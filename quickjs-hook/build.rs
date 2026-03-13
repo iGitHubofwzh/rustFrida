@@ -27,24 +27,35 @@ fn main() {
     let quickjs_c = quickjs_src.join("quickjs.c");
     let quickjs_h = quickjs_src.join("quickjs.h");
     if quickjs_c.exists() && quickjs_h.exists() {
+        let quickjs_version = std::fs::read_to_string(quickjs_src.join("VERSION"))
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let has_libbf = quickjs_src.join("libbf.c").exists();
+
         let mut build = cc::Build::new();
         build
             .file(&quickjs_c)
+            .file(quickjs_src.join("dtoa.c"))
             .file(quickjs_src.join("libregexp.c"))
             .file(quickjs_src.join("libunicode.c"))
             .file(quickjs_src.join("cutils.c"))
-            .file(quickjs_src.join("libbf.c"))
             .file(src_path.join("quickjs_wrapper.c"))
             .include(&quickjs_src)
             .include(&src_path)
             .opt_level(2)
             .flag("-fPIC")
             .flag("-fno-exceptions")
-            .flag("-DCONFIG_VERSION=\"2024-01-13\"")
-            .flag("-DCONFIG_BIGNUM")
+            .flag(&format!("-DCONFIG_VERSION=\"{}\"", quickjs_version))
             .flag("-D_GNU_SOURCE")
             .flag_if_supported("-Wno-implicit-const-int-float-conversion")
             .warnings(false);
+
+        if has_libbf {
+            build.file(quickjs_src.join("libbf.c"));
+            build.flag("-DCONFIG_BIGNUM");
+        }
 
         // Android-specific flags
         if env::var("TARGET").unwrap_or_default().contains("android") {
@@ -149,7 +160,15 @@ fn main() {
     println!("cargo:rerun-if-changed=src/arm64_writer.h");
     println!("cargo:rerun-if-changed=src/arm64_relocator.c");
     println!("cargo:rerun-if-changed=src/arm64_relocator.h");
+    println!("cargo:rerun-if-changed=quickjs-src/VERSION");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.c");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.h");
+    println!("cargo:rerun-if-changed=quickjs-src/dtoa.c");
+    println!("cargo:rerun-if-changed=quickjs-src/libregexp.c");
+    println!("cargo:rerun-if-changed=quickjs-src/libunicode.c");
+    println!("cargo:rerun-if-changed=quickjs-src/cutils.c");
+    println!("cargo:rerun-if-changed=quickjs-src/libbf.c");
+    println!("cargo:rerun-if-changed=src/quickjs_wrapper.c");
+    println!("cargo:rerun-if-changed=src/quickjs_wrapper.h");
     println!("cargo:rerun-if-changed=build.rs");
 }

@@ -33,8 +33,6 @@ JSValue qjs_new_cfunction_magic(JSContext *ctx, JSCFunctionMagic *func,
 /* Type checking */
 int qjs_is_number(JSValue v);
 int qjs_is_big_int(JSContext *ctx, JSValue v);
-int qjs_is_big_float(JSValue v);
-int qjs_is_big_decimal(JSValue v);
 int qjs_is_bool(JSValue v);
 int qjs_is_null(JSValue v);
 int qjs_is_undefined(JSValue v);

@@ -70,16 +70,6 @@ int qjs_is_big_int(JSContext *ctx, JSValue v) {
     return JS_IsBigInt(ctx, v);
 }
 
-/* JS_IsBigFloat wrapper */
-int qjs_is_big_float(JSValue v) {
-    return JS_IsBigFloat(v);
-}
-
-/* JS_IsBigDecimal wrapper */
-int qjs_is_big_decimal(JSValue v) {
-    return JS_IsBigDecimal(v);
-}
-
 /* JS_IsBool wrapper */
 int qjs_is_bool(JSValue v) {
     return JS_IsBool(v);
