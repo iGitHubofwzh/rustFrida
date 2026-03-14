@@ -181,20 +181,9 @@ pub(crate) fn dump_dynamic_exec_map(map: &ExecMap) {
             return;
         }
     }
-    let Ok(mem_file) = std::fs::File::open("/proc/self/mem") else {
-        return;
-    };
     let size = (map.end - map.start) as usize;
-    let mut data = vec![0u8; size];
-    let mut offset = 0usize;
-    while offset < size {
-        match mem_file.read_at(&mut data[offset..], map.start + offset as u64) {
-            Ok(0) => break,
-            Ok(n) => offset += n,
-            Err(_) => return,
-        }
-    }
-    data.truncate(offset);
+    // 直接从虚拟地址读取, /proc/self/mem 对某些匿名 rwx 页面可能返回 0 字节
+    let data = unsafe { std::slice::from_raw_parts(map.start as *const u8, size) }.to_vec();
 
     let perm = perms_to_u32(&map.perms);
     for (chunk_index, chunk) in data.chunks(DYNAMIC_EXEC_CHUNK_SIZE).enumerate() {
