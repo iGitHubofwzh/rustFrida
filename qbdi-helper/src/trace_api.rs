@@ -336,7 +336,7 @@ extern "C" fn exec_transfer_call_cb(
             dump_dynamic_exec_map(&map);
             return VMAction_QBDI_BREAK_TO_VM;
         }
-        // 探测失败 (如 ---p guard page) → 不 instrument，让 QBDI 以 native 方式执行
+        // 探测失败 → 让 QBDI 以 native 方式执行
     }
     VMAction_QBDI_CONTINUE
 }
