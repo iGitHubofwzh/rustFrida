@@ -1,7 +1,7 @@
 use crate::data::{DynamicExecChunk, ExternalReturn, MemAccess, TraceBundleEvent, TraceBundleEventKind, TraceContext};
 use crate::state::{
     clear_last_error, get_trace_bundle_metadata, helper_log, set_last_error, set_trace_output_dir, ExecMap,
-    ADDED_DYNAMIC_RANGES, DUMPED_DYNAMIC_RANGES, DYNAMIC_EXEC_CHUNK_SIZE, TRACE_EXECUTED_INSTRUCTIONS,
+    ADDED_DYNAMIC_RANGES, ADDED_MODULES, DUMPED_DYNAMIC_RANGES, DYNAMIC_EXEC_CHUNK_SIZE, TRACE_EXECUTED_INSTRUCTIONS,
     TRACE_PROGRESS_EVERY,
 };
 use crate::writer::{finalize_trace_session_async, shutdown_trace_writer, start_trace_writer, trace_send};
@@ -223,6 +223,44 @@ pub(crate) fn ensure_dynamic_exec_range_instrumented(vm: VMInstanceRef, map: &Ex
     }
 }
 
+/// 判断路径是否为 app 自身的 SO (在 /data/app/ 下)
+fn is_app_so(path: &str) -> bool {
+    path.starts_with("/data/app/") && path.ends_with(".so")
+}
+
+/// 将模块的所有可执行段加入 instrumented range，并 emit 元数据
+fn instrument_module(vm: VMInstanceRef, module_path: &str) {
+    let entries = match read_exec_maps() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let module_ranges: Vec<&ExecMap> = entries.iter().filter(|e| e.path == module_path).collect();
+    if module_ranges.is_empty() {
+        return;
+    }
+    let module_base = module_ranges.iter().map(|e| e.start).min().unwrap();
+    for map in &module_ranges {
+        unsafe {
+            qbdi_addInstrumentedRange(vm, map.start, map.end);
+        }
+    }
+    // emit TraceBundleMetadata 让 replay 端知道需要加载这个 SO
+    trace_send(TraceBundleEvent {
+        kind: Some(TraceBundleEventKind::TraceBundleMetadata(
+            crate::data::TraceBundleMetadata {
+                module_path: module_path.to_string(),
+                module_base,
+            },
+        )),
+    });
+    helper_log(&format!(
+        "[trace] 添加 app SO 到 trace: {} base={:#x} ranges={}",
+        module_path,
+        module_base,
+        module_ranges.len()
+    ));
+}
+
 extern "C" fn exec_transfer_call_cb(
     vm: VMInstanceRef,
     _event: *const qbdi::ffi::VMState,
@@ -236,15 +274,21 @@ extern "C" fn exec_transfer_call_cb(
         }
         let dest = (*gpr).pc;
         if let Some(map) = find_exec_map(dest) {
-            if !is_dynamic_exec_map(&map) {
-                return VMAction_QBDI_CONTINUE;
+            // 匿名/动态内存 → 添加范围 + dump
+            if is_dynamic_exec_map(&map) {
+                ensure_dynamic_exec_range_instrumented(vm, &map);
+                dump_dynamic_exec_map(&map);
+                return VMAction_QBDI_BREAK_TO_VM;
             }
-            ensure_dynamic_exec_range_instrumented(vm, &map);
-            dump_dynamic_exec_map(&map);
-            // BREAK_TO_VM 强制 QBDI 重新评估执行状态，
-            // 使新加入的 instrumented range 立即生效，
-            // 否则本次调用仍以 native 方式执行，trace 不到动态区域的指令
-            return VMAction_QBDI_BREAK_TO_VM;
+            // app 内的其他 SO → 添加整个模块
+            if is_app_so(&map.path) {
+                let mut added = ADDED_MODULES.lock().unwrap_or_else(|e| e.into_inner());
+                if added.insert(map.path.clone()) {
+                    drop(added); // 释放锁再做后续操作
+                    instrument_module(vm, &map.path);
+                    return VMAction_QBDI_BREAK_TO_VM;
+                }
+            }
         }
     }
     VMAction_QBDI_CONTINUE
@@ -360,6 +404,16 @@ pub extern "C" fn qbdi_vm_register_trace_callbacks(handle: u64, target: u64, out
         managed.trace_callback_ids.clear();
         ADDED_DYNAMIC_RANGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
         DUMPED_DYNAMIC_RANGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut modules = ADDED_MODULES.lock().unwrap_or_else(|e| e.into_inner());
+            modules.clear();
+            // 主模块加入已添加集合，避免 exec_transfer_call_cb 重复添加
+            if let Some(map) = find_exec_map(target) {
+                if !map.path.is_empty() {
+                    modules.insert(map.path.clone());
+                }
+            }
+        }
 
         let ranges = collect_exec_ranges(target)?;
         for map in &ranges {

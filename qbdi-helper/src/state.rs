@@ -102,6 +102,9 @@ lazy_static! {
         Mutex::new(std::collections::HashSet::new());
     pub(crate) static ref DUMPED_DYNAMIC_RANGES: Mutex<std::collections::HashSet<(u64, u64)>> =
         Mutex::new(std::collections::HashSet::new());
+    /// 已添加到 instrumented range 的模块路径集合 (避免重复添加)
+    pub(crate) static ref ADDED_MODULES: Mutex<std::collections::HashSet<String>> =
+        Mutex::new(std::collections::HashSet::new());
 }
 
 pub(crate) fn update_max(atomic: &AtomicU64, value: u64) {
