@@ -5,6 +5,7 @@
 
 #![cfg(feature = "quickjs")]
 
+use crate::vma_name::set_anon_vma_name_raw;
 use libc::{
     mmap, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
     _SC_PAGESIZE,
@@ -23,6 +24,7 @@ use std::sync::OnceLock;
 use crate::communication::{log_msg, write_stream};
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
 
 /// Executable memory for hooks
 static EXEC_MEM: OnceLock<ExecMemory> = OnceLock::new();
@@ -51,6 +53,14 @@ impl ExecMemory {
 
             if ptr == libc::MAP_FAILED {
                 return None;
+            }
+
+            match set_anon_vma_name_raw(ptr as *mut u8, alloc_size, HOOK_EXEC_VMA_NAME) {
+                Ok(()) => log_msg("[vma] named hook pool as wwb_hook_exec\n".to_string()),
+                Err(errno) => log_msg(format!(
+                    "[vma] failed to name hook pool as wwb_hook_exec: errno={}\n",
+                    errno
+                )),
             }
 
             Some(ExecMemory {

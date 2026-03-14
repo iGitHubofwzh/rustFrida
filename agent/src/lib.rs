@@ -17,6 +17,7 @@ mod crash_handler;
 mod exec_mem;
 mod gumlibc;
 mod trace;
+mod vma_name;
 
 #[cfg(feature = "frida-gum")]
 mod memory_dump;
@@ -241,12 +242,10 @@ fn process_cmd(command: &str) {
             stalker::hfollow(md, offset)
         }
         #[cfg(feature = "quickjs")]
-        Some("jsinit") => {
-            match quickjs_loader::init() {
-                Ok(_) => send_eval_ok("initialized"),
-                Err(e) => send_eval_err(&e),
-            }
-        }
+        Some("jsinit") => match quickjs_loader::init() {
+            Ok(_) => send_eval_ok("initialized"),
+            Err(e) => send_eval_err(&e),
+        },
         #[cfg(feature = "quickjs")]
         Some("loadjs") => {
             let script = command.strip_prefix("loadjs").unwrap_or("").trim();
