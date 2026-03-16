@@ -3,9 +3,7 @@
 本文档只说明 `rust_frida` 里可直接使用的 JavaScript API。当前实现面向 `Android + ARM64`，JS 运行时为内嵌 `QuickJS`。
 
 ## 0. 最近更新
-- 仓库现在使用 `Git LFS` 管理 `qbdi/libQBDI.a`
-  - 首次克隆后需要执行：
-
+拉取git大文件
 ```bash
 git lfs install
 git lfs pull
@@ -13,6 +11,7 @@ git lfs pull
 
 - JS 全局对象新增 `qbdi`
   - 用于在设备侧直接创建 QBDI VM、配置插桩范围、模拟调用、执行 `run()` 和读取寄存器返回值。
+  - qbdi.registerTraceCallbacks(vm,addr), 配合qbdi-replay项目 + IDA插件，实现IDA trace回放，默认trace打包位置：/data/data/com.xxx/trace_bundle.pb
 
 ## 1. 进入 JS 环境
 
