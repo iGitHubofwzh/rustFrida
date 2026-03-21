@@ -85,16 +85,19 @@ void hook_engine_cleanup(void) {
     hook_log("hook_engine_cleanup: hooks=%d (stealth=%d), free_list=%d (stealth=%d)",
              hooks_count, stealth_hooks, free_count, stealth_free);
 
-    /* Restore each live hook individually. Stealth hooks must be released
-     * using the exact patch start address passed during PATCH. */
+    /* Restore each live hook individually.
+     * stealth==1 (wxshadow): must use prctl release.
+     * stealth==2 (recomp): was installed via mprotect+write, restore same way.
+     * stealth==0 (normal): restore via mprotect+memcpy. */
     HookEntry* entry = g_engine.hooks;
     while (entry) {
-        if (entry->stealth) {
+        if (entry->stealth == 1) {
             int rc = wxshadow_release(entry->target);
             if (rc != 0) {
                 hook_log("hook_engine_cleanup: wxshadow_release failed for %p", entry->target);
             }
         } else {
+            /* stealth==0 (mprotect) and stealth==2 (recomp) both use mprotect+memcpy */
             uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
             mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
             memcpy(entry->target, entry->original_bytes, entry->original_size);

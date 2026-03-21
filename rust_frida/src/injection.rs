@@ -54,31 +54,72 @@ fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
 /// 设置 fd 的 SELinux label，使 untrusted_app 能通过 SCM_RIGHTS 接收。
 ///
 /// Android MLS/MCS 会阻止 untrusted_app (带 categories) 访问 tmpfs:s0 (无 categories)。
-/// 参考 Frida: 创建 frida_memfd 类型 (带 mlstrustedobject 属性) 豁免 MLS 检查。
-/// 我们复用 Frida 已创建的 frida_memfd 类型（如果存在于策略中）。
-fn relabel_fd_for_injection(fd: RawFd) {
-    // 尝试的 SELinux context 列表（按优先级）
-    const LABELS: &[&[u8]] = &[
-        b"u:object_r:frida_memfd:s0\0",
-        b"u:object_r:app_data_file:s0\0",
+/// 修复：读取目标进程的 SELinux context 提取 MLS range（如 s0:c15,c257,c512,c768），
+/// 用目标的 MLS categories + tmpfs 类型标记 memfd。
+///
+/// 注意：不使用 frida_memfd 类型——即使该类型存在（Frida 残留），其 MLS range
+/// 定义可能不完整，导致 fsetxattr 返回 0 但 kernel 无法验证 context、退回 unlabeled:s0。
+/// tmpfs 是原生类型，天然支持所有 MLS ranges，且 selinux.rs 已有 TE allow 规则。
+fn relabel_fd_for_injection(fd: RawFd, target_pid: i32) {
+    // 读取目标进程的 MLS range
+    let mls = read_target_mls_range(target_pid).unwrap_or_else(|| "s0".to_string());
+
+    // tmpfs 优先（memfd 底层就是 tmpfs），然后 app_data_file
+    let labels = [
+        format!("u:object_r:tmpfs:{}", mls),
+        format!("u:object_r:app_data_file:{}", mls),
     ];
-    for label in LABELS {
+    for label in &labels {
+        let label_cstr = format!("{}\0", label);
         let ret = unsafe {
             libc::fsetxattr(
                 fd,
                 b"security.selinux\0".as_ptr() as *const libc::c_char,
-                label.as_ptr() as *const c_void,
-                label.len() - 1, // 不包含 NUL
+                label_cstr.as_ptr() as *const c_void,
+                label_cstr.len() - 1, // 不包含 NUL
                 0,
             )
         };
         if ret == 0 {
-            let name = std::str::from_utf8(&label[..label.len() - 1]).unwrap_or("?");
-            log_verbose!("memfd SELinux label → {}", name);
+            // 验证 label 是否真正生效（防止 fsetxattr 假成功、kernel 退回 unlabeled）
+            let mut readback = [0u8; 128];
+            let n = unsafe {
+                libc::fgetxattr(
+                    fd,
+                    b"security.selinux\0".as_ptr() as *const libc::c_char,
+                    readback.as_mut_ptr() as *mut c_void,
+                    readback.len(),
+                )
+            };
+            if n > 0 {
+                let actual = std::str::from_utf8(&readback[..n as usize])
+                    .unwrap_or("")
+                    .trim_end_matches('\0');
+                if actual.contains("unlabeled") {
+                    log_verbose!("memfd SELinux label {} → kernel 退回 unlabeled，尝试下一个", label);
+                    continue;
+                }
+            }
+            log_verbose!("memfd SELinux label → {}", label);
             return;
         }
     }
     log_verbose!("memfd SELinux relabel 全部失败，使用默认 tmpfs label");
+}
+
+/// 读取目标进程的 SELinux MLS range（例如 "s0:c15,c257,c512,c768"）
+fn read_target_mls_range(pid: i32) -> Option<String> {
+    let ctx = std::fs::read_to_string(format!("/proc/{}/attr/current", pid)).ok()?;
+    let ctx = ctx.trim_end_matches('\0').trim();
+    // 格式: u:r:untrusted_app:s0:c15,c257,c512,c768
+    // MLS range 从第 4 个 ':' 分隔的字段开始（可能包含多个 ':'）
+    let mut parts = ctx.splitn(4, ':');
+    let _user = parts.next()?;
+    let _role = parts.next()?;
+    let _type = parts.next()?;
+    let mls = parts.next()?;
+    if mls.is_empty() { return None; }
+    Some(mls.to_string())
 }
 
 /// 根据 UID 查找 /data/data/ 目录下对应的应用数据目录
@@ -331,7 +372,7 @@ fn send_exact(sockfd: RawFd, buf: &[u8]) -> Result<(), String> {
 
 /// Host 端执行 loader IPC 握手协议
 /// 返回 REPL 用的 host_fd
-fn run_loader_handshake(ctrl_fd: RawFd) -> Result<RawFd, String> {
+fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String> {
     // 1. 接收 HELLO 消息: [type:u8][thread_id:i32]
     let mut msg_type = [0u8; 1];
     recv_exact(ctrl_fd, &mut msg_type)?;
@@ -350,8 +391,8 @@ fn run_loader_handshake(ctrl_fd: RawFd) -> Result<RawFd, String> {
     if agent_memfd < 0 {
         return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
     }
-    // 尝试 relabel memfd → frida_memfd (绕过 MLS)
-    relabel_fd_for_injection(agent_memfd);
+    // relabel memfd：匹配目标进程的 MLS categories，绕过 MLS/MCS 检查
+    relabel_fd_for_injection(agent_memfd, target_pid);
     let mut written = 0usize;
     while written < AGENT_SO.len() {
         let n = unsafe {
@@ -375,6 +416,8 @@ fn run_loader_handshake(ctrl_fd: RawFd) -> Result<RawFd, String> {
     }
     let host_repl_fd = sv[0];
     let agent_repl_fd = sv[1];
+    // 注意：socketpair 在 sockfs 上，不支持 fsetxattr relabel（associate 被拒），
+    // 但 Unix socket fd 的 SCM_RIGHTS 传递不受 MLS file 检查约束，无需 relabel
     send_fd(ctrl_fd, agent_repl_fd)?;
     unsafe { close(agent_repl_fd) };
     log_verbose!("REPL socketpair fd 已发送");
@@ -613,7 +656,7 @@ pub(crate) fn inject_via_bootstrapper(
     }
 
     // === Host 端 loader IPC 握手 ===
-    let host_repl_fd = run_loader_handshake(host_ctrl_fd).map_err(|e| {
+    let host_repl_fd = run_loader_handshake(host_ctrl_fd, pid).map_err(|e| {
         unsafe { close(host_ctrl_fd) };
         e
     })?;

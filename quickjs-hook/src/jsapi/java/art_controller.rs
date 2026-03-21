@@ -62,12 +62,33 @@ pub(super) fn stealth_mode() -> StealthMode {
 /// 返回 (hook_addr, stealth_flag):
 ///   Normal:   (resolved_addr, 0)
 ///   WxShadow: (resolved_addr, 1)
-///   Recomp:   (recomp(resolved_addr), 0)
+///   Recomp:   (recomp(resolved_addr), 2)
 ///
 /// jni_env 用于 resolve ART tiny trampoline (LDR+BR)，非 art_router 场景传 null
+///
+/// force_mprotect: 为 true 时跳过 recomp/wxshadow，强制使用 mprotect (sflag=0)。
+/// 用于 libart 内部的大函数（DoCall / GC / FixupStaticTrampolines 等），
+/// 这些函数代码极其复杂（数百个 PC-relative 指令），全页 recomp 容易因
+/// 指令交互导致 SIGSEGV。只对 app OAT 代码的 per-method hook 使用 recomp。
 pub(super) unsafe fn prepare_hook_target(
     addr: u64,
     jni_env: *mut std::ffi::c_void,
+) -> Result<(u64, i32), String> {
+    prepare_hook_target_inner(addr, jni_env, false)
+}
+
+/// 同 prepare_hook_target，但强制 mprotect 模式（忽略 stealth 设置）
+pub(super) unsafe fn prepare_hook_target_mprotect(
+    addr: u64,
+    jni_env: *mut std::ffi::c_void,
+) -> Result<(u64, i32), String> {
+    prepare_hook_target_inner(addr, jni_env, true)
+}
+
+unsafe fn prepare_hook_target_inner(
+    addr: u64,
+    jni_env: *mut std::ffi::c_void,
+    force_mprotect: bool,
 ) -> Result<(u64, i32), String> {
     // 1. Resolve ART trampoline（所有模式都先 resolve）
     let resolved = hook_ffi::resolve_art_trampoline(
@@ -75,6 +96,9 @@ pub(super) unsafe fn prepare_hook_target(
     let real_addr = if !resolved.is_null() { resolved as u64 } else { addr };
 
     // 2. 按 stealth 模式处理
+    if force_mprotect {
+        return Ok((real_addr, 0));
+    }
     match stealth_mode() {
         StealthMode::Normal => Ok((real_addr, 0)),
         StealthMode::WxShadow => Ok((real_addr, 1)),

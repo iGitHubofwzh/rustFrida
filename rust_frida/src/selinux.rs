@@ -33,8 +33,9 @@ const POLICYDB_VERSION_CONSTRAINT_NAMES: u32 = 29;
 const RULES: &[(&str, &str, &str, &[&str])] = &[
     ("domain", "domain", "process", &["execmem"]),
     ("domain", "shell_data_file", "dir", &["search"]),
-    // Frida 通过创建 frida_file/frida_memfd 自定义类型来标记文件，
-    // 纯二进制修补无法创建新类型，改为放行 shell_data_file 和 tmpfs 的文件操作
+    // 放行 shell_data_file / tmpfs / frida_memfd 的文件操作
+    // frida_memfd: Frida 创建的自定义类型（如策略中存在），用于 memfd SCM_RIGHTS 传递
+    // tmpfs: memfd 的默认 label，需要 TE 规则 + MLS categories 匹配
     (
         "domain",
         "shell_data_file",
@@ -44,6 +45,12 @@ const RULES: &[(&str, &str, &str, &[&str])] = &[
     (
         "domain",
         "?tmpfs",
+        "file",
+        &["read", "write", "open", "getattr", "execute", "?map"],
+    ),
+    (
+        "domain",
+        "?frida_memfd",
         "file",
         &["read", "write", "open", "getattr", "execute", "?map"],
     ),

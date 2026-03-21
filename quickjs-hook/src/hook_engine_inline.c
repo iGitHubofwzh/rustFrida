@@ -423,32 +423,37 @@ int hook_remove(void* target) {
 
     while (entry) {
         if (entry->target == target) {
-            if (entry->stealth) {
-                /* Stealth hook: release the exact patch identified by target.
-                 * This must match the addr previously passed to wxshadow PATCH.
-                 *
-                 * NOTE: stealth hooks CANNOT be removed via mprotect+memcpy —
+            if (entry->stealth == 1) {
+                /* Stealth 1 (wxshadow): release the kernel shadow mapping.
+                 * wxshadow patches CANNOT be removed via mprotect+memcpy —
                  * the shadow mapping is a kernel-level instruction-view overlay;
-                 * data-view writes do not affect it. If wxshadow_release fails,
-                 * the hook stays active. */
+                 * data-view writes do not affect it. */
                 int rc = wxshadow_release(target);
                 if (rc != 0) {
                     hook_log("hook_remove: wxshadow_release FAILED for %p (stealth hook stays active)", target);
                     pthread_mutex_unlock(&g_engine.lock);
                     return HOOK_ERROR_WXSHADOW_FAILED;
                 }
-            } else {
-                /* Normal hook: restore original bytes via mprotect + memcpy */
+            } else if (entry->stealth == 2) {
+                /* Stealth 2 (recomp): hook was installed via mprotect+write on recomp page.
+                 * Restore original bytes the same way as non-stealth hooks. */
                 uintptr_t page_start = (uintptr_t)target & ~0xFFF;
                 if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
                     pthread_mutex_unlock(&g_engine.lock);
                     return HOOK_ERROR_MPROTECT_FAILED;
                 }
                 memcpy(target, entry->original_bytes, entry->original_size);
-                /* Restore target page from RWX to R-X after writing original bytes back */
                 restore_page_rx(page_start);
-            }
-            if (!entry->stealth) {
+                hook_flush_cache(target, entry->original_size);
+            } else {
+                /* Normal hook (stealth==0): restore original bytes via mprotect + memcpy */
+                uintptr_t page_start = (uintptr_t)target & ~0xFFF;
+                if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                    pthread_mutex_unlock(&g_engine.lock);
+                    return HOOK_ERROR_MPROTECT_FAILED;
+                }
+                memcpy(target, entry->original_bytes, entry->original_size);
+                restore_page_rx(page_start);
                 hook_flush_cache(target, entry->original_size);
             }
 

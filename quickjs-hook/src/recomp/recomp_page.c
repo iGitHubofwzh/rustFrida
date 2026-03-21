@@ -58,15 +58,25 @@ static int encode_bl(uint64_t from_pc, uint64_t to_pc, uint32_t* out) {
     return 0;
 }
 
+/*
+ * 安全 B 跳转：优先用 B（4 字节），失败时 fallback 到绝对跳转（MOVZ/MOVK X17 + BR X17）
+ * 使用 X17 避免 clobber X16（ART 可能用作通用寄存器）
+ */
+static void put_b_safe(Arm64Writer* w, uint64_t target) {
+    if (arm64_writer_put_b_imm(w, target) != 0) {
+        arm64_writer_put_branch_address_reg(w, target, ARM64_REG_X17);
+    }
+}
+
 /* ============================================================================
  * 跳板生成：为超出范围的 PC 相对指令生成跳板代码
  *
  * 设计要点：
- *   - B/BL：跳板做绝对跳转（MOVZ/MOVK + BR X16）
+ *   - B/BL：跳板做绝对跳转（MOVZ/MOVK + BR X17）
  *   - 条件分支：跳板先判断条件，taken 绝对跳转，not-taken 跳回下一条
  *   - ADR/ADRP：跳板用 MOVZ/MOVK 加载目标地址到目标寄存器，跳回下一条
  *   - LDR literal：跳板加载原始数据地址，从中读取数据，跳回下一条
- *   - 跳回路径使用 B（相对跳转），因为跳板总是紧邻重编译页（< 128MB）
+ *   - 跳回路径使用 put_b_safe（B 优先，失败 fallback 到绝对跳转）
  * ============================================================================ */
 
 /*
@@ -84,9 +94,22 @@ static int emit_fallthrough_trampoline(
     uint64_t orig_base        /* 用于计算页内目标 */
 ) {
     if (!info->is_pc_relative) {
-        /* 非 PC 相对：复制原始指令 + 绝对跳转到下一页 */
+        /* 非 PC 相对：复制原始指令 + 绝对跳转到下一页
+         * 必须保护 X16/X17：put_branch_address 用 X16 做 scratch，
+         * 但调用方可能把 X16 当通用寄存器（如 ART DoCall）。
+         * 用 STP/BLR/LDP 模式：BLR 设 LR = LDP 指令地址，callee（= next_page
+         * 的代码）最终 RET 回来，执行 LDP 恢复 X16/X17，然后完成。
+         * 但 next_page 不是一个 callee（不会 RET），所以用 BR 但手动保护 X16。
+         *
+         * 简单方案: STP 保存, branch_address, LDP 恢复不可行（BR 之后无法 LDP）。
+         * 实际方案: 原始指令可能修改 SP，不能用 STP。
+         * 最终方案: 用 LDR X17, [PC+8] + BR X17 替代 MOVZ/MOVK X16 + BR X16，
+         *           只 clobber X17（ARM64 PCS 允许 linker 用 X17，编译器极少用它做通用）。
+         *           但 X17 也不安全。真正安全: 嵌入地址到代码流用 LDR literal。
+         */
         arm64_writer_put_insn(w, insn);
-        arm64_writer_put_branch_address(w, next_page);
+        /* 使用 X17 替代 X16 做 scratch (保护 X16) */
+        arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
         return 0;
     }
 
@@ -100,10 +123,10 @@ static int emit_fallthrough_trampoline(
             uint64_t taken = arm64_writer_new_label_id(w);
             arm64_writer_put_b_cond_label(w, info->cond, taken);
             /* not-taken → 下一页 */
-            arm64_writer_put_branch_address(w, next_page);
+            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
             arm64_writer_put_label(w, taken);
             /* taken → 原始页内目标（内核重定向到重编译页） */
-            arm64_writer_put_branch_address(w, info->target);
+            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
             break;
         }
         case ARM64_INSN_CBZ:
@@ -113,9 +136,9 @@ static int emit_fallthrough_trampoline(
                 arm64_writer_put_cbz_reg_label(w, info->reg, taken);
             else
                 arm64_writer_put_cbnz_reg_label(w, info->reg, taken);
-            arm64_writer_put_branch_address(w, next_page);
+            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
             arm64_writer_put_label(w, taken);
-            arm64_writer_put_branch_address(w, info->target);
+            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
             break;
         }
         case ARM64_INSN_TBZ:
@@ -125,18 +148,18 @@ static int emit_fallthrough_trampoline(
                 arm64_writer_put_tbz_reg_imm_label(w, info->reg, info->bit, taken);
             else
                 arm64_writer_put_tbnz_reg_imm_label(w, info->reg, info->bit, taken);
-            arm64_writer_put_branch_address(w, next_page);
+            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
             arm64_writer_put_label(w, taken);
-            arm64_writer_put_branch_address(w, info->target);
+            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
             break;
         }
         case ARM64_INSN_BL:
             /* BL 到页内目标：不会 fall-through（BL 跳走了），但保险起见还是处理 */
-            arm64_writer_put_branch_address(w, info->target);
+            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
             break;
         default:
             arm64_writer_put_insn(w, insn);
-            arm64_writer_put_branch_address(w, next_page);
+            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
             break;
         }
         return 0;
@@ -158,16 +181,17 @@ static int emit_trampoline(
 
     /* ---- B ---- */
     case ARM64_INSN_B:
-        arm64_writer_put_branch_address(w, info->target);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
         break;
 
     /* ---- BL ---- */
     case ARM64_INSN_BL:
         /* LR 设为原始地址（让栈帧指向原始代码范围，ART 栈回溯正确）
          * 被调函数 RET → orig_addr → 内核 fault → 重定向到 recomp_addr
-         * 重编译页中 BL 改为 B（不自动设 LR），LR 由跳板手动设置 */
+         * 重编译页中 BL 改为 B（不自动设 LR），LR 由跳板手动设置
+         * 注意: 使用 X17 替代 X16 做 scratch（X16 可能被编译器用作通用寄存器） */
         arm64_writer_put_mov_reg_imm(w, ARM64_REG_X30, orig_ret_addr);
-        arm64_writer_put_branch_address(w, info->target);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
         break;
 
     /* ---- B.cond ---- */
@@ -176,9 +200,9 @@ static int emit_trampoline(
         uint64_t skip = arm64_writer_new_label_id(w);
         Arm64Cond inv = (Arm64Cond)(info->cond ^ 1);
         arm64_writer_put_b_cond_label(w, inv, skip);
-        arm64_writer_put_branch_address(w, info->target);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
         arm64_writer_put_label(w, skip);
-        arm64_writer_put_b_imm(w, return_addr);
+        put_b_safe(w, return_addr);
         break;
     }
 
@@ -191,9 +215,9 @@ static int emit_trampoline(
             arm64_writer_put_cbnz_reg_label(w, info->reg, skip);
         else
             arm64_writer_put_cbz_reg_label(w, info->reg, skip);
-        arm64_writer_put_branch_address(w, info->target);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
         arm64_writer_put_label(w, skip);
-        arm64_writer_put_b_imm(w, return_addr);
+        put_b_safe(w, return_addr);
         break;
     }
 
@@ -205,9 +229,9 @@ static int emit_trampoline(
             arm64_writer_put_tbnz_reg_imm_label(w, info->reg, info->bit, skip);
         else
             arm64_writer_put_tbz_reg_imm_label(w, info->reg, info->bit, skip);
-        arm64_writer_put_branch_address(w, info->target);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
         arm64_writer_put_label(w, skip);
-        arm64_writer_put_b_imm(w, return_addr);
+        put_b_safe(w, return_addr);
         break;
     }
 
@@ -216,7 +240,7 @@ static int emit_trampoline(
     case ARM64_INSN_ADRP:
         /* 用 MOVZ/MOVK 序列加载目标地址到 Xd，然后跳回 */
         arm64_writer_put_mov_reg_imm(w, info->dst_reg, info->target);
-        arm64_writer_put_b_imm(w, return_addr);
+        put_b_safe(w, return_addr);
         break;
 
     /* ---- LDR literal (GPR) ---- */
@@ -238,7 +262,7 @@ static int emit_trampoline(
             /* 64 位加载：LDR Xd, [Xd] */
             arm64_writer_put_ldr_reg_reg_offset(w, xd, xd, 0);
         }
-        arm64_writer_put_b_imm(w, return_addr);
+        put_b_safe(w, return_addr);
         break;
     }
 
@@ -247,7 +271,7 @@ static int emit_trampoline(
         Arm64Reg xd = info->dst_reg;
         arm64_writer_put_ldr_reg_address(w, xd, info->target);
         arm64_writer_put_ldrsw_reg_reg_offset(w, xd, xd, 0);
-        arm64_writer_put_b_imm(w, return_addr);
+        put_b_safe(w, return_addr);
         break;
     }
 
@@ -257,19 +281,19 @@ static int emit_trampoline(
         arm64_writer_put_ldr_reg_address(w, ARM64_REG_X16, info->target);
         arm64_writer_put_ldr_fp_reg_reg(w, (uint32_t)info->dst_reg,
                                          ARM64_REG_X16, info->fp_size);
-        arm64_writer_put_b_imm(w, return_addr);
+        put_b_safe(w, return_addr);
         break;
     }
 
     /* ---- PRFM literal ---- */
     case ARM64_INSN_PRFM_LITERAL:
         /* 预取指令丢弃即可，直接跳回 */
-        arm64_writer_put_b_imm(w, return_addr);
+        put_b_safe(w, return_addr);
         break;
 
     default:
         /* 不应到达此处 */
-        arm64_writer_put_b_imm(w, return_addr);
+        put_b_safe(w, return_addr);
         break;
     }
 
@@ -433,14 +457,36 @@ int recompile_page(
                  "跳板区 label 解析失败");
     }
 
-    /* DEBUG: dump offset 0xfbc-0xfdc 的原始 vs recomp 指令（含页基址） */
+    /* DEBUG: dump 所有被修改的指令 + 未被修改但为 PC-relative 的（疑似遗漏） */
     if (local_stats.error == 0) {
-        for (int d = 0xfbc/4; d <= 0xfdc/4 && d < RECOMP_INSN_COUNT; d++) {
+        int miss_count = 0;
+        for (int d = 0; d < RECOMP_INSN_COUNT; d++) {
             uint32_t orig = orig_insns[d];
             uint32_t recomp = recomp_insns[d];
-            hook_log("[recomp-dump] page=%llx offset=0x%03x: orig=%08x recomp=%08x %s",
-                     (unsigned long long)orig_base, d*4, orig, recomp,
-                     orig != recomp ? "CHANGED" : "same");
+            if (orig != recomp) {
+                /* 已被 recomp 修改（trampoline 化），正常 */
+            } else {
+                /* 没改——检查是否漏掉了 PC-relative 指令 */
+                uint64_t insn_pc = orig_base + (uint64_t)(d * 4);
+                Arm64InsnInfo chk = arm64_relocator_analyze_insn(insn_pc, orig);
+                if (chk.is_pc_relative) {
+                    /* PC-relative 但没被改——如果是页内分支则正常，否则是 BUG */
+                    if (is_branch_type(chk.type) &&
+                        chk.target >= orig_base &&
+                        chk.target < orig_base + RECOMP_PAGE_SIZE) {
+                        /* 页内分支，正常保留 */
+                    } else {
+                        hook_log("[recomp-MISS] page=%llx offset=0x%03x: insn=%08x type=%d target=%llx NOT RELOCATED!",
+                                 (unsigned long long)orig_base, d*4, orig, chk.type,
+                                 (unsigned long long)chk.target);
+                        miss_count++;
+                    }
+                }
+            }
+        }
+        if (miss_count > 0) {
+            hook_log("[recomp-MISS] page=%llx: %d PC-relative instructions NOT relocated!",
+                     (unsigned long long)orig_base, miss_count);
         }
     }
 
