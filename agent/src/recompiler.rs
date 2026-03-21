@@ -191,7 +191,7 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
 
     let registered = if prctl_ret != 0 {
         log_msg(format!(
-            "[recompiler] prctl 注册失败: {} (可能内核不支持)",
+            "\x1b[31m[STEALTH 失效] recomp prctl 注册失败: {}，hook 将无法生效！\x1b[0m",
             Error::last_os_error()
         ));
         false

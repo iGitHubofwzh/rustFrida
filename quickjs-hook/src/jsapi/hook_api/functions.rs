@@ -80,12 +80,19 @@ unsafe fn install_hook(
 
     init_registry();
 
-    // Recomp 模式：先重编译页，获取重编译后的地址
+    // Recomp 模式：先重编译页，再分配跳板 slot
+    // alloc_trampoline_slot 在 recomp 代码页写 B→slot，返回 slot 地址。
+    // hook engine 以 stealth=0 在 slot 上写 full jump→thunk，无需碰原始 SO。
     let (hook_addr, recomp_addr) = match mode {
         StealthMode::Recomp => {
-            match crate::recomp::ensure_and_translate(addr as usize) {
-                Ok(ra) => (ra as u64, ra as u64),
-                Err(e) => return throw_internal_error(ctx, &format!("hook(recomp): {}", e)),
+            // 确保页已重编译
+            if let Err(e) = crate::recomp::ensure_and_translate(addr as usize) {
+                return throw_internal_error(ctx, &format!("hook(recomp): {}", e));
+            }
+            // 分配跳板 slot（recomp 跳板区，B range 内保证）
+            match crate::recomp::alloc_trampoline_slot(addr as usize) {
+                Ok(slot) => (slot as u64, slot as u64),
+                Err(e) => return throw_internal_error(ctx, &format!("hook(recomp slot): {}", e)),
             }
         }
         _ => (addr, 0),
@@ -93,6 +100,8 @@ unsafe fn install_hook(
 
     let callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
 
+    // Recomp 模式下 hook engine 只需在 slot 上写 full jump (stealth=0)，
+    // B 指令已由 alloc_trampoline_slot 写好。
     let stealth_flag = match mode {
         StealthMode::WxShadow => 1,
         _ => 0,

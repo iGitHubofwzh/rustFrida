@@ -18,6 +18,19 @@
 
 #include "hook_engine_internal.h"
 
+/* Stealth 模式: 0=normal(mprotect), 1=wxshadow, 2=recomp */
+static int g_stealth_mode = 0;
+static recomp_translate_fn g_recomp_translate = NULL;
+
+void hook_set_recomp_translate(recomp_translate_fn fn) {
+    g_recomp_translate = fn;
+    g_stealth_mode = fn ? 2 : 0;
+}
+
+void hook_set_stealth_mode(int mode) {
+    g_stealth_mode = mode;
+}
+
 /* ============================================================================
  * Pattern definitions — match inlined GetOatQuickMethodHeader in WalkStack
  *
@@ -502,31 +515,57 @@ static int apply_oat_inline_patch(
     read_target_safe((void*)patch_addr, saved_original, overwrite);
     *patch_size_out = overwrite;
 
-    /* Apply patch: try wxshadow first, fall back to mprotect */
+    /* Apply patch: 严格按用户设置的 stealth 模式执行 */
     size_t page_size = g_engine.exec_mem_page_size;
     uintptr_t page_start = patch_addr & ~(page_size - 1);
 
-    if (wxshadow_patch((void*)patch_addr, redirect, overwrite) == 0) {
-        hook_log("[oat_patch] applied via wxshadow at %#lx", (unsigned long)patch_addr);
+    if (g_stealth_mode == 2 && g_recomp_translate) {
+        /* Recomp 模式 */
+        uintptr_t recomp_addr = g_recomp_translate(patch_addr);
+        if (!recomp_addr) {
+            hook_log("\033[31m[STEALTH 失效] oat_patch recomp 翻译失败 %#lx，patch 未安装！\033[0m",
+                     (unsigned long)patch_addr);
+            return -1;
+        }
+        uintptr_t recomp_page = recomp_addr & ~(page_size - 1);
+        mprotect((void*)recomp_page, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+        memcpy((void*)recomp_addr, redirect, overwrite);
+        mprotect((void*)recomp_page, page_size * 2, PROT_READ | PROT_EXEC);
+        hook_flush_cache((void*)recomp_addr, overwrite);
+        hook_log("[oat_patch] applied via recomp at %#lx → %#lx",
+                 (unsigned long)patch_addr, (unsigned long)recomp_addr);
+    } else if (g_stealth_mode == 1) {
+        /* WxShadow 模式 */
+        if (wxshadow_patch((void*)patch_addr, redirect, overwrite) != 0) {
+            hook_log("\033[31m[STEALTH 失效] oat_patch wxshadow 失败 %#lx，fallback mprotect 直接修改原始内存！\033[0m",
+                     (unsigned long)patch_addr);
+            /* wxshadow 失败仍需 patch，否则会 SIGSEGV */
+            uintptr_t patch_end = patch_addr + overwrite;
+            uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);
+            size_t mprotect_size = page_end - page_start;
+            if (mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                hook_log("[oat_patch] mprotect RWX failed at %#lx: %s",
+                         (unsigned long)page_start, strerror(errno));
+                return -1;
+            }
+            memcpy((void*)patch_addr, redirect, overwrite);
+            mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC);
+        }
+        hook_flush_cache((void*)patch_addr, overwrite);
     } else {
-        /* Fall back to mprotect RWX → write → RX */
-        /* Determine how many pages to mprotect */
+        /* Normal 模式 (stealth=0): 直接 mprotect */
         uintptr_t patch_end = patch_addr + overwrite;
         uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);
         size_t mprotect_size = page_end - page_start;
-
         if (mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
             hook_log("[oat_patch] mprotect RWX failed at %#lx: %s",
                      (unsigned long)page_start, strerror(errno));
             return -1;
         }
-
         memcpy((void*)patch_addr, redirect, overwrite);
-
         mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC);
+        hook_flush_cache((void*)patch_addr, overwrite);
     }
-
-    hook_flush_cache((void*)patch_addr, overwrite);
     return 0;
 }
 
@@ -665,23 +704,40 @@ int hook_restore_inlined_oat_header_patches(void) {
         size_t page_size = g_engine.exec_mem_page_size;
         uintptr_t page_start = entry->original_addr & ~(page_size - 1);
 
-        /* Try wxshadow release first */
-        if (wxshadow_release((void*)entry->original_addr) == 0) {
-            /* wxshadow release restores original automatically */
+        /* 按 stealth 模式 restore */
+        if (g_stealth_mode == 2 && g_recomp_translate) {
+            uintptr_t recomp_addr = g_recomp_translate(entry->original_addr);
+            if (recomp_addr) {
+                uintptr_t rp = recomp_addr & ~(page_size - 1);
+                mprotect((void*)rp, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+                memcpy((void*)recomp_addr, entry->original_bytes, entry->patch_size);
+                mprotect((void*)rp, page_size * 2, PROT_READ | PROT_EXEC);
+                hook_flush_cache((void*)recomp_addr, entry->patch_size);
+            }
+        } else if (g_stealth_mode == 1) {
+            if (wxshadow_release((void*)entry->original_addr) != 0) {
+                /* wxshadow release 失败，fallback mprotect */
+                uintptr_t patch_end = entry->original_addr + entry->patch_size;
+                uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);
+                size_t mprotect_size = page_end - page_start;
+                if (mprotect((void*)page_start, mprotect_size,
+                             PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                    memcpy((void*)entry->original_addr, entry->original_bytes, entry->patch_size);
+                    mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC);
+                }
+            }
+            hook_flush_cache((void*)entry->original_addr, entry->patch_size);
         } else {
-            /* Fall back to mprotect + write */
             uintptr_t patch_end = entry->original_addr + entry->patch_size;
             uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);
             size_t mprotect_size = page_end - page_start;
-
             if (mprotect((void*)page_start, mprotect_size,
                          PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
                 memcpy((void*)entry->original_addr, entry->original_bytes, entry->patch_size);
                 mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC);
             }
+            hook_flush_cache((void*)entry->original_addr, entry->patch_size);
         }
-
-        hook_flush_cache((void*)entry->original_addr, entry->patch_size);
         entry->original_addr = 0;
         restored++;
     }

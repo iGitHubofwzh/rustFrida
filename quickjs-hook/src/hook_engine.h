@@ -426,6 +426,23 @@ int hook_patch_inlined_oat_header_checks(void);
  */
 int hook_restore_inlined_oat_header_patches(void);
 
+/*
+ * Recomp translate callback: 将原始地址翻译为 recomp 页地址。
+ * 返回 recomp 地址 (>0) 表示成功，0 表示失败。
+ */
+typedef uintptr_t (*recomp_translate_fn)(uintptr_t orig_addr);
+
+/*
+ * 注册 recomp 翻译回调。设置后，oat_patch 等写入会在 recomp 页上操作。
+ */
+void hook_set_recomp_translate(recomp_translate_fn fn);
+
+/*
+ * 设置 OAT patch 的 stealth 模式: 0=normal(mprotect), 1=wxshadow, 2=recomp
+ * hook_set_recomp_translate 会自动设为 2，此函数用于单独设 wxshadow。
+ */
+void hook_set_stealth_mode(int mode);
+
 #ifdef __cplusplus
 }
 #endif

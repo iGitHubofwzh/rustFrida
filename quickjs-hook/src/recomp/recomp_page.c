@@ -496,8 +496,22 @@ int recompile_page(
     }
 
 done:
-    if (tramp_used)
-        *tramp_used = arm64_writer_offset(&tw);
+    /* 记录实际跳板使用量：减去 BRK guard 填充。
+     * BRK guard 从 actual end 到 capacity 全填满了，
+     * 但 alloc_trampoline_slot 需要知道真实已用量才能分配后续 slot。
+     * 计算方式：向后扫描 BRK，找到最后一个非 BRK 位置。 */
+    {
+        size_t used = arm64_writer_offset(&tw);
+        uint32_t* base_u32 = (uint32_t*)tramp_buf;
+        while (used >= 4) {
+            uint32_t last = base_u32[(used / 4) - 1];
+            if (last != (0xD4200000 | (0xFEED << 5)))  /* BRK #0xFEED */
+                break;
+            used -= 4;
+        }
+        if (tramp_used)
+            *tramp_used = used;
+    }
 
     if (stats)
         *stats = local_stats;

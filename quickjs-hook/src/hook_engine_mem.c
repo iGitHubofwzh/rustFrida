@@ -562,7 +562,8 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
          * recomp 内核模块只改原始页 PTE，不碰 recomp 页，mprotect 安全。 */
         int64_t b_offset = (int64_t)(uintptr_t)jump_dest - (int64_t)(uintptr_t)target;
         if (b_offset < -(1 << 27) || b_offset >= (1 << 27)) {
-            hook_log("patch_target: B range exceeded for recomp (offset=%lld)", (long long)b_offset);
+            hook_log("\033[31m[STEALTH 失效] recomp B 指令距离超限 %p (offset=%lld)，hook 安装失败！\033[0m",
+                     target, (long long)b_offset);
             return HOOK_ERROR_BUFFER_TOO_SMALL;
         }
         uint32_t b_imm26 = ((uint32_t)(b_offset >> 2)) & 0x3FFFFFF;
@@ -597,6 +598,9 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     }
 
     /* Normal mode (stealth=0) or wxshadow fallback: mprotect + direct write */
+    if (stealth != 0) {
+        hook_log("\033[31m[STEALTH 失效] mprotect 直接修改原始内存 %p，CRC 校验将检测到变化！\033[0m", target);
+    }
     uintptr_t page_start = (uintptr_t)target & ~0xFFF;
     if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         return HOOK_ERROR_MPROTECT_FAILED;

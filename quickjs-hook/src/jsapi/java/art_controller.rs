@@ -41,6 +41,14 @@ use crate::jsapi::hook_api::StealthMode;
 /// Recomp=2  页级重编译，在重编译页上 hook
 static STEALTH_MODE: AtomicU8 = AtomicU8::new(StealthMode::Normal as u8);
 
+/// Recomp 翻译回调：供 C 层 oat_patch 使用
+unsafe extern "C" fn recomp_translate_for_c(orig_addr: usize) -> usize {
+    match crate::recomp::ensure_and_translate(orig_addr) {
+        Ok(addr) => addr,
+        Err(_) => 0,
+    }
+}
+
 /// 设置 stealth 模式
 pub(super) fn set_stealth_mode(mode: StealthMode) {
     STEALTH_MODE.store(mode as u8, Ordering::Relaxed);
@@ -49,6 +57,16 @@ pub(super) fn set_stealth_mode(mode: StealthMode) {
         StealthMode::WxShadow => "wxshadow",
         StealthMode::Recomp => "recomp",
     };
+
+    // 同步 C 层 stealth 模式
+    unsafe {
+        hook_ffi::hook_set_stealth_mode(mode as i32);
+        match mode {
+            StealthMode::Recomp => hook_ffi::hook_set_recomp_translate(Some(recomp_translate_for_c)),
+            _ => hook_ffi::hook_set_recomp_translate(None),
+        }
+    }
+
     output_message(&format!("[stealth] Java hook 模式: {}", label));
 }
 
