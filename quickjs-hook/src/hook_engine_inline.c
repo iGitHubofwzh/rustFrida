@@ -236,6 +236,18 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         return HOOK_ERROR_ALLOC_FAILED;
     }
 
+    /* stealth==2 (recomp) B 指令需要 ±128MB，预分配 thunk 到 entry 上，
+     * generate_attach_thunk 会复用已有的 entry->thunk。 */
+    if (stealth == 2 && (!entry->thunk || entry->thunk_alloc < THUNK_ALLOC_SIZE)) {
+        entry->thunk = hook_alloc_near_range(THUNK_ALLOC_SIZE, entry->target, (int64_t)1 << 27);
+        entry->thunk_alloc = THUNK_ALLOC_SIZE;
+        if (!entry->thunk) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
+            return HOOK_ERROR_ALLOC_FAILED;
+        }
+    }
+
     /* Generate thunk code */
     size_t thunk_size = 0;
     void* thunk_mem = generate_attach_thunk(entry, on_enter, on_leave, user_data, &thunk_size);
@@ -328,6 +340,17 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
+    }
+
+    /* stealth==2 (recomp) B 指令需要 ±128MB，预分配 thunk */
+    if (stealth == 2 && (!entry->thunk || entry->thunk_alloc < THUNK_ALLOC_SIZE)) {
+        entry->thunk = hook_alloc_near_range(THUNK_ALLOC_SIZE, entry->target, (int64_t)1 << 27);
+        entry->thunk_alloc = THUNK_ALLOC_SIZE;
+        if (!entry->thunk) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
+            return NULL;
+        }
     }
 
     /* Generate replace thunk */

@@ -164,6 +164,10 @@ void* hook_alloc_near(size_t size, void* target);
  * 返回 mmap 指针，MAP_FAILED 表示失败。调用方负责 munmap。 */
 void* hook_mmap_near(void* target, size_t alloc_size);
 
+/* 参数化版本: 指定搜索范围 max_range（如 ±128MB = 1<<27）。
+ * recomp 页用此确保紧邻原始代码。 */
+void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range);
+
 /*
  * Relocate ARM64 instruction(s) to dst.
  *

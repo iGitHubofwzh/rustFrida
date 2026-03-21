@@ -396,9 +396,18 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         entry->original_size = 4;
     }
 
-    /* Allocate thunk (router code — larger than default) */
+    /* Allocate thunk (router code — larger than default).
+     * stealth==2 (recomp) 用 B 指令 (±128MB)，需要更严格的距离约束。
+     * 其他模式用 ADRP/MOVZ 无严格距离限制。
+     * 注意: 对 stealth==2 必须忽略 free list 中复用的 thunk（距离可能不对）。 */
     size_t art_thunk_alloc = 1024;
-    if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
+    if (stealth == 2) {
+        /* stealth2: 强制重新分配 ±128MB 范围内的 thunk，不复用旧的 */
+        void* old_thunk = entry->thunk;
+        entry->thunk = hook_alloc_near_range(art_thunk_alloc, target, (int64_t)1 << 27);
+        entry->thunk_alloc = art_thunk_alloc;
+        hook_log("[art_router] stealth2 thunk alloc: target=%p old=%p new=%p", target, old_thunk, entry->thunk);
+    } else if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
         entry->thunk = hook_alloc_near(art_thunk_alloc, target);
         entry->thunk_alloc = art_thunk_alloc;
     }
@@ -425,25 +434,9 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     }
 
     /* Patch target to jump to router thunk.
-     * stealth==2 (recomp): B 指令只能跳 ±128MB，thunk 可能更远。
-     * 分配中间 slot（靠近 target），slot 里放 full jump 到 thunk。 */
+     * stealth==2 (recomp): thunk 已在 ±128MB 内分配，B 直接跳 thunk。
+     * stealth==0/1: ADRP/MOVZ 无距离限制。 */
     void* patch_dest = entry->thunk;
-    if (stealth == 2) {
-        void* slot = hook_alloc_near(32, target);
-        if (!slot) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return NULL;
-        }
-        int jlen = hook_write_jump(slot, entry->thunk);
-        if (jlen < 0) {
-            free_entry(entry);
-            pthread_mutex_unlock(&g_engine.lock);
-            return NULL;
-        }
-        hook_flush_cache(slot, jlen);
-        patch_dest = slot;
-    }
     if (patch_target(target, patch_dest, stealth, entry) != 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);

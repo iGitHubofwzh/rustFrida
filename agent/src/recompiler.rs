@@ -14,7 +14,7 @@
 use crate::communication::log_msg;
 use crate::vma_name::set_anon_vma_name_raw;
 use libc::{
-    mmap, mprotect, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
+    mprotect, munmap, sysconf, PROT_EXEC, PROT_READ, PROT_WRITE,
     _SC_PAGESIZE,
 };
 use std::collections::HashMap;
@@ -50,6 +50,7 @@ extern "C" {
 
     fn hook_flush_cache(start: *mut libc::c_void, size: usize);
     fn hook_write_jump(dst: *mut libc::c_void, target: *mut libc::c_void) -> i32;
+    fn hook_mmap_near(target: *mut libc::c_void, alloc_size: usize) -> *mut libc::c_void;
 }
 
 /// C 侧的 RecompileStats 对应结构
@@ -526,15 +527,18 @@ fn do_recompile_temp(orig_base: usize) -> Result<TempRecomp> {
     }
 
     let total_size = PAGE_SIZE + TRAMPOLINE_PAGES * PAGE_SIZE;
-    // hint 靠近原始页，确保 B 指令（±128MB）和 ADRP（±4GB）都在范围内
-    let hint = (orig_base + PAGE_SIZE) as *mut libc::c_void;
+    // 严格保证 recomp 页在原始代码 ±128MB 内（B 指令 + ADRP 直接重定位均可达）。
+    // 不能靠 mmap(hint) 碰运气 — pool 分配可能占掉 hint 附近的空隙。
+    extern "C" {
+        fn hook_mmap_near_range(target: *mut libc::c_void, alloc_size: usize, max_range: i64) -> *mut libc::c_void;
+    }
     let recomp_ptr = unsafe {
-        mmap(hint, total_size,
-             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+        hook_mmap_near_range(orig_base as *mut libc::c_void, total_size, 1i64 << 27)
     };
     if recomp_ptr == libc::MAP_FAILED {
-        return Err(format!("mmap: {}", Error::last_os_error()));
+        return Err(format!("hook_mmap_near_range(±128MB): {}", Error::last_os_error()));
     }
+    // hook_mmap_near_range 返回 RWX，后续 mprotect 改为 R-X
     let recomp_ptr = recomp_ptr as *mut u8;
     let recomp_base = recomp_ptr as u64;
     let tramp_ptr = unsafe { recomp_ptr.add(PAGE_SIZE) };

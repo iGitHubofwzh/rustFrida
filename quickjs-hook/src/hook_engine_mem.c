@@ -51,21 +51,16 @@ int read_target_safe(void* target, void* buf, size_t len) {
         return 0;
     }
 
-    /* Page not readable (XOM / --x) — use /proc/self/mem to bypass.
-     * mprotect would permanently change --x to r-x in /proc/self/maps,
-     * detectable by hunter scanning libart permission bits. */
-    int fd = open("/proc/self/mem", O_RDONLY);
-    if (fd < 0) {
-        hook_log("read_target_safe: open /proc/self/mem failed errno=%d", errno);
-        return -1;
+    /* Page not readable (XOM / --x) — mprotect to add read, then memcpy */
+    uintptr_t page_start = (uintptr_t)target & ~(uintptr_t)0xFFF;
+    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC) == 0) {
+        memcpy(buf, target, len);
+        /* mprotect already set r-x, no need to restore */
+        return 0;
     }
-    ssize_t n = pread(fd, buf, len, (off_t)(uintptr_t)target);
-    close(fd);
-    if (n != (ssize_t)len) {
-        hook_log("read_target_safe: pread failed n=%zd errno=%d", n, errno);
-        return -1;
-    }
-    return 0;
+
+    hook_log("read_target_safe: mprotect failed errno=%d", errno);
+    return -1;
 }
 
 /* --- Pool permission management --- */
@@ -356,11 +351,10 @@ static void* alloc_from_pool(ExecPool* pool, size_t size) {
     return ptr;
 }
 
-/* 扫描 /proc/self/maps 找 target ±4GB 范围内的空隙，mmap RWX 内存。
- * 公共函数: Rust 侧初始 pool 和 C 侧动态 pool 共用此逻辑。
+/* 参数化版本: 搜索 target ±max_range 范围内的 maps 空隙，mmap RWX 内存。
  * target=NULL 时退化为普通 mmap(NULL)。
  * 返回 mmap 得到的指针，MAP_FAILED 表示失败。 */
-void* hook_mmap_near(void* target, size_t alloc_size) {
+void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
     if (!target) {
         return mmap(NULL, alloc_size,
                     PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -370,21 +364,20 @@ void* hook_mmap_near(void* target, size_t alloc_size) {
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) page_size = 4096;
 
-    int64_t adrp_range = (int64_t)1 << 32;
     uintptr_t target_addr = (uintptr_t)target;
 
     /* 搜索区间 [search_lo, search_hi) */
     uintptr_t search_lo = 0;
-    if (target_addr > (uintptr_t)adrp_range)
-        search_lo = (target_addr - (uintptr_t)adrp_range + page_size - 1) & ~(page_size - 1);
+    if (target_addr > (uintptr_t)max_range)
+        search_lo = (target_addr - (uintptr_t)max_range + page_size - 1) & ~(page_size - 1);
     else
         search_lo = (uintptr_t)page_size;
-    uintptr_t search_hi = target_addr + (uintptr_t)adrp_range;
+    uintptr_t search_hi = target_addr + (uintptr_t)max_range;
     if (search_hi < target_addr) search_hi = UINTPTR_MAX;
 
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) {
-        hook_log("hook_mmap_near: failed to open /proc/self/maps");
+        hook_log("hook_mmap_near_range: failed to open /proc/self/maps");
         return MAP_FAILED;
     }
 
@@ -464,7 +457,7 @@ void* hook_mmap_near(void* target, size_t alloc_size) {
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (ptr != MAP_FAILED) {
                 int64_t d = (int64_t)((uint8_t*)ptr - (uint8_t*)target);
-                if (d < -adrp_range || d >= adrp_range) {
+                if (d < -max_range || d >= max_range) {
                     munmap(ptr, alloc_size);
                     ptr = MAP_FAILED;
                 }
@@ -472,24 +465,31 @@ void* hook_mmap_near(void* target, size_t alloc_size) {
         }
 
         if (ptr != MAP_FAILED) {
-            hook_log("hook_mmap_near: OK at %p for target %p", ptr, target);
+            hook_log("hook_mmap_near_range: OK at %p for target %p (range=±%lld)",
+                     ptr, target, (long long)max_range);
             return ptr;
         }
     }
 
-    hook_log("hook_mmap_near: all %d candidates failed for target %p", max_tries, target);
+    hook_log("hook_mmap_near_range: all %d candidates failed for target %p (range=±%lld)",
+             max_tries, target, (long long)max_range);
     return MAP_FAILED;
     #undef MAX_CANDIDATES
 }
 
-/* 创建新 pool（调用 hook_mmap_near 扫描空隙） */
-static ExecPool* create_pool_near(void* target) {
+/* 公共函数: 默认 ±4GB (ADRP range) 的 wrapper，保持 ABI 兼容 */
+void* hook_mmap_near(void* target, size_t alloc_size) {
+    return hook_mmap_near_range(target, alloc_size, (int64_t)1 << 32);
+}
+
+/* 创建新 pool，限定 ±max_range 范围 */
+static ExecPool* create_pool_near_range(void* target, int64_t max_range) {
     if (g_engine.pool_count >= MAX_EXEC_POOLS) {
-        hook_log("create_pool_near: pool count %d reached MAX_EXEC_POOLS", g_engine.pool_count);
+        hook_log("create_pool_near_range: pool count %d reached MAX_EXEC_POOLS", g_engine.pool_count);
         return NULL;
     }
 
-    void* ptr = hook_mmap_near(target, EXEC_POOL_SIZE);
+    void* ptr = hook_mmap_near_range(target, EXEC_POOL_SIZE, max_range);
     if (ptr == MAP_FAILED) return NULL;
 
     ExecPool* pool = &g_engine.pools[g_engine.pool_count++];
@@ -499,11 +499,22 @@ static ExecPool* create_pool_near(void* target) {
     return pool;
 }
 
+/* 创建新 pool（默认 ±4GB）— 保持现有调用方兼容 */
+static ExecPool* create_pool_near(void* target) {
+    return create_pool_near_range(target, (int64_t)1 << 32);
+}
+
 
 /* 判断 pool 是否在 target 的 ADRP 范围内 (±4GB) */
 static int pool_in_adrp_range(ExecPool* pool, void* target) {
     int64_t dist = (int64_t)((uint8_t*)pool->base - (uint8_t*)target);
     int64_t range = (int64_t)1 << 32;
+    return dist > -range && dist < range;
+}
+
+/* 判断 pool 是否在 target 的指定范围内 */
+static int pool_in_range(ExecPool* pool, void* target, int64_t range) {
+    int64_t dist = (int64_t)((uint8_t*)pool->base - (uint8_t*)target);
     return dist > -range && dist < range;
 }
 
@@ -562,6 +573,44 @@ void* hook_alloc_near(size_t size, void* target) {
     /* Phase 3: nearby 失败 → 通用分配兜底（MOVZ+MOVK 路径） */
     hook_log("hook_alloc_near: WARN nearby failed for target %p, fallback generic", target);
     return hook_alloc(size);
+}
+
+/* 在 target ±max_range 范围内分配可执行内存。
+ * 与 hook_alloc_near 不同: 不会 fallback 到 generic pool。
+ * 用途: stealth2 B 指令需要 ±128MB 范围。 */
+void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
+    if (!g_engine.initialized || !target) return NULL;
+    size = (size + 7) & ~7;
+
+    /* Phase 1: 初始 pool */
+    if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
+        int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
+        if (dist > -max_range && dist < max_range) {
+            void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+            g_engine.exec_mem_used += size;
+            return ptr;
+        }
+    }
+
+    /* Phase 1b: 额外 pool */
+    for (int i = 0; i < g_engine.pool_count; i++) {
+        ExecPool* pool = &g_engine.pools[i];
+        if (pool_in_range(pool, target, max_range) && pool->used + size <= pool->size) {
+            return alloc_from_pool(pool, size);
+        }
+    }
+
+    /* Phase 2: 创建 pool (maps 空隙扫描，限定 ±max_range) */
+    ExecPool* pool = create_pool_near_range(target, max_range);
+    if (pool) {
+        void* ptr = alloc_from_pool(pool, size);
+        if (ptr) return ptr;
+    }
+
+    /* 不 fallback — 调用方需要保证距离 */
+    hook_log("hook_alloc_near_range: FAILED for target %p within ±%lld",
+             target, (long long)max_range);
+    return NULL;
 }
 
 
