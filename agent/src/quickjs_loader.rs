@@ -176,11 +176,7 @@ pub fn is_initialized() -> bool {
 pub fn cleanup() {
     log_msg("[quickjs] cleanup start\n".to_string());
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    // 第一步: 释放 recomp 页 — 注销 prctl，内核立即停止重定向执行到 recomp 页。
-    // 必须最先执行: 后续 cleanup 会恢复 ArtMethod/slot，如果 recomp 仍在生效，
-    // 其他线程走 recomp 页 → B→已恢复的 slot (BRK guard) → SIGTRAP。
-    crate::recompiler::release_all();
-    // Unhook Java hooks (restore ArtMethod entry points + flags)
+    // Unhook Java hooks (restore ArtMethod + OAT inline patches on recomp 页)
     log_msg("[quickjs] cleanup_java_hooks\n".to_string());
     cleanup_java_hooks();
     // Unhook all inline hooks while the JS context (ctx) is still valid
@@ -197,5 +193,10 @@ pub fn cleanup() {
     // Reset hook engine state and free the executable pool metadata
     log_msg("[quickjs] cleanup_hook_engine\n".to_string());
     cleanup_hook_engine();
+    // 最后释放 recomp 页: prctl release 注销重定向，内核恢复原始页 X 权限。
+    // 必须在所有 hook cleanup 之后: OAT patch restore 需要写 recomp 页，
+    // hook_engine_cleanup 恢复 slot 原始字节也在 recomp 跳板区。
+    // 不 munmap: 其他线程 icache 可能仍有 recomp 页指令。
+    crate::recompiler::release_all();
     log_msg("[quickjs] cleanup done\n".to_string());
 }
