@@ -874,3 +874,64 @@ void finalize_hook(HookEntry* entry, void* thunk, size_t thunk_size) {
     entry->next = g_engine.hooks;
     g_engine.hooks = entry;
 }
+
+/* --- Diagnostic: alloc_near 有效性测试 --- */
+
+static const char* identify_pool(void* ptr, int prev_pool_count, int* out_idx) {
+    if ((uint8_t*)ptr >= (uint8_t*)g_engine.exec_mem &&
+        (uint8_t*)ptr < (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_size) {
+        *out_idx = -1;
+        return "initial";
+    }
+    for (int i = 0; i < g_engine.pool_count; i++) {
+        ExecPool* pool = &g_engine.pools[i];
+        if ((uint8_t*)ptr >= (uint8_t*)pool->base &&
+            (uint8_t*)ptr < (uint8_t*)pool->base + pool->size) {
+            *out_idx = i;
+            return (i >= prev_pool_count) ? "NEW" : "reuse";
+        }
+    }
+    *out_idx = -2;
+    return "???";
+}
+
+void hook_diag_alloc_near(void* target) {
+    if (!g_engine.initialized) {
+        hook_log("[diag] hook engine not initialized");
+        return;
+    }
+
+    int64_t adrp_range = (int64_t)1 << 32;
+    int prev_pool_count = g_engine.pool_count;
+
+    hook_log("── target=%p  pools_before=%d ──", target, prev_pool_count);
+
+    void* strict_result = hook_alloc_near_range(512, target, adrp_range);
+    if (strict_result) {
+        int64_t dist = (int64_t)((uint8_t*)strict_result - (uint8_t*)target);
+        int idx;
+        const char* src = identify_pool(strict_result, prev_pool_count, &idx);
+        hook_log("  near_range(±4GB): %p  dist=%+.1fMB  pool=%s[%d]  pools_after=%d",
+                 strict_result, (double)dist / (1024*1024), src, idx, g_engine.pool_count);
+    } else {
+        hook_log("  near_range(±4GB): FAILED");
+    }
+
+    {
+        int64_t d = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
+        hook_log("  [initial] %p  used=%zu/%zu  dist=%+.1fGB %s",
+                 g_engine.exec_mem, g_engine.exec_mem_used, g_engine.exec_mem_size,
+                 (double)d / (1024*1024*1024LL),
+                 (d > -adrp_range && d < adrp_range) ? "" : "OUT");
+    }
+    for (int i = 0; i < g_engine.pool_count; i++) {
+        ExecPool* pool = &g_engine.pools[i];
+        int64_t d = (int64_t)((uint8_t*)pool->base - (uint8_t*)target);
+        hook_log("  [pool %d]  %p  used=%zu/%zu  dist=%+.1fGB %s%s",
+                 i, pool->base, pool->used, pool->size,
+                 (double)d / (1024*1024*1024LL),
+                 (d > -adrp_range && d < adrp_range) ? "" : "OUT",
+                 (i >= prev_pool_count) ? " ★NEW" : "");
+    }
+}
+

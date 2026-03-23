@@ -468,6 +468,12 @@ void hook_set_recomp_translate(recomp_translate_fn fn);
  */
 void hook_set_stealth_mode(int mode);
 
+/*
+ * Diagnostic: 测试 hook_alloc_near 对给定 target 的有效性。
+ * 打印 pool 状态、分配结果、ADRP 可达性。
+ */
+void hook_diag_alloc_near(void* target);
+
 #ifdef __cplusplus
 }
 #endif

@@ -242,3 +242,27 @@ pub(crate) unsafe extern "C" fn js_call_native(
 
     js_i64_to_js_number_or_bigint(ctx, result)
 }
+
+/// diagAllocNear(addr) - 诊断 hook_alloc_near 对指定地址的有效性
+pub(crate) unsafe extern "C" fn js_diag_alloc_near(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"diagAllocNear() requires 1 argument (address)\0".as_ptr() as *const _,
+        );
+    }
+
+    let ptr_arg = JSValue(*argv);
+    let addr = match extract_pointer_address(ctx, ptr_arg, "diagAllocNear") {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+
+    hook_ffi::hook_diag_alloc_near(addr as *mut std::ffi::c_void);
+    JSValue::undefined().raw()
+}

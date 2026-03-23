@@ -12,7 +12,7 @@ use crate::jsapi::callback_util::set_js_u64_property;
 use crate::jsapi::util::add_cfunction_to_object;
 
 use callback::{in_flight_native_hook_callbacks, wait_for_in_flight_native_hook_callbacks};
-use functions::{js_call_native, js_hook, js_recomp_hook, js_unhook};
+use functions::{js_call_native, js_diag_alloc_near, js_hook, js_recomp_hook, js_unhook};
 #[cfg(feature = "qbdi")]
 pub use qbdi::preload_qbdi_helper;
 #[cfg(feature = "qbdi")]
@@ -30,6 +30,7 @@ pub fn register_hook_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx.as_ptr(), g, "unhook", js_unhook, 1);
         add_cfunction_to_object(ctx.as_ptr(), g, "callNative", js_call_native, 1);
         add_cfunction_to_object(ctx.as_ptr(), g, "recompHook", js_recomp_hook, 2);
+        add_cfunction_to_object(ctx.as_ptr(), g, "diagAllocNear", js_diag_alloc_near, 1);
 
         // Hook.NORMAL = 0, Hook.WXSHADOW = 1, Hook.RECOMP = 2
         let hook_obj = ffi::JS_NewObject(ctx.as_ptr());
