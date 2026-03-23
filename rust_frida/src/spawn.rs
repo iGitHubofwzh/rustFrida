@@ -466,6 +466,10 @@ fn is_process_64bit(pid: u32) -> bool {
     header[4] == 2
 }
 
+fn proc_name_implies_64bit(proc_name: &str) -> bool {
+    proc_name == "zygote64" || proc_name == "usap64"
+}
+
 /// 枚举所有 64 位 zygote 进程 PID
 fn find_zygote_pids() -> Result<Vec<(u32, String)>, String> {
     use std::fs;
@@ -494,7 +498,9 @@ fn find_zygote_pids() -> Result<Vec<(u32, String)>, String> {
 
             if proc_name == "zygote" || proc_name == "zygote64" || proc_name == "usap32" || proc_name == "usap64" {
                 // 过滤 32 位进程：zymbiote payload 是 ARM64 ELF，注入 32 位进程会崩溃
-                if !is_process_64bit(pid) {
+                // 在生产机上 shell 可能无权读取 /proc/<pid>/exe，此时对名字已明确带 64
+                // 的进程保守地信任进程名，避免把 zygote64/usap64 误判成 32 位。
+                if !proc_name_implies_64bit(proc_name) && !is_process_64bit(pid) {
                     log_verbose!("跳过 32 位进程 {} (pid={})", proc_name, pid);
                     continue;
                 }
@@ -1348,10 +1354,7 @@ fn find_setargv0_pointer_in_heap(
                 .collect();
             if non_exec_matches.len() == 1 {
                 let (addr, backup, already_patched, _, _) = non_exec_matches[0].clone();
-                log_warn!(
-                    "多个 setArgV0 候选中优先选择非可执行映射内的 slot: 0x{:x}",
-                    addr
-                );
+                log_warn!("多个 setArgV0 候选中优先选择非可执行映射内的 slot: 0x{:x}", addr);
                 return Ok(Some((addr, backup, already_patched)));
             }
 

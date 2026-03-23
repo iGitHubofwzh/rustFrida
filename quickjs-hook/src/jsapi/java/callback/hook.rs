@@ -289,3 +289,232 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         }
     }
 }
+
+// ============================================================================
+// Quick dispatch — 从 art_router found path 直接调用 JS callback
+// ============================================================================
+
+/// ART Quick 调用约定 → JS callback dispatch
+///
+/// 从 art_router found path 直接调用。HookContext 包含 Quick 调用约定寄存器：
+///   x0 = ArtMethod* (original, 通过 user_data 传入)
+///   x1 = this (instance) 或 jclass (static)
+///   x2-x7 = Java 参数 (GP)
+///   d0-d7 = Java 参数 (FP)
+///   x19 = Thread* (ART 约定)
+///
+/// 不经过 JNI trampoline，直接调用 JS callback 并将结果写回 HookContext。
+/// 跳过了 ART 的 JNI epilogue，因此:
+///   - 需要手动 MonitorEnter/Exit (synchronized 方法)
+///   - 对象参数是裸 mirror::Object*，需要标记为 JniTransition 后 NewLocalRef 包装
+///   - float/double 返回值写入 d[0]
+
+/// 将裸 mirror::Object* 转为 JNI local ref (jobject)。
+///
+/// Quick 调用约定中的对象参数是堆上的裸 mirror::Object* 指针。
+/// JNI 标准 NewLocalRef 期望 jobject (IndirectRef)，不能直接传裸指针。
+/// 使用 ART 内部导出的 JNIEnvExt::NewLocalRef(mirror::Object*) 直接接受裸指针。
+///
+/// 缓存 dlsym 结果，避免每次调用都查找。
+#[allow(dead_code)]
+static mut ART_NEW_LOCAL_REF: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void> = None;
+
+#[allow(dead_code)]
+unsafe fn raw_mirror_to_local_ref(env: JniEnv, raw: u64) -> *mut std::ffi::c_void {
+    if raw == 0 || env.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    // 尝试用 ART 内部 JNIEnvExt::NewLocalRef(mirror::Object*) — 直接接受裸指针
+    let add_ref = ART_NEW_LOCAL_REF.get_or_insert_with(|| {
+        let sym = crate::jsapi::module::libart_dlsym(
+            "_ZN3art9JNIEnvExt11NewLocalRefEPNS_6mirror6ObjectE",
+        );
+        if sym.is_null() {
+            // fallback: 标准 JNI NewLocalRef (可能不兼容裸指针)
+            let vtable = *(env as *const *const usize);
+            let new_local: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void =
+                std::mem::transmute(*(vtable.add(25))); // JNI_NEW_LOCAL_REF = 25
+            new_local
+        } else {
+            std::mem::transmute(sym)
+        }
+    });
+    add_ref(env as *mut std::ffi::c_void, raw as *mut std::ffi::c_void)
+}
+#[no_mangle]
+#[allow(dead_code)]
+pub unsafe extern "C" fn java_hook_dispatch_from_quick(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    user_data: *mut std::ffi::c_void,
+) {
+    // 最早的 log — 确认函数是否被调用
+    crate::jsapi::console::output_message("[dispatch] ENTRY");
+    if ctx_ptr.is_null() || user_data.is_null() {
+        return;
+    }
+    let _in_flight_guard = InFlightJavaHookGuard::enter();
+    let _callback_scope = JavaHookCallbackScope::enter();
+
+    let art_method_addr = user_data as u64;
+
+    // 复制 callback 数据，然后释放 lock
+    let (
+        ctx_usize,
+        callback_bytes,
+        is_static,
+        param_count,
+        return_type,
+        return_type_sig,
+        param_types,
+        clone_addr,
+        class_global_ref,
+    ) = {
+        let guard = match JAVA_HOOK_REGISTRY.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                (*ctx_ptr).x[0] = 0;
+                return;
+            }
+        };
+        let registry = match guard.as_ref() {
+            Some(r) => r,
+            None => {
+                (*ctx_ptr).x[0] = 0;
+                return;
+            }
+        };
+        let hook_data = match registry.get(&art_method_addr) {
+            Some(d) => d,
+            None => {
+                (*ctx_ptr).x[0] = 0;
+                return;
+            }
+        };
+        (
+            hook_data.ctx,
+            hook_data.callback_bytes,
+            hook_data.is_static,
+            hook_data.param_count,
+            hook_data.return_type,
+            hook_data.return_type_sig.clone(),
+            hook_data.param_types.clone(),
+            hook_data.clone_addr,
+            hook_data.class_global_ref,
+        )
+    }; // lock released
+
+    // 通过 JNI 标准接口获取当前线程的 JNIEnv*
+    // Android 16+ Thread* 通过 TLS 访问，x19 不再是 Thread*
+    let env: JniEnv = match crate::jsapi::java::jni_core::get_thread_env() {
+        Ok(e) => e,
+        Err(e) => {
+            crate::jsapi::console::output_message(&format!(
+                "[dispatch] get_thread_env failed: {}, art_method={:#x}",
+                e, art_method_addr
+            ));
+            return;
+        }
+    };
+
+    // Quick code 上下文中不能调 JNI 函数 (没有 JNI transition frame)。
+    // 参数不做 marshal, 对象参数以原始值传给 JS (BigUint64)。
+    // callOriginal (ctx.orig()) 走 clone+JNI, 有完整 JNI 环境。
+    let mut result_was_set = false;
+
+    crate::jsapi::console::output_message(&format!(
+        "[dispatch] BEFORE invoke_hook_callback_common: art_method={:#x}, ctx={:#x}",
+        art_method_addr, ctx_usize
+    ));
+
+    // DEBUG: 跳过所有操作，纯 return（验证 dispatch+RET 本身是否安全）
+    crate::jsapi::console::output_message("[dispatch] PURE RETURN (no JS, no clone)");
+    (*ctx_ptr).x[0] = 0; // 返回 null/0
+    return;
+
+    #[allow(unreachable_code)]
+    invoke_hook_callback_common(
+        ctx_usize,
+        &callback_bytes,
+        "java hook (quick)",
+        art_method_addr,
+        // 构建 JS 上下文对象 — 纯数值, 不调 JNI
+        |ctx| {
+            let js_ctx = ffi::JS_NewObject(ctx);
+            let hook_ctx = &*ctx_ptr;
+
+            // thisObj: 原始值 (BigUint64)
+            if !is_static {
+                set_js_u64_property(ctx, js_ctx, "thisObj", hook_ctx.x[1]);
+            }
+
+            // args[] — 从寄存器读取原始值, 不转 JNI handle
+            {
+                let arr = ffi::JS_NewArray(ctx);
+                let mut gp_index: usize = 0;
+                let mut fp_index: usize = 0;
+                for i in 0..param_count {
+                    let type_sig = param_types.get(i).map(|s| s.as_str());
+                    let is_fp = is_floating_point_type(type_sig);
+                    let (raw, fp_raw) =
+                        extract_jni_arg(hook_ctx, is_fp, &mut gp_index, &mut fp_index);
+                    // 所有参数以原始值传递, 不调 JNI marshal
+                    let val = match type_sig.map(|s| s.as_bytes().first().copied()) {
+                        Some(Some(b'Z')) => JSValue::bool(raw != 0).raw(),
+                        Some(Some(b'B')) => JSValue::int(raw as i8 as i32).raw(),
+                        Some(Some(b'S')) => JSValue::int(raw as i16 as i32).raw(),
+                        Some(Some(b'I')) => JSValue::int(raw as i32).raw(),
+                        Some(Some(b'F')) => JSValue::float(f32::from_bits(fp_raw as u32) as f64).raw(),
+                        Some(Some(b'D')) => JSValue::float(f64::from_bits(fp_raw)).raw(),
+                        _ => ffi::JS_NewBigUint64(ctx, raw), // J, L, [, 等 → BigUint64
+                    };
+                    ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
+                }
+                JSValue(js_ctx).set_property(ctx, "args", JSValue(arr));
+            }
+
+            set_js_u64_property(ctx, js_ctx, "env", env as u64);
+            set_js_u64_property(ctx, js_ctx, "__hookCtxPtr", ctx_ptr as usize as u64);
+            set_js_u64_property(ctx, js_ctx, "__hookArtMethod", art_method_addr);
+            set_js_cfunction_property(ctx, js_ctx, "orig", js_call_original, 0);
+
+            js_ctx
+        },
+        // 处理返回值
+        |_ctx, _js_ctx, _result| {
+            result_was_set = true;
+            // 返回值由 ctx.orig() 设置 (通过 invoke_clone_jni)
+            // 如果 JS 没调 orig(), 返回值为 0/null
+        },
+    );
+
+    // Fallback + 默认路径: 调用 clone (原始方法) via JNI
+    // JNI CallNonvirtualMethodA 会建立完整的 JNI transition frame
+    if !result_was_set {
+        if !env.is_null() && clone_addr != 0 {
+            let hook_ctx = &*ctx_ptr;
+            let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
+            let jargs_ptr = if param_count > 0 {
+                jargs.as_ptr() as *const std::ffi::c_void
+            } else {
+                std::ptr::null()
+            };
+            // x[1] 在 Layer 1/2 路径不是 receiver, 强制静态调用
+            let ret_raw = invoke_clone_jni(
+                env,
+                art_method_addr,
+                clone_addr,
+                class_global_ref,
+                0, // receiver=0, 用静态调用
+                return_type,
+                true, // 强制 is_static
+                jargs_ptr,
+            );
+            if return_type != b'V' {
+                (*ctx_ptr).x[0] = ret_raw;
+            }
+        } else {
+            (*ctx_ptr).x[0] = 0;
+        }
+    }
+}

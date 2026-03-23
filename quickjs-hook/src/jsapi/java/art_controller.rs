@@ -511,7 +511,8 @@ pub(super) fn ensure_art_controller_initialized(
     }
 
     // --- Fix 4: hook GetOatQuickMethodHeader (replace mode) ---
-    // 对 replacement method 返回 NULL，防止 ART 查找堆分配方法的 OAT 代码头
+    // replacement 的 data_ = thunk 地址, WalkStack → GetDexPc 查 CodeInfo 会 abort。
+    // 对 replacement method 返回 NULL, 防止 ART 查找堆分配方法的 OAT 代码头。
     let mut oat_header_hook_target: u64 = 0;
     if bridge.get_oat_quick_method_header != 0 {
         let (ha, sf) = unsafe { prepare_hook_target(bridge.get_oat_quick_method_header, std::ptr::null_mut()) }.unwrap_or((bridge.get_oat_quick_method_header, 0));
@@ -578,18 +579,12 @@ pub(super) fn ensure_art_controller_initialized(
         }
     }
 
-    // --- Fix 8: OAT inline patch ---
-    // 暂时仅在 PID 注入模式启用（spawn 模式下 mprotect COW 可能导致问题）
-    // TODO: 判断 spawn vs pid 模式
-    let oat_inline_patched = unsafe {
+    // --- Fix 8: patch 内联 GetOatQuickMethodHeader ---
+    // libart.so 内联了 GetOatQuickMethodHeader 的 data_!=-1 检查,
+    // hook_replace 只拦截非内联调用。内联点需要单独 patch。
+    let oat_inline_patched: i32 = unsafe {
         hook_ffi::hook_patch_inlined_oat_header_checks()
     };
-    if oat_inline_patched > 0 {
-        output_message(&format!(
-            "[artController] Fix 8: {} 个内联 GetOatQuickMethodHeader 已 patch",
-            oat_inline_patched
-        ));
-    }
 
     // SIGSEGV guard 作为 fallback
     unsafe {
@@ -635,7 +630,6 @@ fn get_art_thread_spec_cached() -> Option<&'static ArtThreadSpec> {
 
 pub(super) static DO_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 pub(super) static DO_CALL_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
-
 /// DoCall on_enter: 检查 x0 (ArtMethod*) 是否在 replacedMethods 中，有则替换。
 /// 包含递归防护: 如果当前栈帧来自 callOriginal (managedStack 中已有 replacement)，
 /// 则跳过替换，让 original method 正常执行，防止无限递归。
@@ -652,8 +646,11 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
         if !should_replace_for_stack(replacement) {
             return; // 递归情况，保持 original 不替换
         }
-        // 对标 Frida: declaring_class_ 不在热路径同步，仅由 GC 回调批量同步
-        // （在热路径写 malloc 地址会导致 Scudo 堆损坏）
+        // 同步 declaring_class_: replacement (malloc'd) 不被 GC 追踪，
+        // GC 移动 declaring class 后 replacement 的 declaring_class_ 可能 stale。
+        // 每次替换前从 original 拷贝到 replacement，消除竞态。
+        let dc = std::ptr::read_volatile(method as *const u32);
+        std::ptr::write_volatile(replacement as *mut u32, dc);
         ctx.x[0] = replacement;
     }
 }
@@ -846,14 +843,16 @@ unsafe fn synchronize_replacement_methods() {
 
         // --- Fix 1: declaring_class_ 同步 ---
         // 移动 GC 会更新原始 ArtMethod 的 declaring_class_ (offset 0, 4 bytes GcRoot)，
-        // 但堆分配的 replacement 和 clone 不会被 GC 追踪。同步以防悬空引用。
+        // 堆分配的 clone/replacement 不会被 GC 追踪，需要同步以防悬空引用。
         {
             let declaring_class = std::ptr::read_volatile(art_method as *const u32);
-            let HookType::Replaced { replacement_addr, .. } = &data.hook_type;
-            std::ptr::write_volatile(*replacement_addr as *mut u32, declaring_class);
-            // 同步到 clone (callOriginal 使用的备份 ArtMethod)
             if data.clone_addr != 0 {
                 std::ptr::write_volatile(data.clone_addr as *mut u32, declaring_class);
+            }
+            // 同步 replacement 的 declaring_class_ (对标 Frida synchronize_replacement_methods)
+            let HookType::Replaced { replacement_addr, .. } = &data.hook_type;
+            if *replacement_addr != 0 {
+                std::ptr::write_volatile(*replacement_addr as *mut u32, declaring_class);
             }
         }
 

@@ -340,13 +340,13 @@ unsafe fn chain_to_old_handler(sig: c_int, info: *mut siginfo_t, ucontext: *mut 
 extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *mut c_void) {
     unsafe {
         // --- WalkStack/GetDexPc NULL OatQuickMethodHeader 修复 (API 36) ---
-        // ART 的 WalkStack/GetDexPc 在处理被 hook 方法的栈帧时，内联的
-        // GetOatQuickMethodHeader 返回 NULL 后执行 LDR Wt, [Xn, #0x18] (Xn=0)
-        // → SIGSEGV fault_addr=0x18。
-        // 修复: 解码崩溃指令找到 base 寄存器 Xn，将其指向全零 dummy buffer。
+        // ART 的 WalkStack/GetDexPc/DecodeGcMasksOnly 在处理被 hook 方法的栈帧时，
+        // 可能对 NULL OatQuickMethodHeader 执行字段读取，既可能是 NULL+0x18，
+        // 也可能是 NULL+0x0 等前 64 字节访问。
+        // 修复: 解码当前 load 指令找到 base 寄存器 Xn，将其指向全零 dummy buffer。
         if sig == SIGSEGV && !info.is_null() && !ucontext.is_null() {
             let fault_addr = (*info).si_addr() as u64;
-            if fault_addr == 0x18 {
+            if fault_addr < DUMMY_OAT_HEADER_BUF.len() as u64 {
                 // bionic ucontext_t 布局: mcontext_t at offset 176
                 // regs[0..30] at +8, sp at +256, pc at +264
                 let uc_raw = ucontext as *mut u8;
@@ -357,7 +357,7 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
                 // 解码 LDR (unsigned offset): 1x11 1001 01ii iiii iiii iinn nnnt tttt
                 // 或 LDR Wt: 1011 1001 01.. ....
                 // 提取 Rn (base register): bits [9:5]
-                let is_ldr_unsigned = (insn & 0x3B400000) == 0x39400000;
+                let is_ldr_unsigned = (insn & 0x3B000000) == 0x39000000;
                 if is_ldr_unsigned {
                     let rn = ((insn >> 5) & 0x1F) as usize;
                     if rn < 31 && *regs_ptr.add(rn) == 0 {

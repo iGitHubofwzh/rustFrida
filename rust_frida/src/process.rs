@@ -11,8 +11,8 @@ use std::mem::size_of_val;
 use std::path::Path;
 use std::process;
 
+use crate::types::{UserFpRegs, UserRegs};
 use crate::{log_info, log_success, log_warn};
-use crate::types::{UserRegs, UserFpRegs};
 
 /// 获取指定库的基址
 ///
@@ -212,9 +212,7 @@ fn set_fp_registers(pid: i32, regs: &UserFpRegs) -> Result<(), String> {
         iov_base: regs as *const _ as *mut c_void,
         iov_len: size_of_val(regs),
     };
-    let result = unsafe {
-        libc::ptrace(PTRACE_SETREGSET, pid as pid_t, 2, &mut iov as *mut _ as *mut c_void)
-    };
+    let result = unsafe { libc::ptrace(PTRACE_SETREGSET, pid as pid_t, 2, &mut iov as *mut _ as *mut c_void) };
     if result == -1 {
         let errno = unsafe { *libc::__errno() };
         return Err(format!("设置 FP 寄存器失败，错误码: {}", errno));
@@ -270,7 +268,11 @@ pub(crate) fn call_target_function(
             log_warn!("PC 设置验证失败: 期望 0x{:x}, 实际 0x{:x}", new_regs.pc, verify.pc);
         }
         if verify.regs[30] != new_regs.regs[30] {
-            log_warn!("LR 设置验证失败: 期望 0x{:x}, 实际 0x{:x}", new_regs.regs[30], verify.regs[30]);
+            log_warn!(
+                "LR 设置验证失败: 期望 0x{:x}, 实际 0x{:x}",
+                new_regs.regs[30],
+                verify.regs[30]
+            );
         }
     }
 
@@ -329,10 +331,14 @@ pub(crate) fn call_target_function(
                     if verify.pc != orig_regs.pc || verify.sp != orig_regs.sp || verify.regs[29] != orig_regs.regs[29] {
                         log_warn!(
                             "寄存器恢复验证: PC={:#x}→{:#x} SP={:#x}→{:#x} FP={:#x}→{:#x} LR={:#x}→{:#x}",
-                            orig_regs.pc, verify.pc,
-                            orig_regs.sp, verify.sp,
-                            orig_regs.regs[29], verify.regs[29],
-                            orig_regs.regs[30], verify.regs[30]
+                            orig_regs.pc,
+                            verify.pc,
+                            orig_regs.sp,
+                            verify.sp,
+                            orig_regs.regs[29],
+                            verify.regs[29],
+                            orig_regs.regs[30],
+                            verify.regs[30]
                         );
                     }
 

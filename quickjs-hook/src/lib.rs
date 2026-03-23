@@ -36,13 +36,13 @@ pub mod value;
 pub use completion::complete_script;
 pub use context::JSContext;
 pub use jsapi::console::set_console_callback;
+pub use jsapi::deferred_java_init;
 pub use jsapi::hook_api::cleanup_hooks;
 #[cfg(feature = "qbdi")]
 pub use jsapi::hook_api::preload_qbdi_helper;
 #[cfg(feature = "qbdi")]
 pub use jsapi::hook_api::shutdown_qbdi_helper;
 pub use jsapi::java::cleanup_java_hooks;
-pub use jsapi::deferred_java_init;
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 

@@ -6,7 +6,9 @@ use nix::unistd::Pid;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 
-use crate::process::{attach_to_process, call_target_function, read_memory, read_remote_mem, write_bytes, write_memory};
+use crate::process::{
+    attach_to_process, call_target_function, read_memory, read_remote_mem, write_bytes, write_memory,
+};
 use crate::types::{bootstrap_status, message_type, FridaBootstrapContext, FridaLibcApi, RustFridaLoaderContext};
 use crate::{log_error, log_info, log_success, log_verbose, log_warn};
 
@@ -118,7 +120,9 @@ fn read_target_mls_range(pid: i32) -> Option<String> {
     let _role = parts.next()?;
     let _type = parts.next()?;
     let mls = parts.next()?;
-    if mls.is_empty() { return None; }
+    if mls.is_empty() {
+        return None;
+    }
     Some(mls.to_string())
 }
 
@@ -226,14 +230,17 @@ pub(crate) fn watch_and_inject(
 /// 优先选择 linker64（所有 Android 进程都有），避免覆盖 libc 的热代码
 fn find_executable_region(pid: i32, min_size: usize) -> Result<usize, String> {
     let maps_path = format!("/proc/{}/maps", pid);
-    let raw = std::fs::read(&maps_path)
-        .map_err(|e| format!("读取 {} 失败: {}", maps_path, e))?;
+    let raw = std::fs::read(&maps_path).map_err(|e| format!("读取 {} 失败: {}", maps_path, e))?;
     let maps = String::from_utf8_lossy(&raw);
 
     // 优先找 linker64 的 r-xp 段
     for line in maps.lines() {
-        if !line.contains("r-xp") { continue; }
-        if !line.contains("linker64") { continue; }
+        if !line.contains("r-xp") {
+            continue;
+        }
+        if !line.contains("linker64") {
+            continue;
+        }
 
         let parts: Vec<&str> = line.split_whitespace().collect();
         if let Some(range) = parts.first() {
@@ -250,7 +257,9 @@ fn find_executable_region(pid: i32, min_size: usize) -> Result<usize, String> {
 
     // fallback: 任何足够大的 r-xp 区域
     for line in maps.lines() {
-        if !line.contains("r-xp") { continue; }
+        if !line.contains("r-xp") {
+            continue;
+        }
         let parts: Vec<&str> = line.split_whitespace().collect();
         if let Some(range) = parts.first() {
             let mut it = range.split('-');
@@ -275,11 +284,41 @@ fn write_string_table_at(
 ) -> Result<usize, String> {
     // 复用 types.rs 中定义的字符串列表
     let entries: Vec<(&str, Vec<u8>)> = vec![
-        ("sym_name", overrides.get("sym_name").map(|s| s.as_bytes().to_vec()).unwrap_or_else(|| b"hello_entry".to_vec())),
-        ("pthread_err", overrides.get("pthread_err").map(|s| s.as_bytes().to_vec()).unwrap_or_else(|| b"pthreadded".to_vec())),
-        ("dlsym_err", overrides.get("dlsym_err").map(|s| s.as_bytes().to_vec()).unwrap_or_else(|| b"dlsymFail".to_vec())),
-        ("cmdline", overrides.get("cmdline").map(|s| s.as_bytes().to_vec()).unwrap_or_else(|| b"novalue".to_vec())),
-        ("output_path", overrides.get("output_path").map(|s| s.as_bytes().to_vec()).unwrap_or_else(|| b"novalue".to_vec())),
+        (
+            "sym_name",
+            overrides
+                .get("sym_name")
+                .map(|s| s.as_bytes().to_vec())
+                .unwrap_or_else(|| b"hello_entry".to_vec()),
+        ),
+        (
+            "pthread_err",
+            overrides
+                .get("pthread_err")
+                .map(|s| s.as_bytes().to_vec())
+                .unwrap_or_else(|| b"pthreadded".to_vec()),
+        ),
+        (
+            "dlsym_err",
+            overrides
+                .get("dlsym_err")
+                .map(|s| s.as_bytes().to_vec())
+                .unwrap_or_else(|| b"dlsymFail".to_vec()),
+        ),
+        (
+            "cmdline",
+            overrides
+                .get("cmdline")
+                .map(|s| s.as_bytes().to_vec())
+                .unwrap_or_else(|| b"novalue".to_vec()),
+        ),
+        (
+            "output_path",
+            overrides
+                .get("output_path")
+                .map(|s| s.as_bytes().to_vec())
+                .unwrap_or_else(|| b"novalue".to_vec()),
+        ),
     ];
 
     // 每个条目: u64 (ptr) + u32 (len) + 4 bytes padding = 16 bytes
@@ -301,9 +340,9 @@ fn write_string_table_at(
     let mut table_data = Vec::with_capacity(table_size);
     for (offset, len) in &string_offsets {
         let ptr = (strings_base + offset) as u64;
-        table_data.extend_from_slice(&ptr.to_le_bytes());      // u64 ptr
+        table_data.extend_from_slice(&ptr.to_le_bytes()); // u64 ptr
         table_data.extend_from_slice(&(*len as u32).to_le_bytes()); // u32 len
-        table_data.extend_from_slice(&[0u8; 4]);                // padding
+        table_data.extend_from_slice(&[0u8; 4]); // padding
     }
 
     // 写入 StringTable struct
@@ -361,7 +400,14 @@ fn recv_exact(sockfd: RawFd, buf: &mut [u8]) -> Result<(), String> {
 fn send_exact(sockfd: RawFd, buf: &[u8]) -> Result<(), String> {
     let mut done = 0;
     while done < buf.len() {
-        let n = unsafe { libc::send(sockfd, buf[done..].as_ptr() as *const c_void, buf.len() - done, libc::MSG_NOSIGNAL) };
+        let n = unsafe {
+            libc::send(
+                sockfd,
+                buf[done..].as_ptr() as *const c_void,
+                buf.len() - done,
+                libc::MSG_NOSIGNAL,
+            )
+        };
         if n <= 0 {
             return Err(format!("send_exact: send 失败 (n={})", n));
         }
@@ -396,7 +442,11 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String
     let mut written = 0usize;
     while written < AGENT_SO.len() {
         let n = unsafe {
-            libc::write(agent_memfd, AGENT_SO[written..].as_ptr() as *const c_void, AGENT_SO.len() - written)
+            libc::write(
+                agent_memfd,
+                AGENT_SO[written..].as_ptr() as *const c_void,
+                AGENT_SO.len() - written,
+            )
         };
         if n <= 0 {
             unsafe { close(agent_memfd) };
@@ -434,7 +484,11 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String
             let msg_len = u16::from_le_bytes(len_buf) as usize;
             let mut msg_buf = vec![0u8; msg_len];
             recv_exact(ctrl_fd, &mut msg_buf)?;
-            let kind = if t == message_type::ERROR_DLOPEN { "dlopen" } else { "dlsym" };
+            let kind = if t == message_type::ERROR_DLOPEN {
+                "dlopen"
+            } else {
+                "dlsym"
+            };
             let msg = String::from_utf8_lossy(&msg_buf);
             unsafe { close(host_repl_fd) };
             return Err(format!("Loader {} 失败: {}", kind, msg));
@@ -501,13 +555,12 @@ pub(crate) fn inject_via_bootstrapper(
 
     // 6. 调用 bootstrapper Phase 1（raw mmap syscall 分配内存）
     log_verbose!("bootstrapper Phase 1: mmap 分配...");
-    let status = call_target_function(pid, swap_addr, &[stack_ctx_addr], None)
-        .map_err(|e| {
-            // 恢复原始代码后再报错
-            let _ = write_bytes(pid, swap_addr, &original_code);
-            let _ = ptrace::detach(Pid::from_raw(pid), None);
-            format!("bootstrapper Phase 1 失败: {}", e)
-        })?;
+    let status = call_target_function(pid, swap_addr, &[stack_ctx_addr], None).map_err(|e| {
+        // 恢复原始代码后再报错
+        let _ = write_bytes(pid, swap_addr, &original_code);
+        let _ = ptrace::detach(Pid::from_raw(pid), None);
+        format!("bootstrapper Phase 1 失败: {}", e)
+    })?;
 
     if status != bootstrap_status::ALLOCATION_SUCCESS {
         let _ = write_bytes(pid, swap_addr, &original_code);
@@ -544,11 +597,10 @@ pub(crate) fn inject_via_bootstrapper(
     write_memory(pid, ctx_addr, &bootstrap_ctx)?;
 
     log_verbose!("调用 bootstrapper Phase 2...");
-    let status = call_target_function(pid, alloc_base, &[ctx_addr], None)
-        .map_err(|e| {
-            let _ = ptrace::detach(Pid::from_raw(pid), None);
-            format!("bootstrapper Phase 2 失败: {}", e)
-        })?;
+    let status = call_target_function(pid, alloc_base, &[ctx_addr], None).map_err(|e| {
+        let _ = ptrace::detach(Pid::from_raw(pid), None);
+        format!("bootstrapper Phase 2 失败: {}", e)
+    })?;
 
     match status {
         s if s == bootstrap_status::SUCCESS => {
@@ -588,11 +640,18 @@ pub(crate) fn inject_via_bootstrapper(
 
     // 提取 ctrlfds[0] 到 host
     let host_ctrl_fd = extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0])?;
-    log_verbose!("已提取 ctrl fd: target {} → host {}", bootstrap_ctx.ctrlfds[0], host_ctrl_fd);
+    log_verbose!(
+        "已提取 ctrl fd: target {} → host {}",
+        bootstrap_ctx.ctrlfds[0],
+        host_ctrl_fd
+    );
 
     // === 写入 StringTable ===
-    let string_table_offset = size_of::<FridaLibcApi>() + size_of::<FridaBootstrapContext>()
-        + size_of::<RustFridaLoaderContext>() + size_of::<FridaLibcApi>() + 256; // 预留字符串区
+    let string_table_offset = size_of::<FridaLibcApi>()
+        + size_of::<FridaBootstrapContext>()
+        + size_of::<RustFridaLoaderContext>()
+        + size_of::<FridaLibcApi>()
+        + 256; // 预留字符串区
     let string_table_base = data_base + string_table_offset;
     let string_table_addr = write_string_table_at(pid, string_table_base, string_overrides)?;
     log_verbose!("StringTable 写入: 0x{:x}", string_table_addr);
@@ -613,7 +672,11 @@ pub(crate) fn inject_via_bootstrapper(
     let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
     write_bytes(pid, str_base, entrypoint_str)?;
     write_bytes(pid, str_base + entrypoint_str.len(), data_str)?;
-    write_bytes(pid, str_base + entrypoint_str.len() + data_str.len(), fallback_str.as_bytes())?;
+    write_bytes(
+        pid,
+        str_base + entrypoint_str.len() + data_str.len(),
+        fallback_str.as_bytes(),
+    )?;
 
     // 构造 LoaderContext
     let mut loader_ctx = RustFridaLoaderContext::default();
@@ -630,12 +693,11 @@ pub(crate) fn inject_via_bootstrapper(
 
     // 调用 loader（执行 pthread_create 后立即返回）
     log_verbose!("调用 loader...");
-    let _ = call_target_function(pid, alloc_base, &[loader_ctx_addr], None)
-        .map_err(|e| {
-            unsafe { close(host_ctrl_fd) };
-            let _ = ptrace::detach(Pid::from_raw(pid), None);
-            format!("loader 执行失败: {}", e)
-        })?;
+    let _ = call_target_function(pid, alloc_base, &[loader_ctx_addr], None).map_err(|e| {
+        unsafe { close(host_ctrl_fd) };
+        let _ = ptrace::detach(Pid::from_raw(pid), None);
+        format!("loader 执行失败: {}", e)
+    })?;
 
     // === 分离前验证寄存器状态 ===
     {
@@ -643,7 +705,11 @@ pub(crate) fn inject_via_bootstrapper(
         if let Ok(r) = final_regs {
             log_verbose!(
                 "分离前寄存器: PC={:#x} SP={:#x} LR={:#x} FP(x29)={:#x} x19={:#x}",
-                r.pc, r.sp, r.regs[30], r.regs[29], r.regs[19]
+                r.pc,
+                r.sp,
+                r.regs[30],
+                r.regs[29],
+                r.regs[19]
             );
         }
     }

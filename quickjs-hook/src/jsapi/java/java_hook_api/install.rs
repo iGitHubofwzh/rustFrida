@@ -12,8 +12,8 @@ use super::super::art_method::*;
 use super::super::callback::*;
 use super::super::jni_core::*;
 use super::install_support::{
-    alloc_art_method_clone, create_class_global_ref, create_replacement_art_method, install_per_method_router_hook,
-    update_original_method_flags_for_hook, JavaHookInstallGuard,
+    alloc_art_method_clone, create_class_global_ref, create_replacement_art_method,
+    install_per_method_router_hook, update_original_method_flags_for_hook, JavaHookInstallGuard,
 };
 
 pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
@@ -175,9 +175,13 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         has_independent_code, original_entry_point
     ));
 
+    // Clone+Replace 模式 (对标 Frida):
+    // 原始 ArtMethod 仅修改 flags (deopt)，不设 kAccNative。
+    // replacement ArtMethod (heap) 设为 kAccNative + jniCode=thunk + quickCode=jni_trampoline。
+    // 通过 artController Layer 1+2+3 路由 original → replacement。
+
     // current_pc_hint 统一传 0: replacement 已标记 kAccNative，
     // ART JNI 路径会正确处理 native 方法的 frame。
-    // 不需要 fake hint PC，让 JNI trampoline 正常走完 epilogue。
     let thunk = hook_ffi::hook_create_native_trampoline(
         art_method,
         Some(java_hook_callback),
@@ -204,11 +208,6 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         Err(msg) => return throw_internal_error(ctx, msg),
     };
     install_guard.set_replacement_addr(replacement_addr);
-
-    // Clone+Replace 模式 (对标 Frida):
-    // 原始 ArtMethod 仅修改 flags (deopt)，不设 kAccNative。
-    // replacement ArtMethod (heap) 设为 kAccNative + jniCode=thunk + quickCode=jni_trampoline。
-    // 通过 artController Layer 1+2+3 路由 original → replacement。
 
     // B1: 确保 artController 已初始化 (Layer 1 + Layer 2 全局 hook)
     ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);

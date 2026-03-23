@@ -65,19 +65,19 @@ pub(crate) mod message_type {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FridaBootstrapContext {
-    pub(crate) allocation_base: u64,  // void *
-    pub(crate) allocation_size: u64,  // size_t
-    pub(crate) page_size: u64,        // size_t
-    pub(crate) fallback_ld: u64,      // const char * (unused on Android)
-    pub(crate) fallback_libc: u64,    // const char * (unused on Android)
-    pub(crate) rtld_flavor: i32,      // FridaRtldFlavor (int)
-    _pad0: i32,                       // 对齐 padding
-    pub(crate) rtld_base: u64,        // void *
+    pub(crate) allocation_base: u64, // void *
+    pub(crate) allocation_size: u64, // size_t
+    pub(crate) page_size: u64,       // size_t
+    pub(crate) fallback_ld: u64,     // const char * (unused on Android)
+    pub(crate) fallback_libc: u64,   // const char * (unused on Android)
+    pub(crate) rtld_flavor: i32,     // FridaRtldFlavor (int)
+    _pad0: i32,                      // 对齐 padding
+    pub(crate) rtld_base: u64,       // void *
     pub(crate) r_brk: u64,           // void *
     pub(crate) enable_ctrlfds: i32,
     pub(crate) ctrlfds: [i32; 2],
-    _pad1: i32,                       // 对齐 padding（ctrlfds 后 12 字节到下一个 8 字节边界）
-    pub(crate) libc: u64,            // FridaLibcApi *
+    _pad1: i32,           // 对齐 padding（ctrlfds 后 12 字节到下一个 8 字节边界）
+    pub(crate) libc: u64, // FridaLibcApi *
 }
 
 impl Default for FridaBootstrapContext {
@@ -93,7 +93,7 @@ impl Default for FridaBootstrapContext {
 pub(crate) struct FridaLibcApi {
     pub(crate) printf: u64,
     pub(crate) sprintf: u64,
-    pub(crate) mmap_fn: u64,        // 避免与 libc::mmap 冲突
+    pub(crate) mmap_fn: u64, // 避免与 libc::mmap 冲突
     pub(crate) munmap_fn: u64,
     pub(crate) socket: u64,
     pub(crate) socketpair: u64,
@@ -127,10 +127,10 @@ pub(crate) struct RustFridaLoaderContext {
     pub(crate) agent_entrypoint: u64, // const char *
     pub(crate) agent_data: u64,       // const char *
     pub(crate) fallback_address: u64, // const char *
-    pub(crate) libc: u64,            // FridaLibcApi *
+    pub(crate) libc: u64,             // FridaLibcApi *
     pub(crate) string_table_addr: u64,
-    pub(crate) worker: u64,          // pthread_t (runtime, zeroed)
-    pub(crate) agent_handle: u64,    // void * (runtime, zeroed)
+    pub(crate) worker: u64,                // pthread_t (runtime, zeroed)
+    pub(crate) agent_handle: u64,          // void * (runtime, zeroed)
     pub(crate) agent_entrypoint_impl: u64, // fn ptr (runtime, zeroed)
 }
 
@@ -139,4 +139,3 @@ impl Default for RustFridaLoaderContext {
         unsafe { std::mem::zeroed() }
     }
 }
-

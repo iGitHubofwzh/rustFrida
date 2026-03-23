@@ -147,7 +147,13 @@ unsafe fn invoke_clone_jni(
     is_static: bool,
     jargs_ptr: *const std::ffi::c_void,
 ) -> u64 {
-    // 对标 Frida: declaring_class_ 不在热路径同步，由 GC 回调批量同步
+    // 同步 clone 的 declaring_class_: GC 可能已移动 declaring class，
+    // clone (malloc'd) 不被 GC 追踪，declaring_class_ 可能 stale。
+    // 每次调用前从 original 拷贝到 clone，消除竞态。
+    if art_method_addr != 0 && clone_addr != 0 {
+        let dc = std::ptr::read_volatile(art_method_addr as *const u32);
+        std::ptr::write_volatile(clone_addr as *mut u32, dc);
+    }
     jni_check_exc(env);
 
     let clone_mid = clone_addr as *mut std::ffi::c_void;
@@ -411,6 +417,7 @@ unsafe extern "C" fn js_call_original(
         std::ptr::null()
     };
 
+    // 恢复 JNI trampoline 后, x[1] 是标准 JNI jobject (由 ART 转换)
     // Invoke clone via shared JNI helper
     let ret_raw = invoke_clone_jni(
         env,

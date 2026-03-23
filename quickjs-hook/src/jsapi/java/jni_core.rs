@@ -89,6 +89,8 @@ pub(super) type DeleteLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c
 pub(super) type NewLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type NewGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type DeleteGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void);
+pub(super) type MonitorEnterFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32;
+pub(super) type MonitorExitFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32;
 pub(super) type GetObjectClassFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type GetSuperclassFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type IsSameObjectFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
@@ -598,6 +600,8 @@ pub(super) const JNI_GET_OBJECT_CLASS: usize = 31;
 pub(super) const JNI_IS_INSTANCE_OF: usize = 32;
 pub(super) const JNI_NEW_GLOBAL_REF: usize = 21;
 pub(super) const JNI_NEW_LOCAL_REF: usize = 25;
+pub(super) const JNI_MONITOR_ENTER: usize = 217;
+pub(super) const JNI_MONITOR_EXIT: usize = 218;
 pub(super) const JNI_GET_FIELD_ID: usize = 94;
 pub(super) const JNI_GET_OBJECT_FIELD: usize = 95;
 pub(super) const JNI_GET_BOOLEAN_FIELD: usize = 96;
@@ -673,11 +677,7 @@ pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
             return Err("dlsym(JNI_GetCreatedJavaVMs) failed".to_string());
         }
 
-        let get_vms: unsafe extern "C" fn(
-            *mut *mut std::ffi::c_void,
-            i32,
-            *mut i32,
-        ) -> i32 = std::mem::transmute(sym);
+        let get_vms: unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32, *mut i32) -> i32 = std::mem::transmute(sym);
 
         let mut vm_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut vm_count: i32 = 0;
@@ -702,11 +702,8 @@ pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
 unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv, String> {
     // 先试 GetEnv — 如果当前线程已 attach，直接返回（不触发 Thread::Attach）
     let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
-    let get_env_fn: unsafe extern "C" fn(
-        *mut std::ffi::c_void,
-        *mut *mut std::ffi::c_void,
-        i32,
-    ) -> i32 = std::mem::transmute(*vm_table.add(6)); // GetEnv = index 6
+    let get_env_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void, i32) -> i32 =
+        std::mem::transmute(*vm_table.add(6)); // GetEnv = index 6
 
     let mut env_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let get_env_ret = get_env_fn(vm_ptr, &mut env_ptr, 0x00010006); // JNI_VERSION_1_6

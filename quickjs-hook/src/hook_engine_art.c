@@ -24,6 +24,8 @@ volatile uint64_t g_art_router_last_hit_x0 = 0;
  * ============================================================================ */
 
 int hook_art_router_table_add(uint64_t original, uint64_t replacement) {
+    hook_log("[art_router] table_add: original=%llx, replacement=%llx",
+             (unsigned long long)original, (unsigned long long)replacement);
     /* Find first empty slot (original == 0 is sentinel) */
     for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
         if (g_art_router_table[i].original == original) {
@@ -227,8 +229,9 @@ static void emit_art_router_debug_counters(Arm64Writer* w) {
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
 }
 
-/* Found path: load replacement into X0, load quickCode, restore d0-d7,
- * discard saved X16/X17, BR X17 to replacement.quickCode.
+/* Found path: load replacement ArtMethod from table[i].replacement,
+ * overwrite saved X0 with replacement, restore all regs, then jump to
+ * replacement.entry_point_ (jni_trampoline).
  *
  * 对标 Frida: declaring_class_ 不在 trampoline 里同步。
  * Frida 的 find_replacement_method_from_quick_code 是纯读操作，
@@ -237,24 +240,38 @@ static void emit_art_router_debug_counters(Arm64Writer* w) {
 static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
                                         uint32_t quickcode_offset,
                                         uint64_t current_pc_hint) {
-    arm64_writer_put_label(w, lbl_found);
-    /* Debug: increment hit counter (X17=original, X16=&table[i]) */
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X0, (uint64_t)&g_art_router_hit_count);
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X0, 0);
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X17, ARM64_REG_X17, 1);
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X0, 0);
+    (void)current_pc_hint;
 
-    /* At this point: X16 = &table[i] */
-    /* 把 replacement 写入 saved x0 slot (对标 Frida: overwrite saved x0 with replacement) */
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);  /* X17 = replacement */
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);   /* saved_x0 = replacement */
-    /* 不做 LR/x20 swap。replacement 已标记 kAccNative，ART JNI 路径会正确处理。
-     * 之前的 swap 会导致 native thunk 绕过 GenericJniMethodEnd，
-     * JNI transition frame 泄漏在栈上 → GC WalkStack 查 StackMap abort。
-     * 保持 LR = caller 真实返回地址，让 JNI 正常走完 epilogue。 */
+    arm64_writer_put_label(w, lbl_found);
+
+    /* Debug: increment hit counter + store last hit X0 */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_art_router_hit_count);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X0, ARM64_REG_X0, 1);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
+
+    /* X16 points to matched table entry; load replacement ArtMethod* from offset 8 */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
+
+    /* 内联同步 declaring_class_ (offset 0, 4 bytes):
+     * GC 移动对象后 original 的 declaring_class_ 已更新，
+     * 但 replacement (malloc'd) 不被 GC 追踪 → 可能 stale。
+     * 每次 found 命中时从 original 拷贝到 replacement，消除竞态窗口。
+     * X16 仍指向 table entry: [X16+0]=original, [X16+8]=replacement(=X17) */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 0);  /* X0 = original */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X0, 0);   /* W0 = original->declaring_class_ */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X17, 0);  /* replacement->declaring_class_ = W0 */
+
+    /* Overwrite saved X0 on stack (SP+0) with replacement ArtMethod* */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+
+    /* Restore all regs — X0 now holds replacement ArtMethod* */
     emit_art_router_restore_all(w);
-    /* 恢复后 X0 = replacement ArtMethod*, 从中加载 quickCode 到 X16 */
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X0, (int64_t)quickcode_offset);
+
+    /* Load replacement.entry_point_ (= jni_trampoline) and branch to it.
+     * X0 = replacement ArtMethod*, so JNI trampoline sees a kAccNative method
+     * and calls replacement.data_ (= our thunk) → java_hook_callback. */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X0, quickcode_offset);
     arm64_writer_put_br_reg(w, ARM64_REG_X16);
 }
 
@@ -404,7 +421,7 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     }
 
     /* Allocate thunk (router code — larger than default) */
-    size_t art_thunk_alloc = 1024;
+    size_t art_thunk_alloc = 2048;
     if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
         entry->thunk = hook_alloc_near(art_thunk_alloc, target);
         entry->thunk_alloc = art_thunk_alloc;
@@ -467,7 +484,7 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
     pthread_mutex_lock(&g_engine.lock);
 
     /* stub 通过 ArtMethod.entry_point_ 指针间接调用，不需要 near */
-    size_t stub_alloc = 1024;
+    size_t stub_alloc = 2048;
     void* stub_mem = hook_alloc(stub_alloc);
     if (!stub_mem) {
         pthread_mutex_unlock(&g_engine.lock);

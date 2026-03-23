@@ -243,7 +243,6 @@ fn main() {
         }
     }
 
-
     let mut rl = match Editor::new() {
         Ok(e) => e,
         Err(e) => {
@@ -310,8 +309,10 @@ fn main() {
                 // Fix #1: loadjs/jseval/jsinit 都等待 EVAL:/EVAL_ERR: 响应并显示结果
                 // jsinit 也走 eval 等待，避免其 EVAL:initialized 响应污染后续 jseval 通道
                 let is_recomp = line.starts_with("recomp");
-                let is_eval_cmd =
-                    line.starts_with("jseval ") || line.starts_with("loadjs ") || line == "jsinit" || line == "jsclean"
+                let is_eval_cmd = line.starts_with("jseval ")
+                    || line.starts_with("loadjs ")
+                    || line == "jsinit"
+                    || line == "jsclean"
                     || is_recomp;
                 if is_eval_cmd {
                     eval_state().clear();
@@ -349,4 +350,3 @@ fn main() {
     // 等待 handler 线程退出（agent cleanup 完成后主动关闭 socket，host 收到 EOF 自然退出）
     let _ = handle.join();
 }
-

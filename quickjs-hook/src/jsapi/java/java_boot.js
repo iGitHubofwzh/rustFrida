@@ -582,6 +582,13 @@
         // 首个注册：安装 gate hook
         if (_readyCallbacks.length === 0) {
             _hook("android/app/Instrumentation", "newApplication", _readyGateSig, function(ctx) {
+                // 先执行原始 newApplication。stealth2/recomp 下如果在编译方法入口
+                // offset 0 就触发 FindClass/WalkStack，ART 可能在 GetDexPc/StackMap
+                // 路径上看到当前 quick frame native_pc=0 并 abort。
+                // 将 ClassLoader 更新和 ready 回调后置，避开“当前被 hook 编译帧”
+                // 仍停在入口 PC 的窗口。
+                var app = ctx.orig();
+
                 // 从第一个参数获取 ClassLoader 并更新缓存
                 if (ctx.args && ctx.args[0] !== null && ctx.args[0] !== undefined) {
                     var clPtr = ctx.args[0];
@@ -604,8 +611,7 @@
                     }
                 }
 
-                // 调用原始方法 — app 继续 (attachBaseContext, onCreate 等)
-                return ctx.orig();
+                return app;
             });
         }
 

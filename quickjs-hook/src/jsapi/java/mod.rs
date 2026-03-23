@@ -53,8 +53,8 @@ use crate::jsapi::console::output_message;
 use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
 
-use art_controller::{set_stealth_mode, stealth_mode};
 use crate::jsapi::hook_api::StealthMode;
+use art_controller::{set_stealth_mode, stealth_mode};
 use art_method::try_invalidate_jit_cache;
 use callback::*;
 use java_field_api::*;
@@ -490,11 +490,7 @@ pub fn pre_init_art_controller() -> Result<(), String> {
         // 发现 ART bridge 函数
         let bridge = art_method::find_art_bridge_functions(env, ep_offset);
         // 初始化 artController (安装 Layer 1+2 全局 hooks)
-        art_controller::ensure_art_controller_initialized(
-            &bridge,
-            ep_offset,
-            env as *mut std::ffi::c_void,
-        );
+        art_controller::ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
     }
     Ok(())
 }
@@ -504,9 +500,10 @@ pub fn pre_init_art_controller() -> Result<(), String> {
 /// Spawn 模式延迟 JNI 初始化：AttachCurrentThread + cache reflect IDs + 触发 gate hook。
 /// 在 resume 之后调用（ART 已完成 post-fork 初始化）。
 pub fn deferred_java_init() -> Result<(), String> {
-    let env = ensure_jni_initialized()
-        .map_err(|e| format!("deferred_java_init: {}", e))?;
-    unsafe { cache_reflect_ids(env); }
+    let env = ensure_jni_initialized().map_err(|e| format!("deferred_java_init: {}", e))?;
+    unsafe {
+        cache_reflect_ids(env);
+    }
 
     crate::jsapi::console::output_message("[java] deferred_java_init: JNI 已就绪");
 
@@ -648,11 +645,27 @@ pub fn cleanup_java_hooks() {
     if let Ok(env) = ensure_jni_initialized() {
         unsafe {
             cleanup_enumerated_classloader_refs(env);
+            cleanup_cached_class_refs(env);
         }
     }
 
+    // DEBUG: cleanup 前打印 art_router hit/miss 计数
+    unsafe {
+        let mut last_x0: u64 = 0;
+        let mut miss_count: u64 = 0;
+        let mut hit_count: u64 = 0;
+        hook_ffi::hook_art_router_get_debug(&mut last_x0, &mut miss_count);
+        hook_ffi::hook_art_router_get_hit_debug(&mut hit_count, std::ptr::null_mut());
+        let do_call_total = art_controller::DO_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let do_call_hits = art_controller::DO_CALL_HIT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        output_message(&format!(
+            "[art_router_debug] cleanup: router_hit={}, router_miss={}, last_x0={:#x}, docall_total={}, docall_hit={}",
+            hit_count, miss_count, last_x0, do_call_total, do_call_hits
+        ));
+        hook_ffi::hook_art_router_table_dump();
+    }
+
     // 【关键】先清空 C 侧 ART router 查表，切断路由 → 防止并发线程通过
-    // Layer 1 router 访问即将释放的 replacement ArtMethod (UAF)
     unsafe {
         hook_ffi::hook_art_router_table_clear();
     }

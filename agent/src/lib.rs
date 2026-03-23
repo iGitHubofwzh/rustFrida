@@ -292,8 +292,12 @@ fn process_cmd(command: &str) {
                     Ok((recomp_base, stats)) => {
                         send_eval_ok(&format!(
                             "recomp 0x{:x} → 0x{:x} (copied={} intra={} reloc={} tramp={})",
-                            addr, recomp_base, stats.num_copied, stats.num_intra_page,
-                            stats.num_direct_reloc, stats.num_trampolines
+                            addr,
+                            recomp_base,
+                            stats.num_copied,
+                            stats.num_intra_page,
+                            stats.num_direct_reloc,
+                            stats.num_trampolines
                         ));
                     }
                     Err(e) => send_eval_err(&e),

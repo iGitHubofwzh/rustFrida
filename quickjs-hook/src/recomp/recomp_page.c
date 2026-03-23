@@ -419,6 +419,13 @@ int recompile_page(
         if (rr == ARM64_RELOC_OK) {
             recomp_insns[i] = relocated;
             local_stats.num_direct_reloc++;
+            /* DEBUG: ADRP 直接重定位详细日志 */
+            if (info.type == ARM64_INSN_ADRP || info.type == ARM64_INSN_ADR) {
+                hook_log("[recomp-RELOC] page=%llx +0x%03x: %08x → %08x  type=%s target=%llx dst_reg=%d",
+                         (unsigned long long)orig_base, i * 4, insn, relocated,
+                         info.type == ARM64_INSN_ADRP ? "ADRP" : "ADR",
+                         (unsigned long long)info.target, (int)info.dst_reg);
+            }
             continue;
         }
 
@@ -468,6 +475,26 @@ int recompile_page(
 
         recomp_insns[i] = branch_insn;
         local_stats.num_trampolines++;
+
+        /* DEBUG: 打印每条跳板化指令的详细信息 */
+        {
+            static const char* type_names[] = {
+                [ARM64_INSN_B]="B", [ARM64_INSN_BL]="BL", [ARM64_INSN_B_COND]="B.cond",
+                [ARM64_INSN_CBZ]="CBZ", [ARM64_INSN_CBNZ]="CBNZ",
+                [ARM64_INSN_TBZ]="TBZ", [ARM64_INSN_TBNZ]="TBNZ",
+                [ARM64_INSN_ADR]="ADR", [ARM64_INSN_ADRP]="ADRP",
+                [ARM64_INSN_LDR_LITERAL]="LDR_LIT", [ARM64_INSN_LDRSW_LITERAL]="LDRSW_LIT",
+                [ARM64_INSN_LDR_LITERAL_FP]="LDR_LIT_FP",
+                [ARM64_INSN_PRFM_LITERAL]="PRFM_LIT",
+                [ARM64_INSN_BR]="BR", [ARM64_INSN_BLR]="BLR", [ARM64_INSN_RET]="RET",
+            };
+            const char* tname = (info.type < sizeof(type_names)/sizeof(type_names[0]) && type_names[info.type])
+                ? type_names[info.type] : "?";
+            hook_log("[recomp-TRAMP] page=%llx +0x%03x: %08x → B tramp  type=%-10s target=%llx dst_reg=%d tramp_pc=%llx ret=%llx",
+                     (unsigned long long)orig_base, i * 4, insn, tname,
+                     (unsigned long long)info.target, (int)info.dst_reg,
+                     (unsigned long long)tramp_pc, (unsigned long long)return_addr);
+        }
     }
 
     /* flush writer 的 label 引用 */
