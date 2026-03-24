@@ -55,7 +55,7 @@ use crate::value::JSValue;
 
 use crate::jsapi::hook_api::StealthMode;
 use art_controller::{set_stealth_mode, stealth_mode};
-use art_method::try_invalidate_jit_cache;
+use art_method::{resolve_art_method, try_invalidate_jit_cache};
 use callback::*;
 use java_field_api::*;
 use java_hook_api::*;
@@ -215,6 +215,93 @@ unsafe extern "C" fn js_java_deopt(
     try_invalidate_jit_cache();
     output_verbose("[java deopt] JIT 缓存清空完成");
     JSValue::bool(true).raw()
+}
+
+/// JS CFunction: Java.deoptimizeBootImage() — 对标 Frida Java.deoptimizeBootImage()
+/// Boot image AOT 方法降级为 interpreter (API >= 26)
+unsafe extern "C" fn js_java_deoptimize_boot_image(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    match art_controller::deoptimize_boot_image() {
+        Ok(()) => JSValue::bool(true).raw(),
+        Err(e) => {
+            let msg = std::ffi::CString::new(e).unwrap_or_default();
+            ffi::JS_ThrowInternalError(ctx, msg.as_ptr())
+        }
+    }
+}
+
+/// JS CFunction: Java.deoptimizeEverything() — 对标 Frida Java.deoptimizeEverything()
+/// 全局强制解释执行
+unsafe extern "C" fn js_java_deoptimize_everything(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    match art_controller::deoptimize_everything() {
+        Ok(()) => JSValue::bool(true).raw(),
+        Err(e) => {
+            let msg = std::ffi::CString::new(e).unwrap_or_default();
+            ffi::JS_ThrowInternalError(ctx, msg.as_ptr())
+        }
+    }
+}
+
+/// JS CFunction: Java.deoptimizeMethod(class, method, sig) — 对标 Frida Java.deoptimizeMethod()
+/// 单个方法降级为 interpreter
+unsafe extern "C" fn js_java_deoptimize_method(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 3 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"deoptimizeMethod(class, method, sig) requires 3 arguments\0".as_ptr() as *const _,
+        );
+    }
+
+    let class_name = match crate::jsapi::callback_util::extract_string_arg(
+        ctx, JSValue(*argv), b"class must be a string\0",
+    ) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let method_name = match crate::jsapi::callback_util::extract_string_arg(
+        ctx, JSValue(*argv.add(1)), b"method must be a string\0",
+    ) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let sig = match crate::jsapi::callback_util::extract_string_arg(
+        ctx, JSValue(*argv.add(2)), b"sig must be a string\0",
+    ) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let env = match ensure_jni_initialized() {
+        Ok(e) => e,
+        Err(msg) => return crate::jsapi::callback_util::throw_internal_error(ctx, msg),
+    };
+
+    let (art_method, _is_static) = match resolve_art_method(env, &class_name, &method_name, &sig, false) {
+        Ok(r) => r,
+        Err(msg) => return crate::jsapi::callback_util::throw_internal_error(ctx, msg),
+    };
+
+    match art_controller::deoptimize_method(art_method) {
+        Ok(()) => JSValue::bool(true).raw(),
+        Err(e) => {
+            let msg = std::ffi::CString::new(e).unwrap_or_default();
+            ffi::JS_ThrowInternalError(ctx, msg.as_ptr())
+        }
+    }
 }
 
 /// JS CFunction: Java._artRouterDebug() — dump ART router not_found capture
@@ -543,6 +630,9 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "hook", js_java_hook, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "unhook", js_java_unhook, 3);
         add_cfunction_to_object(ctx_ptr, java_obj, "deopt", js_java_deopt, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "deoptimizeBootImage", js_java_deoptimize_boot_image, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "deoptimizeEverything", js_java_deoptimize_everything, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "deoptimizeMethod", js_java_deoptimize_method, 3);
         add_cfunction_to_object(ctx_ptr, java_obj, "setStealth", js_java_set_stealth, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "getStealth", js_java_get_stealth, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_artRouterDebug", js_art_router_debug, 0);

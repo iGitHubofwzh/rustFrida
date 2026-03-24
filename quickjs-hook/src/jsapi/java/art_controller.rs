@@ -159,31 +159,107 @@ unsafe fn prepare_hook_target_inner(
 // DeoptimizeBootImage — 对标 Frida
 // ============================================================================
 
-/// 调用 art::Runtime::DeoptimizeBootImage() 将 boot image 中所有 AOT 编译方法
-/// 的 entry_point 改为 interpreter_bridge，确保调用走 interpreter → DoCall 路径。
-unsafe fn call_deoptimize_boot_image() {
+/// 获取 Instrumentation* 地址（按 InstrumentationSpec 的指针/嵌入模式解析）
+unsafe fn get_instrumentation_ptr() -> Result<u64, String> {
+    let spec = get_instrumentation_spec().ok_or("InstrumentationSpec 不可用")?;
+    let runtime = get_runtime_addr().ok_or("Runtime 地址不可用")?;
+
+    if spec.is_pointer_mode {
+        let ptr = *((runtime as usize + spec.runtime_instrumentation_offset) as *const u64);
+        let stripped = ptr & PAC_STRIP_MASK;
+        if stripped == 0 {
+            return Err("Instrumentation 指针为空".into());
+        }
+        Ok(stripped)
+    } else {
+        Ok(runtime + spec.runtime_instrumentation_offset as u64)
+    }
+}
+
+/// Java.deoptimizeBootImage() — 对标 Frida
+/// 调用 art::Runtime::DeoptimizeBootImage()，将 boot image AOT 方法降级为 interpreter。
+pub(super) unsafe fn deoptimize_boot_image() -> Result<(), String> {
     let sym = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime19DeoptimizeBootImageEv");
     if sym.is_null() {
-        output_verbose("[deopt] DeoptimizeBootImage 符号未找到，跳过");
-        return;
+        return Err("DeoptimizeBootImage 符号未找到 (API < 26?)".into());
     }
-
-    let runtime = match get_runtime_addr() {
-        Some(r) => r,
-        None => {
-            output_verbose("[deopt] Runtime 地址不可用，跳过 DeoptimizeBootImage");
-            return;
-        }
-    };
+    let runtime = get_runtime_addr().ok_or("Runtime 地址不可用")?;
 
     type DeoptFn = unsafe extern "C" fn(runtime: u64);
     let deopt: DeoptFn = std::mem::transmute(sym);
-    output_verbose(&format!(
-        "[deopt] 调用 DeoptimizeBootImage: func={:#x}, runtime={:#x}",
-        sym as u64, runtime
-    ));
     deopt(runtime);
-    output_verbose("[deopt] DeoptimizeBootImage 完成");
+    Ok(())
+}
+
+/// Java.deoptimizeEverything() — 对标 Frida
+/// 调用 art::Instrumentation::DeoptimizeEverything()，全局强制解释执行。
+/// API 30+: 直接调用 Instrumentation::DeoptimizeEverything
+/// API < 30: 需要 JDWP 会话（暂不支持，返回错误）
+pub(super) unsafe fn deoptimize_everything() -> Result<(), String> {
+    let instrumentation = get_instrumentation_ptr()?;
+
+    // 先检查并启用 deoptimization (API < 33)
+    let enable_sym = crate::jsapi::module::libart_dlsym(
+        "_ZN3art15instrumentation15Instrumentation20EnableDeoptimizationEv",
+    );
+    if !enable_sym.is_null() {
+        let spec = get_instrumentation_spec().unwrap();
+        if let Some(deopt_enabled_off) = spec.deoptimization_enabled_offset {
+            let enabled = *((instrumentation as usize + deopt_enabled_off) as *const u8);
+            if enabled == 0 {
+                type EnableFn = unsafe extern "C" fn(instrumentation: u64);
+                let enable: EnableFn = std::mem::transmute(enable_sym);
+                enable(instrumentation);
+            }
+        }
+    }
+
+    // 调用 DeoptimizeEverything(instrumentation, "rustfrida")
+    let sym = crate::jsapi::module::libart_dlsym(
+        "_ZN3art15instrumentation15Instrumentation20DeoptimizeEverythingEPKc",
+    );
+    if sym.is_null() {
+        return Err("Instrumentation::DeoptimizeEverything 符号未找到".into());
+    }
+
+    type DeoptFn = unsafe extern "C" fn(instrumentation: u64, key: *const u8);
+    let deopt: DeoptFn = std::mem::transmute(sym);
+    deopt(instrumentation, b"rustfrida\0".as_ptr());
+    Ok(())
+}
+
+/// Java.deoptimizeMethod(artMethod) — 对标 Frida
+/// 调用 art::Instrumentation::Deoptimize(ArtMethod*)，单个方法降级。
+pub(super) unsafe fn deoptimize_method(art_method: u64) -> Result<(), String> {
+    let instrumentation = get_instrumentation_ptr()?;
+
+    // 先检查并启用 deoptimization (API < 33)
+    let enable_sym = crate::jsapi::module::libart_dlsym(
+        "_ZN3art15instrumentation15Instrumentation20EnableDeoptimizationEv",
+    );
+    if !enable_sym.is_null() {
+        let spec = get_instrumentation_spec().unwrap();
+        if let Some(deopt_enabled_off) = spec.deoptimization_enabled_offset {
+            let enabled = *((instrumentation as usize + deopt_enabled_off) as *const u8);
+            if enabled == 0 {
+                type EnableFn = unsafe extern "C" fn(instrumentation: u64);
+                let enable: EnableFn = std::mem::transmute(enable_sym);
+                enable(instrumentation);
+            }
+        }
+    }
+
+    let sym = crate::jsapi::module::libart_dlsym(
+        "_ZN3art15instrumentation15Instrumentation10DeoptimizeEPNS_9ArtMethodE",
+    );
+    if sym.is_null() {
+        return Err("Instrumentation::Deoptimize 符号未找到".into());
+    }
+
+    type DeoptFn = unsafe extern "C" fn(instrumentation: u64, method: u64);
+    let deopt: DeoptFn = std::mem::transmute(sym);
+    deopt(instrumentation, art_method);
+    Ok(())
 }
 
 // ============================================================================
