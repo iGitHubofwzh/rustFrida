@@ -17,7 +17,7 @@
 //! 所有路由通过 replacedMethods 映射查找 replacement ArtMethod。
 
 use crate::ffi::hook as hook_ffi;
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
@@ -67,7 +67,7 @@ pub(super) fn set_stealth_mode(mode: StealthMode) {
         }
     }
 
-    output_message(&format!("[stealth] Java hook 模式: {}", label));
+    output_verbose(&format!("[stealth] Java hook 模式: {}", label));
 }
 
 /// 查询当前 stealth 模式
@@ -89,12 +89,12 @@ unsafe fn try_fixup_trampoline(trampoline: *mut std::ffi::c_void, orig_addr: u64
     }
     // 1. 用真正的原始指令重建 trampoline
     if let Err(e) = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, orig_addr as usize) {
-        output_message(&format!("[stealth2] fixup_trampoline {:#x}: {}", orig_addr, e));
+        output_verbose(&format!("[stealth2] fixup_trampoline {:#x}: {}", orig_addr, e));
         return;
     }
     // 2. thunk + trampoline 都就绪，原子写 B 指令激活 hook
     if let Err(e) = crate::recomp::commit_slot_patch(orig_addr as usize) {
-        output_message(&format!("[stealth2] commit_slot_patch {:#x}: {}", orig_addr, e));
+        output_verbose(&format!("[stealth2] commit_slot_patch {:#x}: {}", orig_addr, e));
     }
 }
 
@@ -164,26 +164,26 @@ unsafe fn prepare_hook_target_inner(
 unsafe fn call_deoptimize_boot_image() {
     let sym = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime19DeoptimizeBootImageEv");
     if sym.is_null() {
-        output_message("[deopt] DeoptimizeBootImage 符号未找到，跳过");
+        output_verbose("[deopt] DeoptimizeBootImage 符号未找到，跳过");
         return;
     }
 
     let runtime = match get_runtime_addr() {
         Some(r) => r,
         None => {
-            output_message("[deopt] Runtime 地址不可用，跳过 DeoptimizeBootImage");
+            output_verbose("[deopt] Runtime 地址不可用，跳过 DeoptimizeBootImage");
             return;
         }
     };
 
     type DeoptFn = unsafe extern "C" fn(runtime: u64);
     let deopt: DeoptFn = std::mem::transmute(sym);
-    output_message(&format!(
+    output_verbose(&format!(
         "[deopt] 调用 DeoptimizeBootImage: func={:#x}, runtime={:#x}",
         sym as u64, runtime
     ));
     deopt(runtime);
-    output_message("[deopt] DeoptimizeBootImage 完成");
+    output_verbose("[deopt] DeoptimizeBootImage 完成");
 }
 
 // ============================================================================
@@ -202,7 +202,7 @@ unsafe fn set_forced_interpret_only() {
     let spec = match get_instrumentation_spec() {
         Some(s) => s,
         None => {
-            output_message("[instrumentation] InstrumentationSpec 不可用，跳过 forced_interpret_only");
+            output_verbose("[instrumentation] InstrumentationSpec 不可用，跳过 forced_interpret_only");
             return;
         }
     };
@@ -210,7 +210,7 @@ unsafe fn set_forced_interpret_only() {
     let runtime = match get_runtime_addr() {
         Some(r) => r,
         None => {
-            output_message("[instrumentation] 无法获取 Runtime 地址，跳过 forced_interpret_only");
+            output_verbose("[instrumentation] 无法获取 Runtime 地址，跳过 forced_interpret_only");
             return;
         }
     };
@@ -220,7 +220,7 @@ unsafe fn set_forced_interpret_only() {
         let ptr = *((runtime as usize + spec.runtime_instrumentation_offset) as *const u64);
         let stripped = ptr & PAC_STRIP_MASK;
         if stripped == 0 {
-            output_message("[instrumentation] Instrumentation 指针为空");
+            output_verbose("[instrumentation] Instrumentation 指针为空");
             return;
         }
         stripped as usize
@@ -235,13 +235,13 @@ unsafe fn set_forced_interpret_only() {
     if old_val == 0 {
         std::ptr::write_volatile(field_addr, 1);
         FORCED_INTERPRET_SAVED.store(1, Ordering::Relaxed);
-        output_message(&format!(
+        output_verbose(&format!(
             "[instrumentation] forced_interpret_only_ 已设置 (Instrumentation={:#x}, offset={})",
             instrumentation_base, spec.force_interpret_only_offset
         ));
     } else {
         FORCED_INTERPRET_SAVED.store(2, Ordering::Relaxed);
-        output_message("[instrumentation] forced_interpret_only_ 已为1，无需修改");
+        output_verbose("[instrumentation] forced_interpret_only_ 已为1，无需修改");
     }
 }
 
@@ -277,7 +277,7 @@ unsafe fn restore_forced_interpret_only() {
     let field_addr = (instrumentation_base + spec.force_interpret_only_offset) as *mut u8;
     std::ptr::write_volatile(field_addr, 0);
     FORCED_INTERPRET_SAVED.store(0, Ordering::Relaxed);
-    output_message("[instrumentation] forced_interpret_only_ 已恢复为 0");
+    output_verbose("[instrumentation] forced_interpret_only_ 已恢复为 0");
 }
 
 // ============================================================================
@@ -332,7 +332,7 @@ pub(super) fn ensure_art_controller_initialized(
         return;
     }
 
-    output_message("[artController] 开始安装三层拦截矩阵...");
+    output_verbose("[artController] 开始安装三层拦截矩阵...");
 
     // 提前探测 ArtThreadSpec (递归防护 stack check 需要)
     let _ = get_art_thread_spec(env as JniEnv);
@@ -368,14 +368,14 @@ pub(super) fn ensure_art_controller_initialized(
 
     for (name, addr) in &stubs {
         if *addr == 0 {
-            output_message(&format!("[artController] Layer 1: {} 地址为0，跳过", name));
+            output_verbose(&format!("[artController] Layer 1: {} 地址为0，跳过", name));
             continue;
         }
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
         let (hook_addr, sflag) = match unsafe { prepare_hook_target(*addr, env) } {
             Ok(v) => v,
             Err(e) => {
-                output_message(&format!("[artController] Layer 1: {} prepare failed: {}", name, e));
+                output_verbose(&format!("[artController] Layer 1: {} prepare failed: {}", name, e));
                 continue;
             }
         };
@@ -406,7 +406,7 @@ pub(super) fn ensure_art_controller_initialized(
                 JNI_TRAMPOLINE_BYPASS.store(trampoline as u64, Ordering::Release);
             }
 
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] Layer 1: {} hook 安装成功: {:#x} (hooked={:#x}), trampoline={:#x}",
                 name, addr, actual_target, trampoline as u64
             ));
@@ -415,7 +415,7 @@ pub(super) fn ensure_art_controller_initialized(
                 hook_ffi::hook_dump_code(actual_target as *mut std::ffi::c_void, 20);
             }
         } else {
-            output_message(&format!("[artController] Layer 1: {} hook 安装失败: {:#x}", name, addr));
+            output_verbose(&format!("[artController] Layer 1: {} hook 安装失败: {:#x}", name, addr));
         }
     }
 
@@ -431,12 +431,12 @@ pub(super) fn ensure_art_controller_initialized(
         if ret == 0 {
             unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), addr) };
             do_call_targets.push(addr);
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] Layer 2: DoCall[{}] hook 安装成功: {:#x}",
                 i, addr
             ));
         } else {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] Layer 2: DoCall[{}] hook 安装失败: {:#x} (ret={})",
                 i, addr, ret
             ));
@@ -456,12 +456,12 @@ pub(super) fn ensure_art_controller_initialized(
         if ret == 0 {
             unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.gc_copying_phase) };
             gc_hook_targets.push(bridge.gc_copying_phase);
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] GC CopyingPhase hook 安装成功: {:#x}",
                 bridge.gc_copying_phase
             ));
         } else {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] GC CopyingPhase hook 安装失败: {:#x} (ret={})",
                 bridge.gc_copying_phase, ret
             ));
@@ -477,12 +477,12 @@ pub(super) fn ensure_art_controller_initialized(
         if ret == 0 {
             unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.gc_collect_internal) };
             gc_hook_targets.push(bridge.gc_collect_internal);
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] GC CollectGarbageInternal hook 安装成功: {:#x}",
                 bridge.gc_collect_internal
             ));
         } else {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] GC CollectGarbageInternal hook 安装失败: {:#x} (ret={})",
                 bridge.gc_collect_internal, ret
             ));
@@ -498,12 +498,12 @@ pub(super) fn ensure_art_controller_initialized(
         if ret == 0 {
             unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.run_flip_function) };
             gc_hook_targets.push(bridge.run_flip_function);
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] GC RunFlipFunction hook 安装成功: {:#x}",
                 bridge.run_flip_function
             ));
         } else {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] GC RunFlipFunction hook 安装失败: {:#x} (ret={})",
                 bridge.run_flip_function, ret
             ));
@@ -522,12 +522,12 @@ pub(super) fn ensure_art_controller_initialized(
         if !trampoline.is_null() {
             unsafe { try_fixup_trampoline(trampoline, bridge.get_oat_quick_method_header) };
             oat_header_hook_target = bridge.get_oat_quick_method_header;
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] GetOatQuickMethodHeader hook 安装成功: {:#x}, trampoline={:#x}",
                 bridge.get_oat_quick_method_header, trampoline as u64
             ));
         } else {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] GetOatQuickMethodHeader hook 安装失败: {:#x}",
                 bridge.get_oat_quick_method_header
             ));
@@ -545,12 +545,12 @@ pub(super) fn ensure_art_controller_initialized(
         if ret == 0 {
             unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.fixup_static_trampolines) };
             fixup_hook_target = bridge.fixup_static_trampolines;
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] FixupStaticTrampolines hook 安装成功: {:#x}",
                 bridge.fixup_static_trampolines
             ));
         } else {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] FixupStaticTrampolines hook 安装失败: {:#x} (ret={})",
                 bridge.fixup_static_trampolines, ret
             ));
@@ -567,12 +567,12 @@ pub(super) fn ensure_art_controller_initialized(
         if ret == 0 {
             unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), bridge.pretty_method) };
             pretty_method_hook_target = bridge.pretty_method;
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] PrettyMethod hook 安装成功: {:#x}",
                 bridge.pretty_method
             ));
         } else {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[artController] PrettyMethod hook 安装失败: {:#x} (ret={})",
                 bridge.pretty_method, ret
             ));
@@ -591,7 +591,7 @@ pub(super) fn ensure_art_controller_initialized(
         install_walkstack_sigsegv_guard();
     }
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[artController] 初始化完成: Layer1={}, Layer2={}, GC={}, OatHeader={}, Fixup={}, PrettyMethod={}, InlinePatch={}",
         shared_stub_targets.len(),
         do_call_targets.len(),
@@ -958,9 +958,9 @@ unsafe fn install_walkstack_sigsegv_guard() {
 
     let ret = libc::sigaction(libc::SIGSEGV, &sa, &mut PREV_SIGSEGV_ACTION);
     if ret == 0 {
-        output_message("[artController] WalkStack SIGSEGV guard 已安装");
+        output_verbose("[artController] WalkStack SIGSEGV guard 已安装");
     } else {
-        output_message(&format!(
+        output_verbose(&format!(
             "[artController] WalkStack SIGSEGV guard 安装失败: {}",
             std::io::Error::last_os_error()
         ));
@@ -990,7 +990,7 @@ pub(super) fn cleanup_art_controller() {
         None => return, // 从未初始化，无需清理
     };
 
-    output_message("[artController] 开始清理全局 ART hook...");
+    output_verbose("[artController] 开始清理全局 ART hook...");
 
     // 收集所有需要移除的地址，统一移除
     let mut all_targets: Vec<(&str, u64)> = Vec::new();
@@ -1023,10 +1023,10 @@ pub(super) fn cleanup_art_controller() {
     unsafe {
         let restored = hook_ffi::hook_restore_inlined_oat_header_patches();
         if restored > 0 {
-            output_message(&format!("[artController] 恢复了 {} 个内联 OAT patch", restored));
+            output_verbose(&format!("[artController] 恢复了 {} 个内联 OAT patch", restored));
         }
     }
 
     LAST_SEEN_ART_METHOD.store(0, Ordering::Relaxed);
-    output_message("[artController] 全局 ART hook 清理完成");
+    output_verbose("[artController] 全局 ART hook 清理完成");
 }

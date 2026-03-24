@@ -114,7 +114,7 @@ fn main() {
     };
 
     // 启动 socketpair handler（在 host_fd 上读写）
-    let handle = start_socketpair_handler(host_fd);
+    let _handle = start_socketpair_handler(host_fd);
 
     // 等待 agent 连接，默认超时 30s（可通过 --connect-timeout 调整）
     {
@@ -153,6 +153,11 @@ fn main() {
         }
     }
     let sender = GLOBAL_SENDER.get().unwrap();
+
+    // 传递 verbose 标志给 agent
+    if args.verbose {
+        let _ = send_command(sender, "__set_verbose__");
+    }
 
     #[cfg(feature = "qbdi")]
     {
@@ -347,6 +352,14 @@ fn main() {
         spawn::cleanup_zygote_patches();
     }
 
-    // 等待 handler 线程退出（agent cleanup 完成后主动关闭 socket，host 收到 EOF 自然退出）
-    let _ = handle.join();
+    // 等待 agent 断开连接（agent cleanup 完成后主动关闭 socket）
+    // 超时保护：agent cleanup 挂起或进程被杀时不永远阻塞
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !AGENT_DISCONNECTED.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= deadline {
+            log_warn!("等待 agent 断开超时 (5s)，强制退出");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }

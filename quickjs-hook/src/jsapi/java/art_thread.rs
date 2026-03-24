@@ -12,7 +12,7 @@ use super::jni_core::get_android_api_level;
 use super::jni_core::JniEnv;
 use super::safe_mem::{refresh_mem_regions, safe_read_u64};
 use super::PAC_STRIP_MASK;
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 
 // ============================================================================
 // ManagedStack 布局规格 — 按 API level 硬编码 (对标 Frida getManagedStackSpec)
@@ -49,7 +49,7 @@ pub(super) fn get_managed_stack_spec() -> &'static ManagedStackSpec {
                 link_offset: 0,
             }
         };
-        output_message(&format!(
+        output_verbose(&format!(
             "[managed stack] API {}: top_quick_frame={}, link={}",
             api_level, spec.top_quick_frame_offset, spec.link_offset
         ));
@@ -105,11 +105,11 @@ fn probe_art_thread_spec(env: JniEnv) -> Option<ArtThreadSpec> {
     let thread = thread_ptr & PAC_STRIP_MASK;
 
     if thread == 0 {
-        output_message("[art thread] Thread 指针为空");
+        output_verbose("[art thread] Thread 指针为空");
         return None;
     }
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art thread] JNIEnv={:#x}, Thread*={:#x} (raw={:#x})",
         env_ptr, thread, thread_ptr
     ));
@@ -128,7 +128,7 @@ fn probe_art_thread_spec(env: JniEnv) -> Option<ArtThreadSpec> {
         let val_stripped = val & PAC_STRIP_MASK;
         if val_stripped == env_stripped {
             jni_env_offset = Some(offset);
-            output_message(&format!(
+            output_verbose(&format!(
                 "[art thread] 找到 jni_env 在 Thread+{} (value={:#x})",
                 offset, val
             ));
@@ -139,7 +139,7 @@ fn probe_art_thread_spec(env: JniEnv) -> Option<ArtThreadSpec> {
     let n = match jni_env_offset {
         Some(off) => off,
         None => {
-            output_message("[art thread] Thread 中未找到 JNIEnv 指针 (扫描范围 144..384)");
+            output_verbose("[art thread] Thread 中未找到 JNIEnv 指针 (扫描范围 144..384)");
             return None;
         }
     };
@@ -186,7 +186,7 @@ fn probe_art_thread_spec(env: JniEnv) -> Option<ArtThreadSpec> {
         top_handle_scope_offset += PTR;
     }
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art thread] 探测成功 (API {}): exception={}, managed_stack={}, self={}, top_handle_scope={}, \
          is_exception_reported={:?}, throw_location={:?}",
         api_level,

@@ -3,7 +3,7 @@
 //! Contains: ArtMethod layout constants, JNI type aliases, function table helpers,
 //! entry_point offset probing, JNI state management.
 
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 use crate::jsapi::module::probe_module_range;
 use std::ffi::CString;
 use std::os::raw::c_char;
@@ -279,7 +279,7 @@ fn probe_art_method_spec(env: JniEnv, art_method: u64) -> ArtMethodSpec {
         return spec;
     }
 
-    output_message("[art spec] Frida-style probe 失败，退回 entry_point 探测...");
+    output_verbose("[art spec] Frida-style probe 失败，退回 entry_point 探测...");
 
     // Strategy 2: Fallback — probe entry_point offset using code pointer heuristic
     let ep_offset = probe_entry_point_offset_legacy(env, art_method);
@@ -302,7 +302,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     // Step 1: 获取 Process.getElapsedCpuTime 的 ArtMethod*
     let probe_method = get_known_native_art_method(env)?;
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art spec] 探测方法: Process.getElapsedCpuTime ArtMethod*={:#x}",
         probe_method
     ));
@@ -310,11 +310,11 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     // Step 2: 获取 libandroid_runtime.so 地址范围（native 实现所在）
     let (rt_start, rt_end) = probe_module_range("libandroid_runtime.so");
     if rt_start == 0 {
-        output_message("[art spec] libandroid_runtime.so 范围获取失败");
+        output_verbose("[art spec] libandroid_runtime.so 范围获取失败");
         return None;
     }
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art spec] libandroid_runtime.so range: {:#x}-{:#x}",
         rt_start, rt_end
     ));
@@ -344,7 +344,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
             if (val & RELEVANT_MASK) == EXPECTED_FLAGS {
                 access_flags_offset = Some(offset);
                 remaining -= 1;
-                output_message(&format!(
+                output_verbose(&format!(
                     "[art spec] access_flags 发现: offset={}, value={:#x}, masked={:#x}",
                     offset,
                     val,
@@ -361,7 +361,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
             if stripped >= rt_start && stripped < rt_end {
                 data_offset = Some(offset);
                 remaining -= 1;
-                output_message(&format!(
+                output_verbose(&format!(
                     "[art spec] data_ (jniCode) 发现: offset={}, value={:#x}",
                     offset, val
                 ));
@@ -372,7 +372,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     let af_offset = match access_flags_offset {
         Some(o) => o,
         None => {
-            output_message("[art spec] access_flags 未找到");
+            output_verbose("[art spec] access_flags 未找到");
             return None;
         }
     };
@@ -380,7 +380,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     let d_offset = match data_offset {
         Some(o) => o,
         None => {
-            output_message("[art spec] data_ (jniCode) 未找到 (expected in libandroid_runtime.so)");
+            output_verbose("[art spec] data_ (jniCode) 未找到 (expected in libandroid_runtime.so)");
             return None;
         }
     };
@@ -399,7 +399,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     let access_flags_end = af_offset + 4; // access_flags is u32
     let size = frida_size.max(access_flags_end);
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art spec] Frida-style 探测成功: access_flags={}, data_={}, entry_point={}, size={} (API {})",
         af_offset, d_offset, ep_offset, size, api_level
     ));
@@ -428,14 +428,14 @@ unsafe fn get_known_native_art_method(env: JniEnv) -> Option<u64> {
 
     let cls = find_class(env, c_class.as_ptr());
     if cls.is_null() || jni_check_exc(env) {
-        output_message("[art spec] FindClass(android/os/Process) 失败");
+        output_verbose("[art spec] FindClass(android/os/Process) 失败");
         return None;
     }
 
     let mid = get_static_mid(env, cls, c_method.as_ptr(), c_sig.as_ptr());
     if mid.is_null() || jni_check_exc(env) {
         delete_local_ref(env, cls);
-        output_message("[art spec] GetStaticMethodID(getElapsedCpuTime) 失败");
+        output_verbose("[art spec] GetStaticMethodID(getElapsedCpuTime) 失败");
         return None;
     }
 
@@ -445,7 +445,7 @@ unsafe fn get_known_native_art_method(env: JniEnv) -> Option<u64> {
     delete_local_ref(env, cls);
 
     if art_method != mid as u64 {
-        output_message(&format!(
+        output_verbose(&format!(
             "[art spec] jmethodID 已解码: {:#x} → ArtMethod*={:#x}",
             mid as u64, art_method
         ));
@@ -465,7 +465,7 @@ fn probe_entry_point_offset_legacy(env: JniEnv, target_art_method: u64) -> usize
     let is_24 = is_code_pointer(val_24);
     let is_32 = is_code_pointer(val_32);
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[art spec] legacy probe: val_24={:#x} (code={}), val_32={:#x} (code={})",
         val_24, is_24, val_32, is_32
     ));
@@ -487,7 +487,7 @@ fn probe_entry_point_offset_legacy(env: JniEnv, target_art_method: u64) -> usize
         probe_with_known_method_legacy(env).unwrap_or(24)
     };
 
-    output_message(&format!("[art spec] legacy result: entry_point offset={}", offset));
+    output_verbose(&format!("[art spec] legacy result: entry_point offset={}", offset));
     offset
 }
 
@@ -752,7 +752,7 @@ static IS_API_34_OR_APEX_EQUIV: std::sync::OnceLock<bool> = std::sync::OnceLock:
 pub(super) fn get_art_apex_version() -> u64 {
     *ART_APEX_VERSION.get_or_init(|| {
         let version = parse_art_apex_version();
-        output_message(&format!("[apex] ART APEX version: {}", version));
+        output_verbose(&format!("[apex] ART APEX version: {}", version));
         version
     })
 }
@@ -773,14 +773,14 @@ pub(super) fn is_api_level_34_or_apex_equivalent() -> bool {
             // 检查 API 34 新增符号
             let sym1 = libart_dlsym("_ZN3art7AppInfo29GetPrimaryApkReferenceProfileEv");
             if !sym1.is_null() {
-                output_message("[apex] API 34+ 等效: 发现 AppInfo::GetPrimaryApkReferenceProfile");
+                output_verbose("[apex] API 34+ 等效: 发现 AppInfo::GetPrimaryApkReferenceProfile");
                 return true;
             }
 
             // Thread::RunFlipFunction(Thread*, bool) — API 34 新增 bool 参数重载
             let sym2 = libart_dlsym("_ZN3art6Thread15RunFlipFunctionEPS0_b");
             if !sym2.is_null() {
-                output_message("[apex] API 34+ 等效: 发现 Thread::RunFlipFunction(Thread*, bool)");
+                output_verbose("[apex] API 34+ 等效: 发现 Thread::RunFlipFunction(Thread*, bool)");
                 return true;
             }
 
@@ -788,7 +788,7 @@ pub(super) fn is_api_level_34_or_apex_equivalent() -> bool {
         };
 
         if !result {
-            output_message("[apex] API 34+ 等效检测: 未发现特征符号");
+            output_verbose("[apex] API 34+ 等效检测: 未发现特征符号");
         }
         result
     })
@@ -845,7 +845,7 @@ pub(super) fn init_jni_id_decoder() {
         let indirection_offset = match get_jni_ids_indirection_offset() {
             Some(o) => o,
             None => {
-                output_message("[jniIds] indirection offset 不可用，ID 解码走 fallback 路径");
+                output_verbose("[jniIds] indirection offset 不可用，ID 解码走 fallback 路径");
                 return None;
             }
         };
@@ -854,7 +854,7 @@ pub(super) fn init_jni_id_decoder() {
         let runtime = match unsafe { get_runtime_addr() } {
             Some(r) => r,
             None => {
-                output_message("[jniIds] 无法获取 Runtime 地址");
+                output_verbose("[jniIds] 无法获取 Runtime 地址");
                 return None;
             }
         };
@@ -887,7 +887,7 @@ pub(super) fn init_jni_id_decoder() {
                     Some(off) => {
                         let mgr = unsafe { super::safe_mem::safe_read_u64(runtime + off as u64) & PAC_STRIP_MASK };
                         if mgr != 0 {
-                            output_message(&format!("[jniIds] JniIdManager*={:#x} (Runtime+{:#x})", mgr, off));
+                            output_verbose(&format!("[jniIds] JniIdManager*={:#x} (Runtime+{:#x})", mgr, off));
                         }
                         mgr
                     }
@@ -905,7 +905,7 @@ pub(super) fn init_jni_id_decoder() {
         // 如果 decode 函数不可用 → fallback 强制写 kPointer
         let current_mode = unsafe { std::ptr::read_volatile(indirection_field_addr) };
         let forced_pointer_mode = if has_decode {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[jniIds] Frida-style 解码器就绪: DecodeMethodId={}, DecodeFieldId={}, indirection={}",
                 decode_method_fn.is_some(),
                 decode_field_fn.is_some(),
@@ -915,13 +915,13 @@ pub(super) fn init_jni_id_decoder() {
         } else if current_mode != K_POINTER {
             // 无 decode 函数但 indirection != kPointer → 必须强制写
             unsafe { std::ptr::write_volatile(indirection_field_addr as *mut i32, K_POINTER) };
-            output_message(&format!(
+            output_verbose(&format!(
                 "[jniIds] decode 函数不可用，fallback 强制 indirection {} → 0 (kPointer), Runtime+{:#x}",
                 current_mode, indirection_offset
             ));
             true
         } else {
-            output_message("[jniIds] 已为 kPointer 模式，jmethodID 即 ArtMethod* 直接可用");
+            output_verbose("[jniIds] 已为 kPointer 模式，jmethodID 即 ArtMethod* 直接可用");
             false
         };
 
@@ -1007,7 +1007,7 @@ fn parse_art_apex_version() -> u64 {
     let content = match std::fs::read_to_string("/proc/self/mountinfo") {
         Ok(c) => c,
         Err(_) => {
-            output_message("[apex] /proc/self/mountinfo 读取失败，使用 fallback");
+            output_verbose("[apex] /proc/self/mountinfo 读取失败，使用 fallback");
             let api = get_android_api_level() as u64;
             return api * 10_000_000;
         }

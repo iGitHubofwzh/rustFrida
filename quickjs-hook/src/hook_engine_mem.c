@@ -532,6 +532,16 @@ static ExecPool* create_pool_near_range(void* target, int64_t max_range) {
     void* ptr = hook_mmap_near_range(target, EXEC_POOL_SIZE, max_range);
     if (ptr == MAP_FAILED) return NULL;
 
+    /* 标记 VMA 名称便于 /proc/self/maps 识别 */
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, (unsigned long)ptr, EXEC_POOL_SIZE,
+          (unsigned long)"wwb_hook_pool");
+
     ExecPool* pool = &g_engine.pools[g_engine.pool_count++];
     pool->base = ptr;
     pool->size = EXEC_POOL_SIZE;

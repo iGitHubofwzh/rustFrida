@@ -433,7 +433,7 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String
     // 2. 发送 agent SO fd (创建 memfd → 写入 AGENT_SO → sendmsg)
     //    关键: 必须设置 SELinux label 为 frida_memfd (带 mlstrustedobject 属性)，
     //    否则 untrusted_app 因 MLS 分类不匹配无法通过 SCM_RIGHTS 接收 tmpfs fd。
-    let agent_memfd = unsafe { libc::memfd_create(b"agent\0".as_ptr() as _, 0) };
+    let agent_memfd = unsafe { libc::memfd_create(b"wwb_so\0".as_ptr() as _, 0) };
     if agent_memfd < 0 {
         return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
     }

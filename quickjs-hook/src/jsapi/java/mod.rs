@@ -49,7 +49,7 @@ use crate::context::JSContext;
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{set_js_u64_property, throw_internal_error, throw_type_error};
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
 
@@ -119,12 +119,19 @@ pub(crate) unsafe fn try_read_jstring(env_ptr: u64, obj_ptr: u64) -> Option<Stri
 
 pub(crate) unsafe fn try_get_class_name(env_ptr: u64, cls_ptr: u64) -> Option<String> {
     let env = env_ptr as JniEnv;
-    let cls = cls_ptr as *mut std::ffi::c_void;
-    if env.is_null() || !validate_jni_ref(env, cls) {
+    if env.is_null() || cls_ptr == 0 {
         return None;
     }
 
-    crate::jsapi::java::get_class_name_unchecked(env_ptr, cls_ptr)
+    // 直接尝试 JNI 调用 Class.getName()，不做 DecodeJObject 前置验证。
+    // 前置验证对 indirect JNI reference (如 hook 回调中的 jclass) 可能误判失败。
+    // JNI 自身能安全处理无效引用（返回 null 或抛异常）。
+    let result = crate::jsapi::java::get_class_name_unchecked(env_ptr, cls_ptr);
+    // 清除 JNI 调用可能产生的异常
+    if result.is_none() {
+        jni_check_exc(env);
+    }
+    result
 }
 
 pub(crate) unsafe fn try_get_object_class(env_ptr: u64, obj_ptr: u64) -> Option<u64> {
@@ -204,9 +211,9 @@ unsafe extern "C" fn js_java_deopt(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    output_message("[java deopt] 清空 JIT 缓存...");
+    output_verbose("[java deopt] 清空 JIT 缓存...");
     try_invalidate_jit_cache();
-    output_message("[java deopt] JIT 缓存清空完成");
+    output_verbose("[java deopt] JIT 缓存清空完成");
     JSValue::bool(true).raw()
 }
 
@@ -223,7 +230,7 @@ unsafe extern "C" fn js_art_router_debug(
     let mut last_x0: u64 = 0;
     let mut miss_count: u64 = 0;
     hook_ffi::hook_art_router_get_debug(&mut last_x0, &mut miss_count);
-    output_message(&format!(
+    output_verbose(&format!(
         "[art_router_debug] last_x0={:#x}, miss_count={}",
         last_x0, miss_count
     ));
@@ -241,7 +248,7 @@ unsafe extern "C" fn js_art_router_debug(
                         std::ptr::read_volatile((*art_method as usize + spec.entry_point_offset) as *const u64);
                     let current_flags =
                         std::ptr::read_volatile((*art_method as usize + spec.access_flags_offset) as *const u32);
-                    output_message(&format!(
+                    output_verbose(&format!(
                         "[art_router_debug] ArtMethod={:#x}: current_ep={:#x} (original={:#x}), flags={:#x} (original={:#x})",
                         art_method, current_ep, data.original_entry_point,
                         current_flags, data.original_access_flags
@@ -328,11 +335,11 @@ unsafe extern "C" fn js_update_classloader(
     match ensure_jni_initialized() {
         Ok(env) => {
             update_app_classloader(env, cl_ptr);
-            output_message("[java.ready] ClassLoader 已更新");
+            output_verbose("[java.ready] ClassLoader 已更新");
             JSValue::bool(true).raw()
         }
         Err(_) => {
-            output_message("[java.ready] 获取 JNIEnv 失败，ClassLoader 更新失败");
+            output_verbose("[java.ready] 获取 JNIEnv 失败，ClassLoader 更新失败");
             JSValue::bool(false).raw()
         }
     }
@@ -505,13 +512,13 @@ pub fn deferred_java_init() -> Result<(), String> {
         cache_reflect_ids(env);
     }
 
-    crate::jsapi::console::output_message("[java] deferred_java_init: JNI 已就绪");
+    crate::jsapi::console::output_verbose("[java] deferred_java_init: JNI 已就绪");
 
     // 触发 Java.ready gate hook 安装：调用 Java._installGateHook()
     // loadjs 在 resume 前运行时 Java.ready(fn) 注册了回调但 gate hook 安装失败（无 JNI）
     // 现在 JNI 就绪，重新安装 gate hook
     if let Err(e) = crate::load_script("Java._installGateHook && Java._installGateHook()") {
-        crate::jsapi::console::output_message(&format!("[java] gate hook eval 失败: {}", e));
+        crate::jsapi::console::output_verbose(&format!("[java] gate hook eval 失败: {}", e));
     }
 
     Ok(())
@@ -587,7 +594,7 @@ pub fn register_java_api(ctx: &JSContext) {
     let boot = include_str!("java_boot.js");
     match ctx.eval(boot, "<java_boot>") {
         Ok(val) => val.free(ctx.as_ptr()),
-        Err(e) => output_message(&format!("[java_api] boot script error: {}", e)),
+        Err(e) => output_verbose(&format!("[java_api] boot script error: {}", e)),
     }
 }
 
@@ -658,7 +665,7 @@ pub fn cleanup_java_hooks() {
         hook_ffi::hook_art_router_get_hit_debug(&mut hit_count, std::ptr::null_mut());
         let do_call_total = art_controller::DO_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         let do_call_hits = art_controller::DO_CALL_HIT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        output_message(&format!(
+        output_verbose(&format!(
             "[art_router_debug] cleanup: router_hit={}, router_miss={}, last_x0={:#x}, docall_total={}, docall_hit={}",
             hit_count, miss_count, last_x0, do_call_total, do_call_hits
         ));
@@ -710,7 +717,7 @@ pub fn cleanup_java_hooks() {
     // 等待已进入 thunk 的回调自然退出。
     // ArtMethod 已恢复后不会再有新回调进入，因此这里等待 in-flight 计数清零即可。
     if !wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(200)) {
-        output_message(&format!(
+        output_verbose(&format!(
             "[java cleanup] 等待 in-flight callbacks 超时，remaining={}",
             in_flight_java_hook_callbacks()
         ));

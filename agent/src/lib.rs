@@ -240,6 +240,10 @@ fn process_cmd(command: &str) {
             stalker::hfollow(md, offset)
         }
         #[cfg(feature = "quickjs")]
+        Some("__set_verbose__") => {
+            quickjs_hook::set_verbose(true);
+        }
+        #[cfg(feature = "quickjs")]
         Some("artinit") => {
             // 预初始化 artController Layer 1+2 (spawn 模式, 进程暂停时调用)
             match quickjs_hook::jsapi::java::pre_init_art_controller() {

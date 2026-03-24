@@ -4,7 +4,7 @@ use crate::jsapi::callback_util::{
     dup_callback_to_bytes, ensure_function_arg, extract_string_arg, throw_internal_error, with_registry,
     with_registry_mut,
 };
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::{output_message, output_verbose};
 use crate::value::JSValue;
 
 use super::super::art_controller::ensure_art_controller_initialized;
@@ -98,7 +98,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
             ffi::qjs_free_value(ctx, old_callback);
         }
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[java hook] 回调已替换: {}.{}{}",
             class_name, method_name, actual_sig
         ));
@@ -114,7 +114,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     let original_data = std::ptr::read_volatile((art_method as usize + data_off) as *const u64);
     let original_entry_point = read_entry_point(art_method, ep_offset);
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[java hook] Step 1 fetchArtMethod: art_method={:#x}, flags={:#x}, data_={:#x}, ep={:#x}",
         art_method, original_access_flags, original_data, original_entry_point
     ));
@@ -122,7 +122,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     {
         let api_level = get_android_api_level();
         if api_level < 30 && (original_access_flags & K_ACC_XPOSED_HOOKED_METHOD) != 0 {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[java hook] Step 2: Xposed hooked method detected (flags={:#x}), proceeding with caution",
                 original_access_flags
             ));
@@ -135,7 +135,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         Err(msg) => return throw_internal_error(ctx, msg),
     };
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[java hook] Step 3 clone: backup={:#x} (size={})",
         clone_addr, clone_size
     ));
@@ -170,7 +170,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     let has_independent_code = !is_art_quick_entrypoint(original_entry_point, bridge);
     let is_constructor = method_name == "<init>";
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[java hook] Step 4: has_independent_code={} (ep={:#x})",
         has_independent_code, original_entry_point
     ));
@@ -227,7 +227,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         if interp_bridge != 0 {
             std::ptr::write_volatile((art_method as usize + ep_offset) as *mut u64, interp_bridge);
             hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
-            output_message(&format!(
+            output_verbose(&format!(
                 "[java hook] nterp → interpreter_bridge: {:#x} → {:#x}",
                 original_entry_point, interp_bridge
             ));

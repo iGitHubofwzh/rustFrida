@@ -35,7 +35,7 @@ pub mod value;
 
 pub use completion::complete_script;
 pub use context::JSContext;
-pub use jsapi::console::set_console_callback;
+pub use jsapi::console::{set_console_callback, set_verbose};
 pub use jsapi::deferred_java_init;
 pub use jsapi::hook_api::cleanup_hooks;
 #[cfg(feature = "qbdi")]

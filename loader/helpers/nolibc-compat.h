@@ -120,6 +120,17 @@ static inline long __syscall4(long nr, long a0, long a1, long a2, long a3) {
     return x0;
 }
 
+static inline long __syscall5(long nr, long a0, long a1, long a2, long a3, long a4) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x8) : "memory");
+    return x0;
+}
+
 static inline long __syscall6(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
     register long x8 __asm__("x8") = nr;
     register long x0 __asm__("x0") = a0;
@@ -164,7 +175,7 @@ static inline int munmap(void *addr, size_t len) {
 
 static inline int prctl(int option, unsigned long arg2, unsigned long arg3,
                         unsigned long arg4, unsigned long arg5) {
-    return (int)__syscall4(__NR_prctl, option, arg2, arg3, arg4);
+    return (int)__syscall5(__NR_prctl, option, arg2, arg3, arg4, arg5);
 }
 
 static inline int socketpair(int domain, int type, int protocol, int sv[2]) {

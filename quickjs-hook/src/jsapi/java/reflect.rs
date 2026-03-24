@@ -3,7 +3,7 @@
 //! Contains: decode_method_id, ReflectIds, cache_reflect_ids, find_class_safe,
 //! MethodInfo, java_type_to_jni, enumerate_methods.
 
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -56,7 +56,7 @@ where
     // Strategy 1: JniIdManager decode (对标 Frida unwrapGenericId)
     if let Some(result) = decode_via_manager(id) {
         if result != id {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[jni] decode_{label}({id:#x}): Decode → {art_label}={result:#x}"
             ));
         }
@@ -68,7 +68,7 @@ where
         Some(r) => {
             let fid = get_reflect_field_id(r);
             if fid.is_null() {
-                output_message(&format!(
+                output_verbose(&format!(
                     "[jni] decode_{label}({id:#x}): no decoder available, returning raw"
                 ));
                 return id;
@@ -76,7 +76,7 @@ where
             fid
         }
         _ => {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[jni] decode_{label}({id:#x}): no decoder available, returning raw"
             ));
             return id;
@@ -88,14 +88,14 @@ where
 
     let reflected_obj = to_reflected_fn(env, cls, id as *mut std::ffi::c_void, if is_static { 1 } else { 0 });
     if reflected_obj.is_null() || jni_check_exc(env) {
-        output_message(&format!("[jni] decode_{label}({id:#x}): ToReflected failed"));
+        output_verbose(&format!("[jni] decode_{label}({id:#x}): ToReflected failed"));
         return id;
     }
 
     let art_ptr = get_long(env, reflected_obj, art_field_id) as u64;
     delete_local_ref(env, reflected_obj);
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[jni] decode_{label}({id:#x}) → {art_short}={art_ptr:#x} (via reflection)"
     ));
 
@@ -719,7 +719,7 @@ unsafe fn bypass_hidden_api_restrictions(env: JniEnv) {
     let c_vmrt = CString::new("dalvik/system/VMRuntime").unwrap();
     let vmrt_cls = find_class(env, c_vmrt.as_ptr());
     if vmrt_cls.is_null() || jni_check_exc(env) {
-        output_message("[java] hidden API bypass: VMRuntime class not found (pre-Android 9?)");
+        output_verbose("[java] hidden API bypass: VMRuntime class not found (pre-Android 9?)");
         return;
     }
 
@@ -729,13 +729,13 @@ unsafe fn bypass_hidden_api_restrictions(env: JniEnv) {
     let get_runtime_mid = get_static_mid(env, vmrt_cls, c_get_runtime.as_ptr(), c_get_runtime_sig.as_ptr());
     if get_runtime_mid.is_null() || jni_check_exc(env) {
         delete_local_ref(env, vmrt_cls);
-        output_message("[java] hidden API bypass: getRuntime() not found");
+        output_verbose("[java] hidden API bypass: getRuntime() not found");
         return;
     }
     let runtime = call_static_obj(env, vmrt_cls, get_runtime_mid, std::ptr::null());
     if runtime.is_null() || jni_check_exc(env) {
         delete_local_ref(env, vmrt_cls);
-        output_message("[java] hidden API bypass: getRuntime() returned null");
+        output_verbose("[java] hidden API bypass: getRuntime() returned null");
         return;
     }
 
@@ -746,7 +746,7 @@ unsafe fn bypass_hidden_api_restrictions(env: JniEnv) {
     if set_mid.is_null() || jni_check_exc(env) {
         delete_local_ref(env, runtime);
         delete_local_ref(env, vmrt_cls);
-        output_message("[java] hidden API bypass: setHiddenApiExemptions not found (pre-Android 10?)");
+        output_verbose("[java] hidden API bypass: setHiddenApiExemptions not found (pre-Android 10?)");
         return;
     }
 
@@ -768,9 +768,9 @@ unsafe fn bypass_hidden_api_restrictions(env: JniEnv) {
         let args: [*mut std::ffi::c_void; 1] = [arr];
         call_void(env, runtime, set_mid, args.as_ptr() as *const std::ffi::c_void);
         if jni_check_exc(env) {
-            output_message("[java] hidden API bypass: setHiddenApiExemptions threw exception");
+            output_verbose("[java] hidden API bypass: setHiddenApiExemptions threw exception");
         } else {
-            output_message("[java] hidden API bypass: setHiddenApiExemptions(\"\") OK");
+            output_verbose("[java] hidden API bypass: setHiddenApiExemptions(\"\") OK");
         }
     }
 
@@ -1028,7 +1028,7 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
             delete_local_ref(env, parent_cls);
             if !fid.is_null() && !jni_check_exc(env) {
                 art_method_field_id = fid;
-                output_message(&format!("[java] cached artMethod field ID from {}", parent_cls_name));
+                output_verbose(&format!("[java] cached artMethod field ID from {}", parent_cls_name));
                 break;
             }
         }
@@ -1045,7 +1045,7 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
                 delete_local_ref(env, field_reflect_cls);
                 if !fid.is_null() && !jni_check_exc(env) {
                     art_field_field_id = fid;
-                    output_message("[java] cached artField field ID from java/lang/reflect/Field");
+                    output_verbose("[java] cached artField field ID from java/lang/reflect/Field");
                 } else {
                     jni_check_exc(env);
                 }
@@ -1146,11 +1146,11 @@ pub(super) unsafe fn reprobe_classloader() -> bool {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if reprobe_classloader_once() {
-            crate::jsapi::console::output_message(&format!("[Java.ready] reprobe succeeded after {}ms", attempt * 100));
+            crate::jsapi::console::output_verbose(&format!("[Java.ready] reprobe succeeded after {}ms", attempt * 100));
             return true;
         }
     }
-    crate::jsapi::console::output_message("[Java.ready] reprobe_classloader: 5s timeout, app not ready");
+    crate::jsapi::console::output_verbose("[Java.ready] reprobe_classloader: 5s timeout, app not ready");
     false
 }
 
@@ -1257,7 +1257,7 @@ unsafe fn reprobe_classloader_once() -> bool {
     }
     delete_local_ref(env, cl);
 
-    crate::jsapi::console::output_message("[Java.ready] reprobe_classloader: app ClassLoader found");
+    crate::jsapi::console::output_verbose("[Java.ready] reprobe_classloader: app ClassLoader found");
     true
 }
 
@@ -1341,7 +1341,7 @@ pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std:
     }
 
     if crate::jsapi::java::callback::in_java_hook_callback() {
-        crate::jsapi::console::output_message(&format!(
+        crate::jsapi::console::output_verbose(&format!(
             "[java] find_class_safe: skip JNI FindClass fallback inside hook callback: {}",
             class_name
         ));

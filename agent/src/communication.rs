@@ -124,10 +124,14 @@ pub(crate) fn log_msg(msg: String) {
 
 /// 关闭 socket 连接，通知 host 收到 EOF 自然退出
 pub(crate) fn shutdown_stream() {
+    // shutdown + close 双保险：shutdown 标记不再读写，close 释放 fd 触发 peer EOF
     if let Some(m) = GLOBAL_STREAM.get() {
         if let Ok(stream) = m.lock() {
             let _ = stream.shutdown(Shutdown::Both);
         }
+    }
+    if let Some(fd) = GLOBAL_STREAM_FD.get() {
+        unsafe { libc::close(*fd); }
     }
 }
 

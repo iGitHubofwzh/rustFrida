@@ -12,7 +12,7 @@ use super::art_method::get_art_field_spec;
 use super::jni_core::*;
 use super::safe_mem::{refresh_mem_regions, safe_read_u16, safe_read_u32, safe_read_u64};
 use super::PAC_STRIP_MASK;
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 use crate::jsapi::module::libart_dlsym;
 
 // ============================================================================
@@ -50,7 +50,7 @@ pub(super) fn get_art_class_spec(env: JniEnv) -> Option<&'static ArtClassSpec> {
 /// 4. 扫描 Class 对象内存，查找包含已知指针的 LengthPrefixedArray
 /// 5. 对于 copiedMethodsOffset，从 methods_ 起搜索等于 methods array length 的 u16
 fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
-    output_message("[art class] 开始 ArtClass 布局探测...");
+    output_verbose("[art class] 开始 ArtClass 布局探测...");
 
     let field_spec = get_art_field_spec()?;
     let method_spec = ART_METHOD_SPEC.get()?;
@@ -68,7 +68,7 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
         let c_thread = std::ffi::CString::new("java/lang/Thread").unwrap();
         let cls_local = find_class(env, c_thread.as_ptr());
         if cls_local.is_null() || jni_check_exc(env) {
-            output_message("[art class] FindClass(java/lang/Thread) 失败");
+            output_verbose("[art class] FindClass(java/lang/Thread) 失败");
             return None;
         }
 
@@ -77,7 +77,7 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
         let cls_global = new_global_ref(env, cls_local);
         delete_local_ref(env, cls_local);
         if cls_global.is_null() {
-            output_message("[art class] NewGlobalRef 失败");
+            output_verbose("[art class] NewGlobalRef 失败");
             return None;
         }
 
@@ -98,12 +98,12 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
         jni_check_exc(env);
 
         if static_field_id.is_null() && instance_field_id.is_null() && method_id.is_null() {
-            output_message("[art class] 所有引用获取失败");
+            output_verbose("[art class] 所有引用获取失败");
             delete_global_ref(env, cls_global);
             return None;
         }
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[art class] Thread: static_field={:#x}, instance_field={:#x}, method={:#x}",
             static_field_id as u64, instance_field_id as u64, method_id as u64
         ));
@@ -115,7 +115,7 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
         let art_field_instance = super::reflect::decode_field_id(env, cls_global, instance_field_id as u64, false);
         let art_method_instance = super::reflect::decode_method_id(env, cls_global, method_id as u64, false);
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[art class] 解码后: static_field={:#x}, instance_field={:#x}, method={:#x}",
             art_field_static, art_field_instance, art_method_instance
         ));
@@ -142,7 +142,7 @@ fn probe_art_class_spec(env: JniEnv) -> Option<ArtClassSpec> {
 
         let spec = scan_result?;
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[art class] 探测成功: ifields={}, sfields={}, methods={}, copied_methods={}",
             spec.ifields_offset, spec.sfields_offset, spec.methods_offset, spec.copied_methods_offset
         ));
@@ -169,11 +169,11 @@ unsafe fn scan_class_layout(
     let class_obj = match decode_jclass(env, cls_global) {
         Some(addr) => addr,
         None => {
-            output_message("[art class] jclass 解码失败，跳过 ArtClass 探测");
+            output_verbose("[art class] jclass 解码失败，跳过 ArtClass 探测");
             return None;
         }
     };
-    output_message(&format!("[art class] mirror::Class* = {:#x}", class_obj));
+    output_verbose(&format!("[art class] mirror::Class* = {:#x}", class_obj));
 
     // 扫描 Class 对象查找字段数组和方法数组
     // LengthPrefixedArray<ArtField>: { u32 length, ArtField[length] } (4-aligned entries)
@@ -196,7 +196,7 @@ unsafe fn scan_class_layout(
         if sfield_offset.is_none() && art_field_static != 0 {
             if check_array_contains(val_stripped, f_entry_size, 4, art_field_static, 50) {
                 sfield_offset = Some(offset);
-                output_message(&format!(
+                output_verbose(&format!(
                     "[art class] 找到 sfields_ 在 Class+{:#x} (array={:#x})",
                     offset, val_stripped
                 ));
@@ -206,7 +206,7 @@ unsafe fn scan_class_layout(
         if ifield_offset.is_none() && art_field_instance != 0 {
             if check_array_contains(val_stripped, f_entry_size, 4, art_field_instance, 50) {
                 ifield_offset = Some(offset);
-                output_message(&format!(
+                output_verbose(&format!(
                     "[art class] 找到 ifields_ 在 Class+{:#x} (array={:#x})",
                     offset, val_stripped
                 ));
@@ -217,7 +217,7 @@ unsafe fn scan_class_layout(
         if methods_offset.is_none() && art_method_instance != 0 {
             if check_array_contains(val_stripped, m_entry_size, 8, art_method_instance, 100) {
                 methods_offset = Some(offset);
-                output_message(&format!(
+                output_verbose(&format!(
                     "[art class] 找到 methods_ 在 Class+{:#x} (array={:#x})",
                     offset, val_stripped
                 ));
@@ -235,7 +235,7 @@ unsafe fn scan_class_layout(
         let candidate = sfield_offset.unwrap().wrapping_sub(8);
         if candidate < MAX_OFFSET {
             ifield_offset = Some(candidate);
-            output_message(&format!(
+            output_verbose(&format!(
                 "[art class] ifields_ 推算: sfields-8 = Class+{:#x}",
                 candidate
             ));
@@ -244,7 +244,7 @@ unsafe fn scan_class_layout(
         let candidate = ifield_offset.unwrap() + 8;
         if candidate < MAX_OFFSET {
             sfield_offset = Some(candidate);
-            output_message(&format!(
+            output_verbose(&format!(
                 "[art class] sfields_ 推算: ifields+8 = Class+{:#x}",
                 candidate
             ));
@@ -254,7 +254,7 @@ unsafe fn scan_class_layout(
     let ifields = match ifield_offset {
         Some(o) => o,
         None => {
-            output_message("[art class] ifields_ 偏移未找到");
+            output_verbose("[art class] ifields_ 偏移未找到");
             return None;
         }
     };
@@ -262,14 +262,14 @@ unsafe fn scan_class_layout(
         Some(o) if o != ifields => o,
         _ => {
             // sfields 未找到或与 ifields 相同，设为 0 表示不可用
-            output_message("[art class] sfields_ 偏移未找到或与 ifields 重合，设为 0");
+            output_verbose("[art class] sfields_ 偏移未找到或与 ifields 重合，设为 0");
             0
         }
     };
     let methods = match methods_offset {
         Some(o) => o,
         None => {
-            output_message("[art class] methods_ 偏移未找到");
+            output_verbose("[art class] methods_ 偏移未找到");
             return None;
         }
     };
@@ -289,7 +289,7 @@ unsafe fn scan_class_layout(
                 let val = safe_read_u16(class_obj + candidate as u64);
                 if val as u32 == methods_array_len {
                     copied_methods = candidate;
-                    output_message(&format!(
+                    output_verbose(&format!(
                         "[art class] copied_methods_offset 发现: Class+{:#x} (value={}, methods_count={})",
                         candidate, val, methods_array_len
                     ));
@@ -408,7 +408,7 @@ where
 {
     let thread = get_thread_ptr(env);
     if thread == 0 {
-        output_message("[runnable] Thread* 为空，跳过状态切换");
+        output_verbose("[runnable] Thread* 为空，跳过状态切换");
         return f();
     }
 
@@ -423,7 +423,7 @@ where
         let transition: ToRunnableFn = std::mem::transmute(to_runnable_sym);
         let old_state = transition(thread);
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[runnable] TransitionFromSuspendedToRunnable: old_state={}",
             old_state
         ));
@@ -457,7 +457,7 @@ where
         let runnable_val = (original & 0xFFFF) | ((K_RUNNABLE as u32) << 16);
         std::ptr::write_volatile(ptr, runnable_val);
 
-        output_message(&format!(
+        output_verbose(&format!(
             "[runnable] 直接状态切换: Thread+{:#x}, kNative({})→kRunnable({})",
             offset, native_state, K_RUNNABLE
         ));
@@ -471,7 +471,7 @@ where
     }
 
     // Strategy 3: 无法切换状态，直接执行（best effort）
-    output_message("[runnable] 状态切换不可用，直接执行（best effort）");
+    output_verbose("[runnable] 状态切换不可用，直接执行（best effort）");
     f()
 }
 
@@ -518,7 +518,7 @@ unsafe fn decode_jobject(env: JniEnv, obj: *mut std::ffi::c_void) -> Option<u64>
 /// 以确保 CC GC 不会在解码后移动对象。
 unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> {
     if let Some(stripped) = decode_jobject(env, cls) {
-        output_message(&format!(
+        output_verbose(&format!(
             "[art class] DecodeJObject: ref={:#x} → mirror::Class*={:#x}",
             cls as u64, stripped
         ));
@@ -535,7 +535,7 @@ unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> 
         let stripped = deref & PAC_STRIP_MASK;
         // mirror::Class 对象应在合理堆地址范围
         if stripped > 0x1000_0000 && stripped < 0x0000_FFFF_0000_0000 {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[art class] IndirectRef 解码: *ref={:#x} → {:#x}",
                 cls_val, stripped
             ));
@@ -545,7 +545,7 @@ unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> 
         // 可能使用压缩指针 (32-bit)
         let deref32 = safe_read_u32(cls_val) as u64;
         if deref32 > 0x1000_0000 {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[art class] IndirectRef 压缩指针解码: *ref(u32)={:#x}",
                 deref32
             ));
@@ -553,7 +553,7 @@ unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> 
         }
     }
 
-    output_message("[art class] jclass 解码失败: DecodeJObject 不可用且 fallback 无效");
+    output_verbose("[art class] jclass 解码失败: DecodeJObject 不可用且 fallback 无效");
     None
 }
 

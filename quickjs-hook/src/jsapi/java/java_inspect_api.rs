@@ -198,7 +198,7 @@ pub(super) unsafe extern "C" fn js_java_set_forced_interpret_only(
     let new_val: u8 = if enable { 1 } else { 0 };
     std::ptr::write_volatile(field_addr, new_val);
 
-    crate::jsapi::console::output_message(&format!(
+    crate::jsapi::console::output_verbose(&format!(
         "[test] forced_interpret_only_: {} → {} (addr={:#x})",
         old_val, new_val, field_addr as u64
     ));
@@ -248,7 +248,7 @@ pub(super) unsafe extern "C" fn js_java_init_art_controller(
 
     ensure_art_controller_initialized(bridge, spec.entry_point_offset, env as *mut std::ffi::c_void);
 
-    crate::jsapi::console::output_message("[test] artController Layer 1+2 已初始化 (无方法 hook)");
+    crate::jsapi::console::output_verbose("[test] artController Layer 1+2 已初始化 (无方法 hook)");
 
     JSValue::bool(true).raw()
 }

@@ -90,7 +90,7 @@ pub fn transformer_global(addr: usize) -> Result<usize> {
 // ============== Trace 入口 ==============
 
 pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
-    let stack = unsafe {
+    let stack_base = unsafe {
         mmap(
             null_mut(),
             0x1100000,
@@ -99,8 +99,9 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
             -1,
             0,
         )
-        .add(0x1100000)
     };
+    let _ = crate::vma_name::set_anon_vma_name_raw(stack_base as *mut u8, 0x1100000, b"wwb_trace_stack\0");
+    let stack = unsafe { stack_base.add(0x1100000) };
     let tls = unsafe {
         mmap(
             null_mut(),
@@ -111,6 +112,7 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
             0,
         )
     };
+    let _ = crate::vma_name::set_anon_vma_name_raw(tls as *mut u8, 0x1000, b"wwb_trace_tls\0");
     crate::gumlibc::gum_libc_clone(
         tracer as *mut usize,
         thread_id,

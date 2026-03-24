@@ -120,7 +120,10 @@ frida_main (void * user_data)
   int ctrlfd_for_peer, ctrlfd, agent_codefd, agent_ctrlfd;
 
   thread_id = frida_gettid ();
-  unload_policy = FRIDA_UNLOAD_POLICY_IMMEDIATE;
+  /* RESIDENT: 不 dlclose agent.so，避免 exec pool 中的 trampoline/thunk
+   * 指向已卸载代码导致 SIGSEGV（对标 Frida 默认行为）。
+   * agent 内存成本 ~3MB，但消除了 dlclose 后的 use-after-unload 崩溃。 */
+  unload_policy = FRIDA_UNLOAD_POLICY_RESIDENT;
   ctrlfd = -1;
   agent_codefd = -1;
   agent_ctrlfd = -1;

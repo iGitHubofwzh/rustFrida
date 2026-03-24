@@ -349,7 +349,7 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
     user_data: *mut std::ffi::c_void,
 ) {
     // 最早的 log — 确认函数是否被调用
-    crate::jsapi::console::output_message("[dispatch] ENTRY");
+    crate::jsapi::console::output_verbose("[dispatch] ENTRY");
     if ctx_ptr.is_null() || user_data.is_null() {
         return;
     }
@@ -409,7 +409,7 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
     let env: JniEnv = match crate::jsapi::java::jni_core::get_thread_env() {
         Ok(e) => e,
         Err(e) => {
-            crate::jsapi::console::output_message(&format!(
+            crate::jsapi::console::output_verbose(&format!(
                 "[dispatch] get_thread_env failed: {}, art_method={:#x}",
                 e, art_method_addr
             ));
@@ -422,13 +422,13 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
     // callOriginal (ctx.orig()) 走 clone+JNI, 有完整 JNI 环境。
     let mut result_was_set = false;
 
-    crate::jsapi::console::output_message(&format!(
+    crate::jsapi::console::output_verbose(&format!(
         "[dispatch] BEFORE invoke_hook_callback_common: art_method={:#x}, ctx={:#x}",
         art_method_addr, ctx_usize
     ));
 
     // DEBUG: 跳过所有操作，纯 return（验证 dispatch+RET 本身是否安全）
-    crate::jsapi::console::output_message("[dispatch] PURE RETURN (no JS, no clone)");
+    crate::jsapi::console::output_verbose("[dispatch] PURE RETURN (no JS, no clone)");
     (*ctx_ptr).x[0] = 0; // 返回 null/0
     return;
 

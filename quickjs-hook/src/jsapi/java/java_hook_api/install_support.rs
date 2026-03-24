@@ -1,5 +1,5 @@
 use crate::ffi::hook as hook_ffi;
-use crate::jsapi::console::output_message;
+use crate::jsapi::console::output_verbose;
 
 use super::super::art_controller::prepare_hook_target;
 use super::super::art_method::*;
@@ -176,7 +176,7 @@ pub(super) unsafe fn create_replacement_art_method(
     std::ptr::write_volatile((repl + ep_offset) as *mut u64, jni_trampoline);
     hook_ffi::hook_flush_cache(ptr, clone_size);
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[java hook] Step 4 replacement: addr={:#x}, flags={:#x}, data_={:#x}, ep={:#x}",
         repl, repl_flags, thunk as u64, jni_trampoline
     ));
@@ -196,7 +196,7 @@ pub(super) unsafe fn update_original_method_flags_for_hook(
     }
     let new_flags = (original_access_flags & !removed_flags) | k_acc_compile_dont_bother();
     std::ptr::write_volatile((art_method as usize + access_flags_offset) as *mut u32, new_flags);
-    output_message(&format!(
+    output_verbose(&format!(
         "[java hook] Step 5 original flags: {:#x} → {:#x}",
         original_access_flags, new_flags
     ));
@@ -257,7 +257,7 @@ pub(super) unsafe fn install_per_method_router_hook(
         // 诊断: 验证 inline hook 的 patch 是否真正写入
         let current_ep = std::ptr::read_volatile((art_method as usize + ep_offset) as *const u64);
         let hooked_bytes: [u8; 4] = std::ptr::read(actual_hook_target as *const [u8; 4]);
-        output_message(&format!(
+        output_verbose(&format!(
             "[java hook] Step 9: Layer 3 installed: ep={:#x} (hooked={:#x}), trampoline={:#x}, current_ep={:#x}, first_bytes={:02x}{:02x}{:02x}{:02x}",
             original_entry_point, actual_hook_target, trampoline as u64,
             current_ep,
@@ -284,12 +284,12 @@ pub(super) unsafe fn install_per_method_router_hook(
             // 不需要强制改 ep 为 interpreter_bridge — 保留 ART 设置的 ep（可能是 nterp 或
             // deopt bridge），让 Layer 2 DoCall 拦截。强制改 ep 在 spawn 模式下可能导致
             // WalkStack 异常（entry_point 与 OAT 元数据不匹配）。
-            output_message(&format!(
+            output_verbose(&format!(
                 "[java hook] Step 9: 非 Layer 1 路由 ep={:#x}, 依赖 Layer 2 DoCall 拦截",
                 original_entry_point
             ));
         } else {
-            output_message(&format!(
+            output_verbose(&format!(
                 "[java hook] Step 9: 共享 stub, 依赖 Layer 1+2 路由: ep={:#x}",
                 original_entry_point
             ));
