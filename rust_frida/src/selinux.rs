@@ -67,6 +67,39 @@ const RULES: &[(&str, &str, &str, &[&str])] = &[
     ("zygote", "zygote", "capability", &["sys_ptrace"]),
     ("?app_zygote", "zygote_exec", "file", &["read"]),
     ("system_server", "?apex_art_data_file", "file", &["execute"]),
+    // 属性伪装: 允许 domain 在子进程 mount namespace 中执行 bind mount
+    // /dev/__properties__/ 类型是 properties_device，不是 tmpfs
+    (
+        "domain",
+        "tmpfs",
+        "filesystem",
+        &["?mount", "?unmount", "?remount"],
+    ),
+    (
+        "domain",
+        "?properties_device",
+        "dir",
+        &["mounton", "read", "open", "getattr", "search"],
+    ),
+    (
+        "domain",
+        "?properties_device",
+        "file",
+        &["read", "open", "getattr", "?map"],
+    ),
+    (
+        "domain",
+        "tmpfs",
+        "dir",
+        &["?mounton", "read", "open", "getattr", "search"],
+    ),
+    // mount 需要 sys_admin capability
+    (
+        "domain",
+        "domain",
+        "capability",
+        &["?sys_admin"],
+    ),
 ];
 
 // ─── 全局状态 ───

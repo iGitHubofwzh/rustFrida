@@ -51,12 +51,21 @@ struct ZygotePatch {
     setargv0_ptr_backup: [u8; 8],
     /// setcontext GOT slot（可选）
     setcontext_got: Option<(u64, [u8; 8])>,
+    /// prctl GOT slot（可选，用于保留 CAP_SYS_ADMIN）
+    prctl_got: Option<(u64, [u8; 8])>,
 }
 
 /// 全局状态
 static ZYGOTE_PATCHES: OnceLock<Mutex<Vec<ZygotePatch>>> = OnceLock::new();
 static SERVER_SOCKET_PATH: OnceLock<String> = OnceLock::new();
 static SPAWN_REQUESTS: OnceLock<Mutex<HashMap<String, Arc<SpawnNotifier>>>> = OnceLock::new();
+/// 属性 profile 目录（由 --profile 设置，None = 禁用）
+static PROP_PROFILE_DIR: OnceLock<Option<String>> = OnceLock::new();
+
+/// 设置属性 profile 目录（在 spawn_and_inject 之前调用）
+pub(crate) fn set_prop_profile(profile_dir: Option<String>) {
+    let _ = PROP_PROFILE_DIR.set(profile_dir);
+}
 
 /// Spawn 通知器：线程安全的单次值传递
 struct SpawnNotifier {
@@ -296,6 +305,8 @@ pub(crate) fn spawn_and_inject(
     log_info!("Spawn 模式: 准备注入 {}", package);
 
     let hello = spawn_and_wait_hello(package)?;
+
+    // 属性伪装: mount 在 capset hook 中完成，remap 在 setArgV0 中完成
 
     // 5. 注入 agent 到子进程
     let pid = hello.pid as i32;
@@ -790,6 +801,12 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
         mem.pwrite_all(backup, *addr)?;
     }
 
+    // 还原 prctl GOT（如果有）
+    if let Some((addr, backup)) = &patch.prctl_got {
+        log_verbose!("还原子进程 {} capset GOT at 0x{:x}", pid, addr);
+        mem.pwrite_all(backup, *addr)?;
+    }
+
     Ok(())
 }
 
@@ -958,7 +975,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     }
 
     // 6. 先构建 payload 获取替换函数地址（用于 already-patched 检测）
-    let (payload_data, replacement_setargv0_addr, replacement_setcontext_addr) = build_payload(
+    let (payload_data, replacement_setargv0_addr, replacement_setcontext_addr, replacement_prctl_addr) = build_payload(
         socket_name,
         loc.base,
         loc.prot,
@@ -1059,7 +1076,30 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         None
     };
 
-    // 12. SIGCONT 恢复 zygote — guard 在 drop 时自动发送
+    // 12. 属性伪装: 替换 capset GOT（仅指定 --profile 时）
+    //     capset hook 在 cap drop 前执行 mount --bind
+    let prctl_got = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
+        let got = find_got_entry_for_import(&maps, "libandroid_runtime.so", "capset");
+        if let Some(got) = got {
+            let backup = if already_patched {
+                libc_funcs.prctl.to_ne_bytes()
+            } else {
+                let mut buf = [0u8; 8];
+                mem.pread_exact(&mut buf, got)?;
+                buf
+            };
+            mem.pwrite_all(&replacement_prctl_addr.to_ne_bytes(), got)?;
+            log_verbose!("capset GOT 已替换: 0x{:x}", got);
+            Some((got, backup))
+        } else {
+            log_warn!("未找到 capset GOT，属性 mount 将不可用");
+            None
+        }
+    } else {
+        None
+    };
+
+    // 13. SIGCONT 恢复 zygote — guard 在 drop 时自动发送
     //     正常路径：显式 drop guard 触发 SIGCONT
     //     异常路径：? 返回 Err 时 guard 自动 drop 触发 SIGCONT
     drop(sigcont_guard);
@@ -1073,6 +1113,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         setargv0_ptr_addr,
         setargv0_ptr_backup,
         setcontext_got,
+        prctl_got,
     })
 }
 
@@ -1158,6 +1199,7 @@ struct LibcFunctions {
     recv: u64,
     close: u64,
     raise: u64,
+    prctl: u64,
 }
 
 /// 解析 libc.so 获取所需函数地址
@@ -1194,6 +1236,7 @@ fn resolve_libc_functions(maps: &[MapEntry]) -> Result<LibcFunctions, String> {
         recv: resolve("recv")?,
         close: resolve("close")?,
         raise: resolve("raise")?,
+        prctl: resolve("prctl")?,
     })
 }
 
@@ -1440,7 +1483,7 @@ fn build_payload(
     libc_funcs: &LibcFunctions,
     original_setargv0: u64,
     original_setcontext: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64), String> {
+) -> Result<(Vec<u8>, u64, u64, u64), String> {
     // 解析 zymbiote ELF
     let elf = goblin::elf::Elf::parse(ZYMBIOTE_ELF).map_err(|e| format!("解析 zymbiote ELF 失败: {}", e))?;
 
@@ -1498,12 +1541,15 @@ fn build_payload(
 
     let replacement_setargv0_offset = find_symbol_offset("rustfrida_zymbiote_replacement_setargv0")?;
     let replacement_setcontext_offset = find_symbol_offset("rustfrida_zymbiote_replacement_setcontext")?;
+    let replacement_prctl_offset = find_symbol_offset("rustfrida_zymbiote_replacement_capset")?;
     let zymbiote_offset = find_symbol_offset("zymbiote")?;
 
     // 绝对地址 = payload_base + 段内偏移
     let replacement_setargv0_addr = payload_base + replacement_setargv0_offset;
     let replacement_setcontext_addr = payload_base + replacement_setcontext_offset;
+    let replacement_prctl_addr = payload_base + replacement_prctl_offset;
     let ctx_base = zymbiote_offset as usize;
+    log_verbose!("ZymbioteContext: ctx_base=0x{:x}, payload_len=0x{:x}", ctx_base, payload.len());
 
     // 填充 ZymbioteContext
     // socket_path
@@ -1538,12 +1584,11 @@ fn build_payload(
     write_u64(ctx, CTX_RECV - CTX_SOCKET_PATH, libc_funcs.recv);
     write_u64(ctx, CTX_CLOSE - CTX_SOCKET_PATH, libc_funcs.close);
     write_u64(ctx, CTX_RAISE - CTX_SOCKET_PATH, libc_funcs.raise);
-
     // 无需 GOT 重定位：zymbiote 用 -shared -nostdlib 构建，
     // ARM64 ADRP+ADD 为 PC-relative 寻址，代码和数据在同一段内，
     // 移动到新地址后相对偏移不变。实测 .got 为空且无动态重定位。
 
-    Ok((payload, replacement_setargv0_addr, replacement_setcontext_addr))
+    Ok((payload, replacement_setargv0_addr, replacement_setcontext_addr, replacement_prctl_addr))
 }
 
 /// 在 payload 缓冲区内写入 u64 值
@@ -1671,6 +1716,13 @@ pub(crate) fn cleanup_zygote_patches() {
                 if let Some((addr, backup)) = &patch.setcontext_got {
                     if let Err(e) = mem.pwrite_all(backup, *addr) {
                         log_error!("还原 zygote {} setcontext GOT 失败: {}", patch.pid, e);
+                    }
+                }
+
+                // 还原 prctl GOT
+                if let Some((addr, backup)) = &patch.prctl_got {
+                    if let Err(e) = mem.pwrite_all(backup, *addr) {
+                        log_error!("还原 zygote {} prctl GOT 失败: {}", patch.pid, e);
                     }
                 }
 

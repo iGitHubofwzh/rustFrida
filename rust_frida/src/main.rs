@@ -6,6 +6,7 @@ mod injection;
 mod logger;
 mod proc_mem;
 mod process;
+mod props;
 mod repl;
 mod selinux;
 mod spawn;
@@ -36,6 +37,17 @@ fn main() {
 
     // 初始化 verbose 模式
     logger::VERBOSE.store(args.verbose, Ordering::Relaxed);
+
+    // --dump-props: 独立操作，dump 后退出
+    if let Some(ref profile_name) = args.dump_props {
+        match props::dump_props(profile_name) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                log_error!("Dump 属性失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // 解析 --name 到 PID（如果指定）
     let resolved_pid: Option<i32> = if let Some(ref name) = args.name {
@@ -74,6 +86,20 @@ fn main() {
         log_info!("字符串覆盖列表 ({} 个):", string_overrides.len());
         for (name, value) in &string_overrides {
             println!("     {} = {}", name, value);
+        }
+    }
+
+    // 属性 profile 预处理：在 spawn 之前 patch 文件，
+    // zymbiote 在 fork 后自动 mount+remap，无需 ptrace
+    if let Some(ref profile_name) = args.profile {
+        match props::prep_prop_profile(profile_name) {
+            Ok(profile_dir) => {
+                spawn::set_prop_profile(Some(profile_dir));
+            }
+            Err(e) => {
+                log_error!("属性 profile 预处理失败: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -209,6 +235,7 @@ fn main() {
                 }
             }
             // resume: hook 已就位，恢复子进程
+            // (属性 profile 已由 zymbiote 在 fork 后自动 mount+remap)
             if let Err(e) = spawn::resume_child(pid as u32) {
                 log_error!("恢复子进程失败: {}", e);
             }

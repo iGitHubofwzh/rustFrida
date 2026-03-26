@@ -27,8 +27,12 @@ inline hook、Frida Stalker 追踪等功能。
   rustfrida --pid 1234 -l script.js            # 注入并执行 JS 脚本
   rustfrida --pid 1234 --verbose               # 显示详细注入调试信息
 
+属性伪装:
+  rustfrida --dump-props default               # Dump 本机属性到 profile
+  rustfrida --spawn com.app --profile default  # Spawn 并覆盖属性
+
 注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。",
-    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn"]))
+    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn", "dump_props"]))
 )]
 pub(crate) struct Args {
     /// 目标进程的PID（与 --watch-so、--name、--spawn 互斥）
@@ -79,4 +83,22 @@ pub(crate) struct Args {
     /// 显示详细注入信息（地址、偏移等）
     #[arg(short = 'v', long = "verbose")]
     pub(crate) verbose: bool,
+
+    /// Dump 本机属性到 profile（独立操作，不注入进程）
+    ///
+    /// 将 /dev/__properties__/ 和 getprop 输出保存到 /dev/properties/.profiles/<PROFILE>/，
+    /// 编辑 override.prop 定义属性覆盖，再用 --spawn --profile 应用。
+    #[arg(
+        long = "dump-props",
+        value_name = "PROFILE",
+        conflicts_with_all = ["pid", "watch_so", "name", "spawn"]
+    )]
+    pub(crate) dump_props: Option<String>,
+
+    /// 指定属性覆盖 profile（仅 --spawn 模式可用）
+    ///
+    /// 在子进程恢复前 bind mount 修改后的属性文件到 /dev/__properties__/，
+    /// 同时重写已映射内存中的属性值，实现对目标 App 的属性伪装。
+    #[arg(long = "profile", value_name = "NAME", requires = "spawn")]
+    pub(crate) profile: Option<String>,
 }
