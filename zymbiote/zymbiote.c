@@ -48,6 +48,9 @@ struct _ZymbioteContext
     ssize_t (*recv)(int sockfd, void *buf, size_t len, int flags);
     int     (*close)(int fd);
     int     (*raise)(int sig);
+
+    /* 控制标志（由 Rust 侧填充） */
+    uint64_t prop_remap;            /* 非零 = 启用属性 remap */
 };
 
 /* 全局上下文实例（运行时由 Rust 侧通过 /proc/pid/mem 填充） */
@@ -540,8 +543,8 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
     else
         name_utf8 = (*env)->GetStringUTFChars(env, name, NULL);
 
-    /* 属性伪装: remap（mount 已在 capset hook 中完成）
-     * .active 不存在说明 mount 没做（.profiles/ 被覆盖）或未启用 prop spoofing */
+    /* 属性伪装: remap（仅当 Rust 侧设置 prop_remap 标志时） */
+    if (zymbiote.prop_remap)
     {
         struct prop_remap_entry re[MAX_PROP_ENTRIES];
         int rc = 0;

@@ -169,6 +169,7 @@ const CTX_SENDMSG: usize = 176;
 const CTX_RECV: usize = 184;
 const CTX_CLOSE: usize = 192;
 const CTX_RAISE: usize = 200;
+const CTX_PROP_REMAP: usize = 208;
 /// 读取 stream 直到 EOF 或错误（用于等待子进程关闭 socket）
 fn drain_until_eof(stream: &mut std::os::unix::net::UnixStream, timeout: std::time::Duration) {
     stream.set_read_timeout(Some(timeout)).ok();
@@ -1584,6 +1585,9 @@ fn build_payload(
     write_u64(ctx, CTX_RECV - CTX_SOCKET_PATH, libc_funcs.recv);
     write_u64(ctx, CTX_CLOSE - CTX_SOCKET_PATH, libc_funcs.close);
     write_u64(ctx, CTX_RAISE - CTX_SOCKET_PATH, libc_funcs.raise);
+    // prop_remap: 有 profile 时启用
+    let prop_remap = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() { 1u64 } else { 0u64 };
+    write_u64(ctx, CTX_PROP_REMAP - CTX_SOCKET_PATH, prop_remap);
     // 无需 GOT 重定位：zymbiote 用 -shared -nostdlib 构建，
     // ARM64 ADRP+ADD 为 PC-relative 寻址，代码和数据在同一段内，
     // 移动到新地址后相对偏移不变。实测 .got 为空且无动态重定位。

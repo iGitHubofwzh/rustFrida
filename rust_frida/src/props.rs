@@ -8,6 +8,7 @@
 //! 3. `--spawn <pkg> --profile <profile>`: 预处理(patch 文件) → zymbiote 在 fork 后自动 mount+remap
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 
 use crate::{log_info, log_step, log_success, log_verbose, log_warn};
 
@@ -21,6 +22,40 @@ const PROP_AREA_MAGIC: u32 = 0x504f5250;
 const PROP_AREA_HEADER_SIZE: usize = 128;
 /// prop_info value 字段大小 (PROP_VALUE_MAX)
 const PROP_VALUE_MAX: usize = 92;
+
+/// 设置文件的 SELinux context（通过 lsetxattr）
+fn set_selinux_context(path: &str, context: &str) {
+    let path_cstr = format!("{}\0", path);
+    let ctx_cstr = format!("{}\0", context);
+    let ret = unsafe {
+        libc::lsetxattr(
+            path_cstr.as_ptr() as *const libc::c_char,
+            b"security.selinux\0".as_ptr() as *const libc::c_char,
+            ctx_cstr.as_ptr() as *const c_void,
+            ctx_cstr.len(),
+            0,
+        )
+    };
+    if ret != 0 {
+        log_verbose!("lsetxattr({}, {}) 失败: {}", path, context, std::io::Error::last_os_error());
+    }
+}
+
+/// 从文件名推断 SELinux context
+///
+/// prop area 文件名即为其 context (u:object_r:xxx:s0)，
+/// 特殊文件 (properties_serial, property_info) 各有固定 context。
+fn selinux_context_from_filename(filename: &str) -> Option<&str> {
+    if filename.starts_with("u:") {
+        Some(filename)
+    } else {
+        match filename {
+            "properties_serial" => Some("u:object_r:properties_serial:s0"),
+            "property_info" => Some("u:object_r:property_info:s0"),
+            _ => None,
+        }
+    }
+}
 
 // ─── 公开 API ────────────────────────────────────────────────────────────────
 
@@ -44,9 +79,14 @@ pub(crate) fn dump_props(profile_name: &str) -> Result<(), String> {
         if !src.is_file() {
             continue;
         }
-        let dst = format!("{}/{}", profile_dir, entry.file_name().to_string_lossy());
+        let filename = entry.file_name().to_string_lossy().to_string();
+        let dst = format!("{}/{}", profile_dir, filename);
         std::fs::copy(&src, &dst)
             .map_err(|e| format!("复制 {:?} → {} 失败: {}", src, dst, e))?;
+        // 恢复 SELinux context（文件名即 context，如 u:object_r:build_prop:s0）
+        if let Some(ctx) = selinux_context_from_filename(&filename) {
+            set_selinux_context(&dst, ctx);
+        }
         count += 1;
     }
     log_info!("已复制 {} 个属性区域文件", count);
@@ -94,7 +134,9 @@ pub(crate) fn set_prop(profile_name: &str, key_value: &str) -> Result<(), String
 
     let count = patch_prop_files(&profile_dir, &overrides)?;
     if count == 0 {
-        return Err(format!("未在属性文件中找到: {}", key));
+        // 属性不存在，添加新属性到最匹配的 prop_area 文件
+        log_info!("属性 {} 不存在，添加新属性...", key);
+        add_prop_to_profile(&profile_dir, key, value)?;
     }
 
     log_success!("{} = {}", key, value);
@@ -180,6 +222,11 @@ pub(crate) fn repack_props(profile_name: &str) -> Result<(), String> {
             total_after += new_data.len();
             std::fs::write(&path, &new_data)
                 .map_err(|e| format!("写回 {:?} 失败: {}", path, e))?;
+            // 恢复 SELinux context
+            if let Some(ctx) = selinux_context_from_filename(&filename) {
+                let path_str = path.to_string_lossy();
+                set_selinux_context(&path_str, ctx);
+            }
             files_repacked += 1;
             log_verbose!(
                 "重排 {}: {} 条属性, {} → {} bytes",
@@ -223,6 +270,111 @@ pub(crate) fn prep_prop_profile(profile_name: &str) -> Result<String, String> {
 }
 
 // ─── 内部实现 ────────────────────────────────────────────────────────────────
+
+/// 向 profile 中添加新属性（当属性不存在时）
+///
+/// 策略: 扫描所有 prop_area 文件，按前缀匹配度选择最合适的文件，
+/// 解析已有属性 → 追加新属性 → 重建 prop_area。
+fn add_prop_to_profile(
+    profile_dir: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(profile_dir)
+        .map_err(|e| format!("读取 {} 失败: {}", profile_dir, e))?;
+
+    let key_parts: Vec<&str> = key.split('.').collect();
+
+    // 候选文件: (路径, 已有属性, 前缀匹配段数)
+    let mut best_path: Option<String> = None;
+    let mut best_props: Vec<(String, String)> = Vec::new();
+    let mut best_score: usize = 0;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if matches!(
+            filename.as_str(),
+            "props.txt" | "override.prop" | "properties_serial" | ".active"
+        ) {
+            continue;
+        }
+
+        let data =
+            std::fs::read(&path).map_err(|e| format!("读取 {:?} 失败: {}", path, e))?;
+        if data.len() < PROP_AREA_HEADER_SIZE {
+            continue;
+        }
+        let magic = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        if magic != PROP_AREA_MAGIC {
+            continue;
+        }
+
+        let props = parse_prop_area(&data);
+        if props.is_empty() {
+            continue;
+        }
+
+        // 计算该文件中属性与新 key 的最长公共前缀段数
+        let mut file_score = 0usize;
+        for (existing_key, _) in &props {
+            let existing_parts: Vec<&str> = existing_key.split('.').collect();
+            let common = key_parts
+                .iter()
+                .zip(existing_parts.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            if common > file_score {
+                file_score = common;
+            }
+        }
+
+        // 选前缀匹配最高的；同分选属性最多的（通常是 default_prop）
+        let better = match &best_path {
+            None => true,
+            Some(_) => {
+                file_score > best_score
+                    || (file_score == best_score && props.len() > best_props.len())
+            }
+        };
+        if better {
+            best_path = Some(path.to_string_lossy().to_string());
+            best_props = props;
+            best_score = file_score;
+        }
+    }
+
+    let target_path = best_path.ok_or_else(|| {
+        "Profile 中没有可用的属性区域文件".to_string()
+    })?;
+
+    // 追加新属性并重建
+    best_props.push((key.to_string(), value.to_string()));
+    let new_data = build_prop_area(&best_props);
+    std::fs::write(&target_path, &new_data)
+        .map_err(|e| format!("写回 {} 失败: {}", target_path, e))?;
+
+    // 恢复 SELinux context
+    let filename = std::path::Path::new(&target_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if let Some(ctx) = selinux_context_from_filename(&filename) {
+        set_selinux_context(&target_path, ctx);
+    }
+    log_info!(
+        "添加新属性 [{}] 到 {} (共 {} 条属性)",
+        key,
+        filename,
+        best_props.len()
+    );
+
+    Ok(())
+}
 
 /// 修补 profile 中的属性区域文件
 ///
@@ -618,8 +770,6 @@ fn build_prop_area(props: &[(String, String)]) -> Vec<u8> {
     // bytes_used
     data[0..4].copy_from_slice(&(alloc_pos as u32).to_le_bytes());
 
-    // 截断到实际使用大小（对齐到页）
-    let used = data_start + ((alloc_pos + 4095) & !4095);
-    data.truncate(used.min(area_size));
+    // 保持标准 PA_SIZE (128KB)，不截断，避免文件大小异常被检测
     data
 }
