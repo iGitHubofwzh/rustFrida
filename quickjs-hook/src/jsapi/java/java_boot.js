@@ -115,8 +115,17 @@
             if (jt === "object") return 2;
             return 1; // 兜底: 其他 JS 类型 → Object
         }
-        // 原始类型: 只有匹配的 JS 类型才兼容
+        // 原始类型: number 区分整数/浮点优先级
         if (t0 === 'Z') return (jt === "boolean" || jt === "number") ? 3 : -1;
+        if (jt === "number") {
+            var isInt = Number.isInteger(jsVal);
+            if (t0 === 'I') return isInt ? 4 : 2;       // 整数值→int=4, 浮点值→int=2
+            if (t0 === 'B') return isInt ? 3 : 1;       // 整数值→byte=3
+            if (t0 === 'S') return isInt ? 3 : 1;       // 整数值→short=3
+            if (t0 === 'J') return isInt ? 3 : 2;       // 整数值→long=3
+            if (t0 === 'D') return isInt ? 2 : 4;       // 浮点值→double=4, 整数值→double=2
+            if (t0 === 'F') return isInt ? 2 : 3;       // 浮点值→float=3
+        }
         if (t0 === 'B' || t0 === 'S' || t0 === 'I' || t0 === 'F' || t0 === 'D')
             return jt === "number" ? 3 : -1;
         if (t0 === 'J') return (jt === "bigint" || jt === "number") ? 3 : -1;
