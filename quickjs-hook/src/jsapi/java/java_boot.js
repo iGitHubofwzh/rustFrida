@@ -79,33 +79,39 @@
         return res;
     }
 
-    function _isJsValueCompatible(jsVal, jniType) {
+    // 判断 JS 值是否可传给 JNI 类型，同时返回匹配精度分数。
+    // 返回: -1 = 不兼容, 1 = autobox 兜底, 2 = 兼容, 3 = 精确匹配
+    function _scoreParam(jsVal, jniType) {
         var t0 = jniType.charAt(0);
         if (jsVal === null || jsVal === undefined) {
-            return t0 === 'L' || t0 === '[';
+            return (t0 === 'L' || t0 === '[') ? 2 : -1;
         }
-        var jsType = typeof jsVal;
-        if (t0 === 'Z') {
-            return jsType === "boolean" || jsType === "number";
-        }
-        if (t0 === 'B' || t0 === 'S' || t0 === 'I'
-            || t0 === 'F' || t0 === 'D') {
-            return jsType === "number";
-        }
-        if (t0 === 'J') {
-            return jsType === "bigint" || jsType === "number";
-        }
-        if (t0 === 'L') {
-            // String 兼容 String、Object 及所有引用类型（String 是 Object 子类）
-            if (jsType === "string") {
-                return true;
+        var jt = typeof jsVal;
+        // 引用类型: 任何 JS 值都可通过 autobox 传给引用类型参数
+        if (t0 === 'L' || t0 === '[') {
+            if (t0 === '[') {
+                // 数组: Array 或 object 精确匹配，其余不兼容
+                return (Array.isArray(jsVal) || jt === "object") ? 2 : -1;
             }
-            return jsType === "object";
+            // L 引用类型
+            if (jt === "string") return jniType === "Ljava/lang/String;" ? 3 : 1;
+            if (jt === "number") return jniType === "Ljava/lang/Integer;" || jniType === "Ljava/lang/Number;" ? 3 : 1;
+            if (jt === "boolean") return jniType === "Ljava/lang/Boolean;" ? 3 : 1;
+            if (jt === "bigint") return jniType === "Ljava/lang/Long;" ? 3 : 1;
+            if (jt === "object") return 2;
+            return 1; // 兜底: 其他 JS 类型 → Object
         }
-        if (t0 === '[') {
-            return Array.isArray(jsVal) || jsType === "object";
-        }
-        return false;
+        // 原始类型: 只有匹配的 JS 类型才兼容
+        if (t0 === 'Z') return (jt === "boolean" || jt === "number") ? 3 : -1;
+        if (t0 === 'B' || t0 === 'S' || t0 === 'I' || t0 === 'F' || t0 === 'D')
+            return jt === "number" ? 3 : -1;
+        if (t0 === 'J') return (jt === "bigint" || jt === "number") ? 3 : -1;
+        if (t0 === 'C') return jt === "string" ? 3 : (jt === "number" ? 2 : -1);
+        return -1;
+    }
+
+    function _isJsValueCompatible(jsVal, jniType) {
+        return _scoreParam(jsVal, jniType) >= 0;
     }
 
     function _scoreOverload(methodInfo, jsArgs) {
@@ -116,15 +122,9 @@
 
         var score = 0;
         for (var i = 0; i < paramTypes.length; i++) {
-            if (!_isJsValueCompatible(jsArgs[i], paramTypes[i])) {
-                return -1;
-            }
-            // 精确类型匹配得分更高: String→String > String→Object
-            if (typeof jsArgs[i] === "string" && paramTypes[i] === "Ljava/lang/String;") {
-                score += 3;
-            } else {
-                score += /^[L[]/.test(paramTypes[i]) ? 1 : 2;
-            }
+            var s = _scoreParam(jsArgs[i], paramTypes[i]);
+            if (s < 0) return -1;
+            score += s;
         }
         return score;
     }
