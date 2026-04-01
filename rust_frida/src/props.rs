@@ -878,12 +878,15 @@ fn patch_prop_files(
                     // 写 short property
                     data[value_offset..value_offset + new_bytes.len()]
                         .copy_from_slice(new_bytes);
-                    // serial: 清除 kLongFlag（如果原来是 long）
-                    let new_serial = if is_long {
+                    // serial: 更新高 8 位值长度 + 清除 kLongFlag
+                    // bionic 用 SERIAL_VALUE_LEN(serial) = serial >> 24 获取值长度
+                    let base_serial = if is_long {
                         original_serial & !(1u32 << 16)
                     } else {
                         original_serial
                     };
+                    let new_serial = (base_serial & 0x00FF_FFFF)
+                        | ((new_bytes.len() as u32) << 24);
                     data[serial_offset..serial_offset + 4]
                         .copy_from_slice(&new_serial.to_le_bytes());
                 }
