@@ -96,8 +96,9 @@
             return jsType === "bigint" || jsType === "number";
         }
         if (t0 === 'L') {
+            // String 兼容 String、Object 及所有引用类型（String 是 Object 子类）
             if (jsType === "string") {
-                return jniType === "Ljava/lang/String;";
+                return true;
             }
             return jsType === "object";
         }
@@ -118,7 +119,12 @@
             if (!_isJsValueCompatible(jsArgs[i], paramTypes[i])) {
                 return -1;
             }
-            score += /^[L[]/.test(paramTypes[i]) ? 1 : 2;
+            // 精确类型匹配得分更高: String→String > String→Object
+            if (typeof jsArgs[i] === "string" && paramTypes[i] === "Ljava/lang/String;") {
+                score += 3;
+            } else {
+                score += /^[L[]/.test(paramTypes[i]) ? 1 : 2;
+            }
         }
         return score;
     }
