@@ -128,15 +128,16 @@ pub(crate) fn set_prop(profile_name: &str, key_value: &str) -> Result<(), String
     let mut overrides = HashMap::new();
     overrides.insert(key.to_string(), value.to_string());
 
-    let (count, modified_files) = patch_prop_files(&profile_dir, &overrides)?;
+    let (count, _modified_files) = patch_prop_files(&profile_dir, &overrides)?;
     if count == 0 {
         // 属性不存在，添加新属性到最匹配的 prop_area 文件
         log_info!("属性 {} 不存在，添加新属性...", key);
         add_prop_to_profile(&profile_dir, key, value)?;
-    } else if !modified_files.is_empty() {
-        // 仅对被修改的文件重建，清理 long 转换产生的空洞
-        erase_dead_props_in_dir(&profile_dir, Some(&modified_files))?;
     }
+    // 注意: 不再调用 erase_dead_props_in_dir
+    // short→short 修改不产生空洞，无需重建 trie。
+    // long→short 产生空洞但不影响 bionic 读取（空洞只浪费空间）。
+    // 如需清理空洞，用 --repack-props 显式执行。
 
     log_success!("{} = {}", key, value);
     Ok(())

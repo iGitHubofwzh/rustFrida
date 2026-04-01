@@ -33,8 +33,12 @@ inline hook、Frida Stalker 追踪等功能。
   rustfrida --set-prop default ro.debuggable=0                      # 可多次调用
   rustfrida --spawn com.app --profile default                       # Spawn 并应用
 
+Server daemon 模式（多 session 并发）:
+  rustfrida --server                                                # 启动 server
+  rustfrida --server --profile default                              # 启动 + 属性伪装持续生效
+
 注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。",
-    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "del_prop", "repack_props"]))
+    group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name", "spawn", "dump_props", "set_prop", "del_prop", "repack_props", "server"]))
 )]
 pub(crate) struct Args {
     /// 目标进程的PID（与 --watch-so、--name、--spawn 互斥）
@@ -130,7 +134,14 @@ pub(crate) struct Args {
     )]
     pub(crate) repack_props: Option<String>,
 
-    /// 指定属性覆盖 profile（仅 --spawn 模式可用）
-    #[arg(long = "profile", value_name = "NAME", requires = "spawn")]
+    /// 指定属性覆盖 profile（--spawn 或 --server 模式可用）
+    #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
+
+    /// Server daemon 模式：多 session 并发 spawn/inject，profile 持续生效
+    ///
+    /// 启动后进入 server REPL，支持同时管理多个注入 session。
+    /// 配合 --profile 使用可在整个 server 生命周期内持续生效。
+    #[arg(long = "server", conflicts_with_all = ["pid", "watch_so", "name", "spawn"])]
+    pub(crate) server: bool,
 }

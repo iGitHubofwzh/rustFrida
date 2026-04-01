@@ -6,12 +6,13 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context, Editor, Helper};
-use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::communication::{complete_state, eval_state, send_command, HostToAgentMessage};
+use crate::communication::send_command;
 use crate::log_error;
 use crate::logger::{GRAY, GREEN, HIGHLIGHT_BG, HIGHLIGHT_FG, RED, RESET, YELLOW};
+use crate::session::Session;
 
 /// 当前构建实际可用的命令列表（编译时由 feature 控制）
 pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -87,15 +88,15 @@ impl Helper for CommandCompleter {}
 
 /// JS REPL 补全器：通过 socket 向 agent 发送 jscomplete 请求，同步等待结果。
 struct JsReplCompleter {
-    sender: Sender<HostToAgentMessage>,
+    session: Arc<Session>,
     /// Cache the last completion results for the hinter to display
     last_candidates: std::cell::RefCell<(String, Vec<String>)>,
 }
 
 impl JsReplCompleter {
-    fn new(sender: Sender<HostToAgentMessage>) -> Self {
+    fn new(session: Arc<Session>) -> Self {
         JsReplCompleter {
-            sender,
+            session,
             last_candidates: std::cell::RefCell::new((String::new(), vec![])),
         }
     }
@@ -104,9 +105,13 @@ impl JsReplCompleter {
     fn fetch_completions(&self, prefix: &str) -> Vec<String> {
         let timeout = std::time::Duration::from_millis(300);
         let cmd = format!("jscomplete {}", prefix);
-        let sender = self.sender.clone();
+        let sender = match self.session.get_sender() {
+            Some(s) => s.clone(),
+            None => return vec![],
+        };
         // 持锁 clear + 发命令 + wait，原子消除竞态窗口
-        complete_state()
+        self.session
+            .complete_state
             .clear_then_recv(timeout, || {
                 let _ = send_command(&sender, cmd);
             })
@@ -202,10 +207,12 @@ impl Highlighter for JsReplCompleter {
 impl Validator for JsReplCompleter {}
 impl Helper for JsReplCompleter {}
 
-/// 打印 eval 响应：等待 eval_state 结果并格式化输出。
-/// main.rs REPL 循环和 jsrepl 模式共用此逻辑。
-pub(crate) fn print_eval_result(timeout_secs: u64) {
-    match eval_state().recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+/// 打印 eval 响应：等待 session.eval_state 结果并格式化输出。
+pub(crate) fn print_eval_result(session: &Session, timeout_secs: u64) {
+    match session
+        .eval_state
+        .recv_timeout(std::time::Duration::from_secs(timeout_secs))
+    {
         None => println!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
         Some(Ok(output)) => {
             if !output.is_empty() {
@@ -274,13 +281,21 @@ pub(crate) fn print_help() {
 /// Every line is sent as `loadjs <line>` to the agent.  Tab completion
 /// queries the live QuickJS global scope via `jscomplete`.
 /// Type `exit` or press Ctrl-D / Ctrl-C to return to the main prompt.
-pub(crate) fn run_js_repl(sender: &Sender<HostToAgentMessage>) {
+pub(crate) fn run_js_repl(session: &Arc<Session>) {
     use crate::logger::{BOLD, CYAN, DIM, RESET};
+
+    let sender = match session.get_sender() {
+        Some(s) => s,
+        None => {
+            log_error!("jsrepl: agent 未连接");
+            return;
+        }
+    };
 
     // Auto-initialize JS engine: send jsinit and wait for EVAL confirmation.
     // Accept both Ok (just initialized) and Err containing "已初始化" (already was ready).
     {
-        let result = eval_state().clear_then_recv(std::time::Duration::from_secs(5), || {
+        let result = session.eval_state.clear_then_recv(std::time::Duration::from_secs(5), || {
             let _ = send_command(sender, "jsinit");
         });
         match result {
@@ -299,8 +314,6 @@ pub(crate) fn run_js_repl(sender: &Sender<HostToAgentMessage>) {
 
     println!("\n{BOLD}{CYAN}进入 JS REPL 模式{RESET} {DIM}(输入 exit 或按 Ctrl-D 退出){RESET}\n");
 
-    // Clone the sender so JsReplCompleter can own it
-    let sender_clone = sender.clone();
     let config = Config::builder().completion_type(CompletionType::Circular).build();
     let mut rl: Editor<JsReplCompleter, _> = match Editor::with_config(config) {
         Ok(e) => e,
@@ -309,7 +322,7 @@ pub(crate) fn run_js_repl(sender: &Sender<HostToAgentMessage>) {
             return;
         }
     };
-    rl.set_helper(Some(JsReplCompleter::new(sender_clone)));
+    rl.set_helper(Some(JsReplCompleter::new(session.clone())));
     let _ = rl.load_history(".rustfrida_js_history");
 
     loop {
@@ -325,14 +338,14 @@ pub(crate) fn run_js_repl(sender: &Sender<HostToAgentMessage>) {
                     break;
                 }
                 // 发送前清空 eval 状态
-                eval_state().clear();
+                session.eval_state.clear();
                 let cmd = format!("loadjs {}", line);
                 if let Err(e) = send_command(sender, cmd) {
                     log_error!("发送 JS 命令失败: {}", e);
                     break;
                 }
                 // 同步等待 agent 返回结果（最长 5 秒）
-                print_eval_result(5);
+                print_eval_result(session, 5);
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                 println!("{DIM}退出 JS REPL 模式{RESET}");

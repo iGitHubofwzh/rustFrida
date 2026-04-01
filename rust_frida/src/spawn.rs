@@ -329,7 +329,7 @@ pub(crate) fn spawn_and_inject(
 
 /// 确保 zymbiote 已加载到所有 zygote 进程
 /// 与 Frida ensure_loaded 一致：可重入，检测新出现的 USAP 进程
-fn ensure_zymbiote_loaded() -> Result<(), String> {
+pub(crate) fn ensure_zymbiote_loaded() -> Result<(), String> {
     let already_initialized = ZYGOTE_PATCHES.get().is_some();
 
     if !already_initialized {
@@ -1587,6 +1587,7 @@ fn build_payload(
     write_u64(ctx, CTX_RAISE - CTX_SOCKET_PATH, libc_funcs.raise);
     // prop_remap: 有 profile 时启用
     let prop_remap = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() { 1u64 } else { 0u64 };
+    log_verbose!("build_payload: prop_remap={} (PROP_PROFILE_DIR={:?})", prop_remap, PROP_PROFILE_DIR.get());
     write_u64(ctx, CTX_PROP_REMAP - CTX_SOCKET_PATH, prop_remap);
     // 无需 GOT 重定位：zymbiote 用 -shared -nostdlib 构建，
     // ARM64 ADRP+ADD 为 PC-relative 寻址，代码和数据在同一段内，

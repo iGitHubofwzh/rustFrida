@@ -77,18 +77,21 @@ static ssize_t rustfrida_recv(int sockfd, void *buf, size_t len, int flags);
 /* ========== ARM64 raw syscall ========== */
 /* 不依赖 libc，直接 svc #0 */
 
-#define __NR_mount  40
-#define __NR_openat 56
-#define __NR_close  57
-#define __NR_read   63
-#define __NR_write  64
-#define __NR_mmap   222
+#define __NR_mount    40
+#define __NR_openat   56
+#define __NR_close    57
+#define __NR_lseek    62
+#define __NR_read     63
+#define __NR_write    64
+#define __NR_mprotect 226
+#define __NR_mmap     222
 
 
 #define MY_AT_FDCWD   (-100)
 #define MY_O_RDONLY    0
 #define MY_MS_BIND     4096
 #define MY_MAP_SHARED  0x01
+#define MY_MAP_PRIVATE 0x02
 #define MY_MAP_FIXED   0x10
 
 static inline long
@@ -185,7 +188,7 @@ parse_maps_line(const char *line, unsigned long *start, unsigned long *end,
 }
 
 /* 收集到的属性映射条目 */
-#define MAX_PROP_ENTRIES 64
+#define MAX_PROP_ENTRIES 512
 
 struct prop_remap_entry
 {
@@ -575,9 +578,11 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
 
                 int rf = (int)raw_syscall6(__NR_openat, MY_AT_FDCWD, (long)rp, MY_O_RDONLY, 0, 0, 0);
                 if (rf < 0) continue;
+
                 raw_syscall6(__NR_mmap, (long)re[i].addr, (long)re[i].size,
                              (long)re[i].prot, MY_MAP_SHARED | MY_MAP_FIXED,
                              (long)rf, (long)re[i].offset);
+
                 raw_syscall6(__NR_close, (long)rf, 0, 0, 0, 0, 0);
             }
         }
