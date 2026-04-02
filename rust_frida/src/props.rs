@@ -397,7 +397,10 @@ fn rebuild_prop_area_preserving_offsets(
                     let nl = ds_read_u32!(co) as usize;
                     let cmp = {
                         let cn = &data[data_start + co + 20..data_start + co + 20 + nl];
-                        part.as_bytes().cmp(cn)
+                        // AOSP cmp_prop_name: 先比长度，同长度再比内容
+                        if part.len() < nl { std::cmp::Ordering::Less }
+                        else if part.len() > nl { std::cmp::Ordering::Greater }
+                        else { part.as_bytes().cmp(cn) }
                     };
                     match cmp {
                         std::cmp::Ordering::Less => cur_ptr = co + 8,
@@ -744,7 +747,15 @@ fn insert_prop_inplace(data: &mut Vec<u8>, key: &str, value: &str) -> Result<(),
                 let nl = read_u32(data, cur_off) as usize;
                 let cur_name = &data[data_start + cur_off + 20..data_start + cur_off + 20 + nl];
 
-                match part.as_bytes().cmp(cur_name) {
+                // AOSP cmp_prop_name: 先比长度，同长度再比内容
+                let cmp = if part.len() < nl {
+                    std::cmp::Ordering::Less
+                } else if part.len() > nl {
+                    std::cmp::Ordering::Greater
+                } else {
+                    part.as_bytes().cmp(cur_name)
+                };
+                match cmp {
                     std::cmp::Ordering::Less => cur_ptr_off = cur_off + 8,    // left
                     std::cmp::Ordering::Greater => cur_ptr_off = cur_off + 12, // right
                     std::cmp::Ordering::Equal => {
@@ -1195,7 +1206,11 @@ fn build_prop_area(props: &[(String, String)]) -> Vec<u8> {
                     let nl = read_u32(&data, cur_off) as usize;
                     let cur_name = &data[data_start + cur_off + 20..data_start + cur_off + 20 + nl];
 
-                    match part.as_bytes().cmp(cur_name) {
+                    // AOSP cmp_prop_name: 先比长度，同长度再比内容
+                    let cmp = if part.len() < nl { std::cmp::Ordering::Less }
+                              else if part.len() > nl { std::cmp::Ordering::Greater }
+                              else { part.as_bytes().cmp(cur_name) };
+                    match cmp {
                         std::cmp::Ordering::Less => cur_ptr_off = cur_off + 8,   // left
                         std::cmp::Ordering::Greater => cur_ptr_off = cur_off + 12, // right
                         std::cmp::Ordering::Equal => {
