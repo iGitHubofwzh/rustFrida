@@ -848,8 +848,8 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         }
         /* stealth1 严格模式: wxshadow 失败拒绝降级到 mprotect。
          * 降级会直接修改原始内存字节 + RWX 权限变更，
-         * hunter CRC 校验 / /proc/self/maps 扫描均可检测。 */
-        hook_log("\033[31m[STEALTH] wxshadow 失败 %p，拒绝降级 mprotect（hunter 防检测）\033[0m", target);
+         * CRC 校验 / /proc/self/maps 扫描均可检测。 */
+        hook_log("\033[31m[STEALTH] wxshadow 失败 %p，拒绝降级 mprotect\033[0m", target);
         return HOOK_ERROR_WXSHADOW_FAILED;
     }
 

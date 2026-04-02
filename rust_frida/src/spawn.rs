@@ -509,9 +509,21 @@ fn find_zygote_pids() -> Result<Vec<(u32, String)>, String> {
                 .unwrap_or("");
 
             if proc_name == "zygote" || proc_name == "zygote64" || proc_name == "usap32" || proc_name == "usap64" {
+                // 过滤 App Zygote：Android 为 isolated service 创建的应用级 zygote，
+                // 进程名也叫 "zygote" 但 UID 不是 root。注入会失败（内存布局不同）。
+                let status_path = format!("/proc/{}/status", pid);
+                if let Ok(status) = fs::read_to_string(&status_path) {
+                    let uid_line = status.lines().find(|l| l.starts_with("Uid:"));
+                    if let Some(line) = uid_line {
+                        let uid: u32 = line.split_whitespace().nth(1)
+                            .and_then(|s| s.parse().ok()).unwrap_or(u32::MAX);
+                        if uid != 0 {
+                            log_verbose!("跳过 App Zygote {} (pid={}, uid={})", proc_name, pid, uid);
+                            continue;
+                        }
+                    }
+                }
                 // 过滤 32 位进程：zymbiote payload 是 ARM64 ELF，注入 32 位进程会崩溃
-                // 在生产机上 shell 可能无权读取 /proc/<pid>/exe，此时对名字已明确带 64
-                // 的进程保守地信任进程名，避免把 zygote64/usap64 误判成 32 位。
                 if !proc_name_implies_64bit(proc_name) && !is_process_64bit(pid) {
                     log_verbose!("跳过 32 位进程 {} (pid={})", proc_name, pid);
                     continue;

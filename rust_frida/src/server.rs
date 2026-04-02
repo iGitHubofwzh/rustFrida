@@ -301,14 +301,15 @@ fn do_attach(
 // ────────────────────────── Session REPL ──────────────────────────
 
 /// 进入 session 交互模式，输入 back 返回 server REPL
-fn run_session_repl(session: &Arc<Session>) {
+/// 返回 true 表示 session 已 exit/shutdown，应从 manager 移除
+fn run_session_repl(session: &Arc<Session>) -> bool {
     use crate::logger::{DIM, RESET};
 
     let mut rl = match Editor::new() {
         Ok(e) => e,
         Err(e) => {
             log_error!("初始化行编辑器失败: {}", e);
-            return;
+            return false;
         }
     };
     rl.set_helper(Some(SessionModeCompleter::new()));
@@ -332,9 +333,12 @@ fn run_session_repl(session: &Arc<Session>) {
         }
     };
 
+    let mut should_remove = false;
+
     loop {
         if session.disconnected.load(Ordering::Acquire) {
             log_error!("[#{}] Agent 连接已断开", session.id);
+            should_remove = true;
             break;
         }
 
@@ -387,6 +391,7 @@ fn run_session_repl(session: &Arc<Session>) {
                     Some(s) => s,
                     None => {
                         log_error!("agent 未连接");
+                        should_remove = true;
                         break;
                     }
                 };
@@ -394,12 +399,14 @@ fn run_session_repl(session: &Arc<Session>) {
                     Ok(_) => {}
                     Err(e) => {
                         log_error!("发送命令失败: {}", e);
+                        should_remove = true;
                         break;
                     }
                 }
 
                 if is_eval_cmd {
-                    print_eval_result(session, if is_recomp { 15 } else { 5 });
+                    let timeout = if is_recomp { 15 } else { 5 };
+                    print_eval_result(session, timeout);
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
@@ -411,6 +418,8 @@ fn run_session_repl(session: &Arc<Session>) {
             }
         }
     }
+
+    should_remove
 }
 
 // ────────────────────────── Server REPL ──────────────────────────
@@ -609,12 +618,20 @@ pub(crate) fn run_server(args: &Args) {
                             Some(session) => {
                                 if !session.is_connected() {
                                     let status = session.status();
-                                    log_warn!("Session #{} 当前状态: {} — 请等待连接就绪", id, status);
+                                    if status == "disconnected" || status == "failed" {
+                                        log_warn!("Session #{} 已断开，正在清理", id);
+                                        mgr.remove_session(id);
+                                    } else {
+                                        log_warn!("Session #{} 当前状态: {} — 请等待连接就绪", id, status);
+                                    }
                                     continue;
                                 }
                                 mgr.set_active(Some(id));
-                                run_session_repl(&session);
+                                let should_remove = run_session_repl(&session);
                                 mgr.set_active(None);
+                                if should_remove {
+                                    mgr.remove_session(id);
+                                }
                             }
                         }
                     }

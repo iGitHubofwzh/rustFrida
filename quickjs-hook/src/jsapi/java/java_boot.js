@@ -8,7 +8,6 @@
     var _invokeStaticMethod = Java._invokeStaticMethod;
     var _newObject = Java._newObject;
     var _getFieldAuto = Java._getFieldAuto;
-    var _setFieldAuto = Java._setFieldAuto;
     var _classLoaders = Java._classLoaders;
     var _findClassWithLoader = Java._findClassWithLoader;
     var _setClassLoader = Java._setClassLoader;
@@ -18,7 +17,6 @@
     delete Java._invokeStaticMethod;
     delete Java._newObject;
     delete Java._getFieldAuto;
-    delete Java._setFieldAuto;
     delete Java._classLoaders;
     delete Java._findClassWithLoader;
     delete Java._setClassLoader;
@@ -81,64 +79,32 @@
         return res;
     }
 
-    // 判断 JS 值是否可传给 JNI 类型，同时返回匹配精度分数。
-    // 返回: -1 = 不兼容, 1 = autobox 兜底, 2 = 兼容, 3 = 精确匹配
-    function _scoreParam(jsVal, jniType) {
+    function _isJsValueCompatible(jsVal, jniType) {
         var t0 = jniType.charAt(0);
         if (jsVal === null || jsVal === undefined) {
-            return (t0 === 'L' || t0 === '[') ? 2 : -1;
+            return t0 === 'L' || t0 === '[';
         }
-        var jt = typeof jsVal;
-        // 引用类型: 任何 JS 值都可通过 autobox 传给引用类型参数
-        if (t0 === 'L' || t0 === '[') {
-            if (t0 === '[') {
-                // 数组: Array 或 object 精确匹配，其余不兼容
-                return (Array.isArray(jsVal) || jt === "object") ? 2 : -1;
+        var jsType = typeof jsVal;
+        if (t0 === 'Z') {
+            return jsType === "boolean" || jsType === "number";
+        }
+        if (t0 === 'B' || t0 === 'S' || t0 === 'I'
+            || t0 === 'F' || t0 === 'D') {
+            return jsType === "number";
+        }
+        if (t0 === 'J') {
+            return jsType === "bigint" || jsType === "number";
+        }
+        if (t0 === 'L') {
+            if (jsType === "string") {
+                return jniType === "Ljava/lang/String;";
             }
-            // L 引用类型
-            if (jt === "string") return jniType === "Ljava/lang/String;" ? 3 : 1;
-            if (jt === "number") {
-                // 精确包装类型(3) > 兼容数值类型(2) > 泛型Object(1)
-                var numBoxed = {
-                    "Ljava/lang/Integer;":3, "Ljava/lang/Double;":3,
-                    "Ljava/lang/Float;":2, "Ljava/lang/Long;":2,
-                    "Ljava/lang/Short;":2, "Ljava/lang/Byte;":2,
-                    "Ljava/lang/Number;":2, "Ljava/lang/Character;":2
-                };
-                return numBoxed[jniType] || 1;
-            }
-            if (jt === "boolean") return jniType === "Ljava/lang/Boolean;" ? 3 : 1;
-            if (jt === "bigint") {
-                return jniType === "Ljava/lang/Long;" ? 3
-                     : (jniType === "Ljava/lang/Integer;" || jniType === "Ljava/lang/Number;" ? 2 : 1);
-            }
-            if (jt === "object") return 2;
-            return 1; // 兜底: 其他 JS 类型 → Object
+            return jsType === "object";
         }
-        // 原始类型: number 区分整数/浮点优先级
-        if (t0 === 'Z') return (jt === "boolean" || jt === "number") ? 3 : -1;
-        if (jt === "number") {
-            var isInt = Number.isInteger(jsVal);
-            if (t0 === 'I') return isInt ? 4 : 2;       // 整数值→int=4, 浮点值→int=2
-            if (t0 === 'B') return isInt ? 3 : 1;       // 整数值→byte=3
-            if (t0 === 'S') return isInt ? 3 : 1;       // 整数值→short=3
-            if (t0 === 'J') return isInt ? 3 : 2;       // 整数值→long=3
-            if (t0 === 'D') return isInt ? 2 : 4;       // 浮点值→double=4, 整数值→double=2
-            if (t0 === 'F') return isInt ? 2 : 3;       // 浮点值→float=3
+        if (t0 === '[') {
+            return Array.isArray(jsVal) || jsType === "object";
         }
-        if (t0 === 'B' || t0 === 'S' || t0 === 'I' || t0 === 'F' || t0 === 'D')
-            return jt === "number" ? 3 : -1;
-        if (t0 === 'J') return (jt === "bigint" || jt === "number") ? 3 : -1;
-        // char: 单字符 string 精确匹配(3)，多字符 string 兼容(1)，number 兼容(2)
-        if (t0 === 'C') {
-            if (jt === "string") return jsVal.length === 1 ? 3 : 1;
-            return jt === "number" ? 2 : -1;
-        }
-        return -1;
-    }
-
-    function _isJsValueCompatible(jsVal, jniType) {
-        return _scoreParam(jsVal, jniType) >= 0;
+        return false;
     }
 
     function _scoreOverload(methodInfo, jsArgs) {
@@ -149,9 +115,10 @@
 
         var score = 0;
         for (var i = 0; i < paramTypes.length; i++) {
-            var s = _scoreParam(jsArgs[i], paramTypes[i]);
-            if (s < 0) return -1;
-            score += s;
+            if (!_isJsValueCompatible(jsArgs[i], paramTypes[i])) {
+                return -1;
+            }
+            score += /^[L[]/.test(paramTypes[i]) ? 1 : 2;
         }
         return score;
     }
@@ -263,20 +230,6 @@
     // - 快捷调用:   obj.$call("methodName", "(sig)", ...args)
     function _wrapJavaObj(ptr, cls) {
         var target = {__jptr: ptr, __jclass: cls};
-        // 缓存方法名集合（lazy init），用于快速判断 prop 是方法还是字段
-        var _methodNames = null;
-        function hasMethod(name) {
-            if (_methodNames === null) {
-                _methodNames = {};
-                try {
-                    var ms = _methods(cls);
-                    for (var i = 0; i < ms.length; i++) {
-                        if (!ms[i].static) _methodNames[ms[i].name] = true;
-                    }
-                } catch(e) { /* ignore */ }
-            }
-            return _methodNames[name] === true;
-        }
         var handler = {
             get: function(target, prop) {
                 if (prop === "__jptr") return target.__jptr;
@@ -291,7 +244,6 @@
                 };
                 if (typeof prop !== "string") return undefined;
                 if (prop === "toString") return function() {
-                    // 调用 Java 的 toString() 方法获取有意义的字符串表示
                     try {
                         return _invokeJavaMethod(target.__jptr, target.__jclass, "toString", "()Ljava/lang/String;", []);
                     } catch(e) {
@@ -303,6 +255,8 @@
                 };
                 if (prop === "$className") return target.__jclass;
                 if (prop === "$call") {
+                    // Instance method invocation:
+                    //   obj.$call("methodName", "(I)V", arg1, arg2, ...)
                     return function(name, sig) {
                         if (typeof name !== "string" || typeof sig !== "string") {
                             throw new Error("obj.$call(name, sig, ...args) requires (string, string, ...)");
@@ -318,32 +272,25 @@
                 }
                 var jptr = target.__jptr;
                 var jcls = target.__jclass;
-
-                // 方法优先：如果存在同名实例方法，返回方法调用器。
-                // 避免 ArrayList.size 字段覆盖 size() 方法等冲突。
-                if (hasMethod(prop)) {
-                    return _makeInstanceMethodInvoker(target, prop);
-                }
-
-                // 无同名方法：尝试字段访问
                 var result;
                 try {
                     result = _getFieldAuto(jptr, jcls, prop);
                 } catch(e) {
+                    console.log("[_wrapJavaObj] _getFieldAuto ERROR: " + e
+                        + " ptr=" + jptr + " cls=" + jcls
+                        + " prop=" + prop);
                     return undefined;
                 }
+                // 如果字段存在（包括 null），按字段语义处理
                 if (result !== undefined) {
                     return _wrapJavaReturn(result);
                 }
 
-                // 字段也没有：兜底返回方法调用器（可能是继承方法不在 _methods 列表中）
+                // 没有同名字段：按方法处理，返回一个调用该方法的函数。
+                // 用法示例:
+                //   显式签名: obj.method("(I)V", 123)
+                //   自动匹配: obj.method("abc", 123)
                 return _makeInstanceMethodInvoker(target, prop);
-            },
-            set: function(target, prop, value) {
-                if (typeof prop !== "string") return false;
-                // 通过 JNI 设置 Java 字段值
-                _setFieldAuto(target.__jptr, target.__jclass, prop, value);
-                return true;
             }
         };
         return new Proxy(target, handler);

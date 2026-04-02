@@ -255,7 +255,7 @@ fn main() {
         }
     }
 
-    // Spawn 模式: jsinit → loadjs → resume
+    // Spawn 模式: propload → jsinit → loadjs → resume
     if let Some(ref _package) = args.spawn {
         if let Some(pid) = target_pid {
             if spawn::signal_received() {
@@ -419,7 +419,8 @@ fn main() {
                     }
                 }
                 if is_eval_cmd {
-                    print_eval_result(&session, if is_recomp { 15 } else { 5 });
+                    let timeout = if is_recomp { 15 } else { 5 };
+                    print_eval_result(&session, timeout);
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {

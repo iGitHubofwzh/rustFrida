@@ -560,7 +560,7 @@ static int apply_oat_inline_patch(
     } else if (g_stealth_mode == 1) {
         /* WxShadow 模式 — stealth1 严格: wxshadow 失败拒绝降级 mprotect */
         if (wxshadow_patch((void*)patch_addr, redirect, overwrite) != 0) {
-            hook_log("\033[31m[STEALTH] oat_patch wxshadow 失败 %#lx，拒绝降级 mprotect（hunter 防检测）\033[0m",
+            hook_log("\033[31m[STEALTH] oat_patch wxshadow 失败 %#lx，拒绝降级 mprotect\033[0m",
                      (unsigned long)patch_addr);
             return -1;
         }
