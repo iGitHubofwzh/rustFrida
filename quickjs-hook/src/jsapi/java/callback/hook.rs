@@ -52,7 +52,23 @@ unsafe fn marshal_jni_arg_to_js(
             if obj.is_null() {
                 return ffi::qjs_null();
             }
-            marshal_borrowed_java_object_to_js(ctx, env, obj, Some(sig))
+            // 快速路径: 签名是 String 时直接读 UTF，避免 get_runtime_class_name
+            if sig == "Ljava/lang/String;" {
+                let get_str: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
+                let rel_str: ReleaseStringUtfCharsFn = jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
+                let chars = get_str(env, obj, std::ptr::null_mut());
+                if !chars.is_null() {
+                    let s = std::ffi::CStr::from_ptr(chars).to_string_lossy().to_string();
+                    rel_str(env, obj, chars);
+                    return JSValue::string(ctx, &s).raw();
+                }
+                jni_check_exc(env);
+                return ffi::qjs_null();
+            }
+            // 轻量路径: 用签名类名直接构造 {__jptr, __jclass} wrapper
+            // 跳过 get_runtime_class_name (省 2-3 次 JNI/参数)
+            let class_name = jni_object_sig_to_class_name(sig);
+            wrap_java_object_value(ctx, raw, &class_name)
         }
         _ => ffi::JS_NewBigUint64(ctx, raw),
     }
