@@ -647,9 +647,11 @@ pub fn register_java_api(ctx: &JSContext) {
             4,
         );
         add_cfunction_to_object(ctx_ptr, java_obj, "_newObject", js_java_new_object, 2);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_getFieldAuto", js_java_get_field_auto, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_setFieldAuto", js_java_set_field_auto, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "getField", js_java_get_field, 4);
+        // Frida-style FieldWrapper 后端（无 FIELD_CACHE 锁）
+        add_cfunction_to_object(ctx_ptr, java_obj, "_fieldMeta", js_java_field_meta, 3);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_readField", js_java_read_field, 5);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_writeField", js_java_write_field, 6);
 
         // 检测面测试 API
         add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);

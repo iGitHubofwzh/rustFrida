@@ -1,5 +1,5 @@
 // Java.use() API — Frida-compatible syntax for Java method hooking
-// Evaluated at engine init after C-level Java.hook/unhook/_methods/_getFieldAuto are registered.
+// Evaluated at engine init after C-level Java.hook/unhook/_methods/_fieldMeta/_readField/_writeField are registered.
 (function() {
     "use strict";
     var _hook = Java.hook;
@@ -7,7 +7,9 @@
     var _methods = Java._methods;
     var _invokeStaticMethod = Java._invokeStaticMethod;
     var _newObject = Java._newObject;
-    var _getFieldAuto = Java._getFieldAuto;
+    var _fieldMeta = Java._fieldMeta;
+    var _readField = Java._readField;
+    var _writeField = Java._writeField;
     var _classLoaders = Java._classLoaders;
     var _findClassWithLoader = Java._findClassWithLoader;
     var _setClassLoader = Java._setClassLoader;
@@ -16,7 +18,9 @@
     delete Java._methods;
     delete Java._invokeStaticMethod;
     delete Java._newObject;
-    delete Java._getFieldAuto;
+    delete Java._fieldMeta;
+    delete Java._readField;
+    delete Java._writeField;
     delete Java._classLoaders;
     delete Java._findClassWithLoader;
     delete Java._setClassLoader;
@@ -221,19 +225,113 @@
         };
     }
 
-    // Wrap a raw Java object pointer as a Proxy for field access via dot notation,
-    // and direct instance method invocation via obj.method(...)
-    // - 字段访问:   obj.fieldName
+    // ========================================================================
+    // Frida-style FieldWrapper: obj.field 返回 FieldWrapper，通过 .value 读写
+    //   obj.field.value        — 读（每次 JNI GetField，无 FIELD_CACHE 锁）
+    //   obj.field.value = x    — 写（每次 JNI SetField，无 FIELD_CACHE 锁）
+    // ========================================================================
+
+    // 每个类的字段元数据缓存: cls → { prop → meta{id,sig,st,cls} | null }
+    // null 表示已探测过但不是字段（即方法），避免重复 C 调用
+    var _classFieldMeta = {};
+
+    function _resolveFieldMeta(cls, prop, objPtr) {
+        var cache = _classFieldMeta[cls];
+        if (!cache) {
+            cache = {};
+            _classFieldMeta[cls] = cache;
+        }
+        if (prop in cache) return cache[prop];
+        // 一次性 C 调用：解析 field_id/sig/isStatic，带 runtime class fallback
+        var meta = _fieldMeta(cls, prop, objPtr);
+        cache[prop] = (meta !== undefined) ? meta : null;
+        return cache[prop];
+    }
+
+    function FieldWrapper(target, meta) {
+        this._t = target;  // Proxy 的 backing {__jptr, __jclass}
+        this._m = meta;     // {id: BigUint64, sig: string, st: boolean, cls: string}
+    }
+
+    Object.defineProperty(FieldWrapper.prototype, "value", {
+        get: function() {
+            var m = this._m;
+            return _wrapJavaReturn(
+                _readField(this._t.__jptr, m.id, m.sig, m.st, m.cls)
+            );
+        },
+        set: function(v) {
+            var m = this._m;
+            _writeField(this._t.__jptr, m.id, m.sig, m.st, m.cls, v);
+        },
+        enumerable: true,
+        configurable: true
+    });
+
+    FieldWrapper.prototype.toString = function() {
+        try {
+            var v = this.value;
+            return String(v);
+        } catch(e) {
+            return "[FieldWrapper]";
+        }
+    };
+
+    // ========================================================================
+    // 方法名缓存 + hybrid wrapper（处理字段/方法同名冲突）
+    // Java 允许同名字段和方法共存，JS 只有一个属性槽。
+    // 同名时返回 hybrid：可调用（方法） + .value（字段）
+    // ========================================================================
+
+    var _classMethodNames = {};
+    function _hasMethod(cls, name) {
+        var set = _classMethodNames[cls];
+        if (!set) {
+            set = {};
+            var ms = _methods(cls);
+            for (var i = 0; i < ms.length; i++) set[ms[i].name] = true;
+            _classMethodNames[cls] = set;
+        }
+        return !!set[name];
+    }
+
+    // 给函数对象挂 .value getter/setter（字段读写）
+    function _decorateWithFieldValue(fn, target, meta) {
+        Object.defineProperty(fn, "value", {
+            get: function() {
+                return _wrapJavaReturn(
+                    _readField(target.__jptr, meta.id, meta.sig, meta.st, meta.cls)
+                );
+            },
+            set: function(v) {
+                _writeField(target.__jptr, meta.id, meta.sig, meta.st, meta.cls, v);
+            },
+            enumerable: true,
+            configurable: true
+        });
+        return fn;
+    }
+
+    // Wrap a raw Java object pointer as a Proxy (Frida-compatible)
+    // - 字段访问:   obj.fieldName          → FieldWrapper
+    //              obj.fieldName.value     → 读取真实 JVM 值
+    //              obj.fieldName.value = x → 写入 JVM 字段
+    // - 同名冲突:   obj.name(args)         → 调用方法
+    //              obj.name.value          → 读写字段
     // - 方法调用:
     //     1) 显式签名: obj.method("(Ljava/lang/String;)V", "arg")
-    //     2) Frida 风格自动匹配: obj.method("arg") （根据实参类型选择 overload）
+    //     2) 自动匹配: obj.method("arg")
     // - 快捷调用:   obj.$call("methodName", "(sig)", ...args)
     function _wrapJavaObj(ptr, cls) {
         var target = {__jptr: ptr, __jclass: cls};
+        var fieldWrappers = {};  // per-instance FieldWrapper 缓存
+
         var handler = {
             get: function(target, prop) {
                 if (prop === "__jptr") return target.__jptr;
                 if (prop === "__jclass") return target.__jclass;
+                // Rust 内部属性穿透（__origJobject 用于 hook 返回值 round-trip）
+                if (prop === "__origJobject") return target.__origJobject;
                 if (prop === Symbol.toPrimitive) return function(hint) {
                     if (hint === "string" || hint === "default") {
                         try {
@@ -255,8 +353,6 @@
                 };
                 if (prop === "$className") return target.__jclass;
                 if (prop === "$call") {
-                    // Instance method invocation:
-                    //   obj.$call("methodName", "(I)V", arg1, arg2, ...)
                     return function(name, sig) {
                         if (typeof name !== "string" || typeof sig !== "string") {
                             throw new Error("obj.$call(name, sig, ...args) requires (string, string, ...)");
@@ -270,26 +366,27 @@
                         );
                     };
                 }
-                var jptr = target.__jptr;
-                var jcls = target.__jclass;
-                var result;
-                try {
-                    result = _getFieldAuto(jptr, jcls, prop);
-                } catch(e) {
-                    console.log("[_wrapJavaObj] _getFieldAuto ERROR: " + e
-                        + " ptr=" + jptr + " cls=" + jcls
-                        + " prop=" + prop);
-                    return undefined;
-                }
-                // 如果字段存在（包括 null），按字段语义处理
-                if (result !== undefined) {
-                    return _wrapJavaReturn(result);
+
+                // 已缓存 — 直接返回（FieldWrapper 或 hybrid 函数）
+                if (fieldWrappers[prop]) return fieldWrappers[prop];
+
+                // 解析字段元数据（per-class 缓存，首次走 C，后续纯 JS 查找）
+                var meta = _resolveFieldMeta(target.__jclass, prop, target.__jptr);
+                if (meta) {
+                    var fw;
+                    if (_hasMethod(target.__jclass, prop)) {
+                        // 同名冲突：hybrid（可调用 + .value）
+                        fw = _decorateWithFieldValue(
+                            _makeInstanceMethodInvoker(target, prop), target, meta
+                        );
+                    } else {
+                        fw = new FieldWrapper(target, meta);
+                    }
+                    fieldWrappers[prop] = fw;
+                    return fw;
                 }
 
-                // 没有同名字段：按方法处理，返回一个调用该方法的函数。
-                // 用法示例:
-                //   显式签名: obj.method("(I)V", 123)
-                //   自动匹配: obj.method("abc", 123)
+                // 不是字段 → 方法
                 return _makeInstanceMethodInvoker(target, prop);
             }
         };
@@ -523,6 +620,9 @@
     Java.use = function(cls) {
         var cache = {};
         var wrappers = {};
+        var staticFieldWrappers = {};
+        // 静态字段用虚拟 target（_readField/isStatic=true 时 objPtr 被忽略）
+        var staticTarget = {__jptr: 0, __jclass: cls};
         return new Proxy({}, {
             get: function(_, prop) {
                 if (typeof prop !== "string") return undefined;
@@ -540,6 +640,24 @@
                     }
                     return cache._new;
                 }
+                // 静态字段检查（per-class 缓存，仅首次走 C 调用）
+                if (staticFieldWrappers[prop]) return staticFieldWrappers[prop];
+                var meta = _resolveFieldMeta(cls, prop, 0);
+                if (meta && meta.st) {
+                    var fw;
+                    if (_hasMethod(cls, prop)) {
+                        // 同名冲突：方法可调用 + .value 读写静态字段
+                        if (!wrappers[prop]) {
+                            wrappers[prop] = _bindMethodWrapper(new MethodWrapper(cls, prop, null, cache));
+                        }
+                        fw = _decorateWithFieldValue(wrappers[prop], staticTarget, meta);
+                    } else {
+                        fw = new FieldWrapper(staticTarget, meta);
+                    }
+                    staticFieldWrappers[prop] = fw;
+                    return fw;
+                }
+                // 方法
                 if (!wrappers[prop]) {
                     wrappers[prop] = _bindMethodWrapper(new MethodWrapper(cls, prop, null, cache));
                 }

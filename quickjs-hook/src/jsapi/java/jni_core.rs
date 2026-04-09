@@ -625,6 +625,17 @@ pub(super) const JNI_GET_STATIC_LONG_FIELD: usize = 151;
 pub(super) const JNI_GET_STATIC_FLOAT_FIELD: usize = 152;
 pub(super) const JNI_GET_STATIC_DOUBLE_FIELD: usize = 153;
 
+// Static field write
+pub(super) const JNI_SET_STATIC_OBJECT_FIELD: usize = 154;
+pub(super) const JNI_SET_STATIC_BOOLEAN_FIELD: usize = 155;
+pub(super) const JNI_SET_STATIC_BYTE_FIELD: usize = 156;
+pub(super) const JNI_SET_STATIC_CHAR_FIELD: usize = 157;
+pub(super) const JNI_SET_STATIC_SHORT_FIELD: usize = 158;
+pub(super) const JNI_SET_STATIC_INT_FIELD: usize = 159;
+pub(super) const JNI_SET_STATIC_LONG_FIELD: usize = 160;
+pub(super) const JNI_SET_STATIC_FLOAT_FIELD: usize = 161;
+pub(super) const JNI_SET_STATIC_DOUBLE_FIELD: usize = 162;
+
 // Instance field write
 pub(super) const JNI_SET_OBJECT_FIELD: usize = 104;
 pub(super) const JNI_SET_BOOLEAN_FIELD: usize = 105;

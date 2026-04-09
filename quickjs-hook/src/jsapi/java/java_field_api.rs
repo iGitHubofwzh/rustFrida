@@ -1,4 +1,6 @@
-//! JS API: Java.getField / Java._getFieldAuto + shared field-value reader
+//! JS API: Java field access
+//!   - Java.getField(objPtr, cls, name, sig) — 显式低层 API
+//!   - Java._fieldMeta / _readField / _writeField — Frida-style FieldWrapper 后端（无 FIELD_CACHE 锁）
 
 use crate::ffi;
 use crate::value::JSValue;
@@ -10,7 +12,7 @@ use super::jni_core::*;
 use super::reflect::*;
 
 // ============================================================================
-// Shared field-value reader (used by getField and _getFieldAuto)
+// Shared field-value reader (used by getField and _readField)
 // ============================================================================
 
 pub(super) enum ObjectFieldMode {
@@ -318,12 +320,7 @@ pub(super) unsafe extern "C" fn js_java_get_field(
 }
 
 // ============================================================================
-// JS API: Java._getFieldAuto(objPtr, className, fieldName)
-//   Auto-detects field type via JNI reflection, returns value directly.
-//   Returns undefined for missing fields (Proxy-friendly).
-//   Lazy caching: if className not in FIELD_CACHE, enumerate on the fly.
-//   Runtime class fallback: if field not found in declared type, use
-//   GetObjectClass to detect the actual runtime type and retry.
+// FIELD_CACHE 查找 + runtime class 探测（_fieldMeta / _readField / _writeField 共用）
 // ============================================================================
 
 /// Try to look up a field in FIELD_CACHE for the given class.
@@ -391,140 +388,131 @@ unsafe fn get_runtime_class_name(env: JniEnv, obj: *mut std::ffi::c_void) -> Opt
     Some(name)
 }
 
-/// Read an instance field given resolved cache info.
-unsafe fn read_instance_field(
+/// 写入字段值的核心分发（实例字段和静态字段共用）
+unsafe fn write_field_value_dispatch(
     ctx: *mut ffi::JSContext,
     env: JniEnv,
-    obj_ptr: u64,
-    jni_sig: &str,
+    target: *mut std::ffi::c_void,
     field_id: *mut std::ffi::c_void,
-    type_name: &str,
-) -> ffi::JSValue {
-    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
-    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-
-    let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
-    if local_obj.is_null() {
-        return ffi::qjs_undefined();
-    }
-
-    let mode = ObjectFieldMode::WrappedProxy {
-        type_name: type_name.to_string(),
-    };
-    let result = read_field_value(ctx, env, local_obj, field_id, jni_sig, false, mode);
-    jni_check_exc(env);
-    delete_local_ref(env, local_obj);
-    result
-}
-
-pub(super) unsafe extern "C" fn js_java_get_field_auto(
-    ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    argc: i32,
-    argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    use crate::jsapi::ptr::get_native_pointer_addr;
-
-    if argc < 3 {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"_getFieldAuto() requires 3 arguments: objPtr, className, fieldName\0".as_ptr() as *const _,
-        );
-    }
-
-    let obj_arg = JSValue(*argv);
-    let _class_arg = JSValue(*argv.add(1));
-    let field_arg = JSValue(*argv.add(2));
-
-    let field_name = match field_arg.to_string(ctx) {
-        Some(s) => s,
-        None => return ffi::qjs_undefined(),
-    };
-
-    let class_name = match _class_arg.to_string(ctx) {
-        Some(s) => s,
-        None => return ffi::qjs_undefined(),
-    };
-
-    // Extract objPtr
-    let obj_ptr = if let Some(addr) = get_native_pointer_addr(ctx, obj_arg) {
-        addr
-    } else if let Some(addr) = obj_arg.to_u64(ctx) {
-        addr
-    } else {
-        return ffi::qjs_undefined();
-    };
-
-    if obj_ptr == 0 {
-        return ffi::qjs_null();
-    }
-
-    // Get thread-safe JNIEnv*
-    let env = match get_thread_env() {
-        Ok(e) => e,
-        Err(_) => return ffi::qjs_undefined(),
-    };
-
-    // Step 1: Lazy cache — if class not yet in FIELD_CACHE, enumerate now
-    if !is_class_cached(&class_name) {
-        cache_fields_for_class(env, &class_name);
-    }
-
-    // Step 2: Try to look up the field in the declared class
-    if let Some((jni_sig, field_id, is_static, type_name)) = lookup_field_in_cache(&class_name, &field_name) {
-        let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-        if is_static {
-            let cls = find_class_safe(env, &class_name);
-            if cls.is_null() {
-                return ffi::qjs_undefined();
-            }
-            let mode = ObjectFieldMode::WrappedProxy { type_name };
-            let result = read_field_value(ctx, env, cls, field_id, &jni_sig, true, mode);
-            jni_check_exc(env);
-            delete_local_ref(env, cls);
-            return result;
-        } else {
-            return read_instance_field(ctx, env, obj_ptr, &jni_sig, field_id, &type_name);
-        }
-    }
-
-    // Step 3: Field not found in declared type — try runtime class via GetObjectClass
-    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
-    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-
-    let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
-    if local_obj.is_null() {
-        return ffi::qjs_undefined();
-    }
-
-    let runtime_class = get_runtime_class_name(env, local_obj);
-    delete_local_ref(env, local_obj);
-
-    if let Some(ref rt_cls) = runtime_class {
-        if rt_cls != &class_name {
-            // Lazy cache the runtime class too
-            if !is_class_cached(rt_cls) {
-                cache_fields_for_class(env, rt_cls);
-            }
-            if let Some((jni_sig, field_id, is_static, type_name)) = lookup_field_in_cache(rt_cls, &field_name) {
-                if is_static {
-                    let cls = find_class_safe(env, rt_cls);
-                    if cls.is_null() {
-                        return ffi::qjs_undefined();
-                    }
-                    let mode = ObjectFieldMode::WrappedProxy { type_name };
-                    let result = read_field_value(ctx, env, cls, field_id, &jni_sig, true, mode);
-                    jni_check_exc(env);
-                    delete_local_ref(env, cls);
-                    return result;
-                } else {
-                    return read_instance_field(ctx, env, obj_ptr, &jni_sig, field_id, &type_name);
-                }
+    jni_sig: &str,
+    is_static: bool,
+    value: JSValue,
+) {
+    match jni_sig.as_bytes().first().copied() {
+        Some(b'Z') => {
+            let v = if value.is_bool() { value.to_bool().unwrap_or(false) as u8 }
+                    else { value.to_i64(ctx).map(|n| (n != 0) as u8).unwrap_or(0) };
+            if is_static {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u8);
+                let f: F = jni_fn!(env, F, JNI_SET_STATIC_BOOLEAN_FIELD);
+                f(env, target, field_id, v);
+            } else {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u8);
+                let f: F = jni_fn!(env, F, JNI_SET_BOOLEAN_FIELD);
+                f(env, target, field_id, v);
             }
         }
+        Some(b'B') => {
+            let v = value.to_i64(ctx).unwrap_or(0) as i8;
+            if is_static {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i8);
+                let f: F = jni_fn!(env, F, JNI_SET_STATIC_BYTE_FIELD);
+                f(env, target, field_id, v);
+            } else {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i8);
+                let f: F = jni_fn!(env, F, JNI_SET_BYTE_FIELD);
+                f(env, target, field_id, v);
+            }
+        }
+        Some(b'C') => {
+            let v = if let Some(s) = value.to_string(ctx) {
+                s.chars().next().map(|c| c as u16).unwrap_or(0)
+            } else { value.to_i64(ctx).unwrap_or(0) as u16 };
+            if is_static {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u16);
+                let f: F = jni_fn!(env, F, JNI_SET_STATIC_CHAR_FIELD);
+                f(env, target, field_id, v);
+            } else {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u16);
+                let f: F = jni_fn!(env, F, JNI_SET_CHAR_FIELD);
+                f(env, target, field_id, v);
+            }
+        }
+        Some(b'S') => {
+            let v = value.to_i64(ctx).unwrap_or(0) as i16;
+            if is_static {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i16);
+                let f: F = jni_fn!(env, F, JNI_SET_STATIC_SHORT_FIELD);
+                f(env, target, field_id, v);
+            } else {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i16);
+                let f: F = jni_fn!(env, F, JNI_SET_SHORT_FIELD);
+                f(env, target, field_id, v);
+            }
+        }
+        Some(b'I') => {
+            let v = value.to_i64(ctx).unwrap_or(0) as i32;
+            if is_static {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i32);
+                let f: F = jni_fn!(env, F, JNI_SET_STATIC_INT_FIELD);
+                f(env, target, field_id, v);
+            } else {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i32);
+                let f: F = jni_fn!(env, F, JNI_SET_INT_FIELD);
+                f(env, target, field_id, v);
+            }
+        }
+        Some(b'J') => {
+            let v = value.to_i64(ctx).unwrap_or(0);
+            if is_static {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i64);
+                let f: F = jni_fn!(env, F, JNI_SET_STATIC_LONG_FIELD);
+                f(env, target, field_id, v);
+            } else {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i64);
+                let f: F = jni_fn!(env, F, JNI_SET_LONG_FIELD);
+                f(env, target, field_id, v);
+            }
+        }
+        Some(b'F') => {
+            let v = value.to_float().unwrap_or(0.0) as f32;
+            if is_static {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, f32);
+                let f: F = jni_fn!(env, F, JNI_SET_STATIC_FLOAT_FIELD);
+                f(env, target, field_id, v);
+            } else {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, f32);
+                let f: F = jni_fn!(env, F, JNI_SET_FLOAT_FIELD);
+                f(env, target, field_id, v);
+            }
+        }
+        Some(b'D') => {
+            let v = value.to_float().unwrap_or(0.0);
+            if is_static {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, f64);
+                let f: F = jni_fn!(env, F, JNI_SET_STATIC_DOUBLE_FIELD);
+                f(env, target, field_id, v);
+            } else {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, f64);
+                let f: F = jni_fn!(env, F, JNI_SET_DOUBLE_FIELD);
+                f(env, target, field_id, v);
+            }
+        }
+        Some(b'L') | Some(b'[') => {
+            use super::callback::marshal_js_to_jvalue;
+            let jval = marshal_js_to_jvalue(ctx, env, value, Some(jni_sig));
+            if is_static {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void);
+                let f: F = jni_fn!(env, F, JNI_SET_STATIC_OBJECT_FIELD);
+                f(env, target, field_id, jval as *mut std::ffi::c_void);
+            } else {
+                type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void);
+                let f: F = jni_fn!(env, F, JNI_SET_OBJECT_FIELD);
+                f(env, target, field_id, jval as *mut std::ffi::c_void);
+            }
+        }
+        _ => {}
     }
-
-    ffi::qjs_undefined()
 }
 
 /// 写入实例字段值
@@ -544,69 +532,146 @@ unsafe fn write_instance_field(
         return false;
     }
 
-    match jni_sig.as_bytes().first().copied() {
-        Some(b'Z') => {
-            type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u8);
-            let f: F = jni_fn!(env, F, JNI_SET_BOOLEAN_FIELD);
-            let v = if value.is_bool() { value.to_bool().unwrap_or(false) as u8 }
-                    else { value.to_i64(ctx).map(|n| (n != 0) as u8).unwrap_or(0) };
-            f(env, local_obj, field_id, v);
-        }
-        Some(b'B') => {
-            type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i8);
-            let f: F = jni_fn!(env, F, JNI_SET_BYTE_FIELD);
-            f(env, local_obj, field_id, value.to_i64(ctx).unwrap_or(0) as i8);
-        }
-        Some(b'C') => {
-            type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u16);
-            let f: F = jni_fn!(env, F, JNI_SET_CHAR_FIELD);
-            let v = if let Some(s) = value.to_string(ctx) {
-                s.chars().next().map(|c| c as u16).unwrap_or(0)
-            } else { value.to_i64(ctx).unwrap_or(0) as u16 };
-            f(env, local_obj, field_id, v);
-        }
-        Some(b'S') => {
-            type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i16);
-            let f: F = jni_fn!(env, F, JNI_SET_SHORT_FIELD);
-            f(env, local_obj, field_id, value.to_i64(ctx).unwrap_or(0) as i16);
-        }
-        Some(b'I') => {
-            type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i32);
-            let f: F = jni_fn!(env, F, JNI_SET_INT_FIELD);
-            f(env, local_obj, field_id, value.to_i64(ctx).unwrap_or(0) as i32);
-        }
-        Some(b'J') => {
-            type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, i64);
-            let f: F = jni_fn!(env, F, JNI_SET_LONG_FIELD);
-            f(env, local_obj, field_id, value.to_i64(ctx).unwrap_or(0));
-        }
-        Some(b'F') => {
-            type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, f32);
-            let f: F = jni_fn!(env, F, JNI_SET_FLOAT_FIELD);
-            f(env, local_obj, field_id, value.to_float().unwrap_or(0.0) as f32);
-        }
-        Some(b'D') => {
-            type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, f64);
-            let f: F = jni_fn!(env, F, JNI_SET_DOUBLE_FIELD);
-            f(env, local_obj, field_id, value.to_float().unwrap_or(0.0));
-        }
-        Some(b'L') | Some(b'[') => {
-            type F = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void);
-            let f: F = jni_fn!(env, F, JNI_SET_OBJECT_FIELD);
-            use super::callback::marshal_js_to_jvalue;
-            let jval = marshal_js_to_jvalue(ctx, env, value, Some(jni_sig));
-            f(env, local_obj, field_id, jval as *mut std::ffi::c_void);
-        }
-        _ => {}
-    }
+    write_field_value_dispatch(ctx, env, local_obj, field_id, jni_sig, false, value);
 
     let ok = !jni_check_exc(env);
     delete_local_ref(env, local_obj);
     ok
 }
 
-// JS API: Java._setFieldAuto(objPtr, className, fieldName, value)
-pub(super) unsafe extern "C" fn js_java_set_field_auto(
+/// 写入静态字段值
+unsafe fn write_static_field(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    class_name: &str,
+    jni_sig: &str,
+    field_id: *mut std::ffi::c_void,
+    value: JSValue,
+) -> bool {
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    let cls = find_class_safe(env, class_name);
+    if cls.is_null() {
+        return false;
+    }
+
+    write_field_value_dispatch(ctx, env, cls, field_id, jni_sig, true, value);
+
+    let ok = !jni_check_exc(env);
+    delete_local_ref(env, cls);
+    ok
+}
+
+// ============================================================================
+// Frida-style FieldWrapper 后端: _fieldMeta / _readField / _writeField
+// 前端 FieldWrapper 缓存 meta，后续读写跳过 FIELD_CACHE 锁
+// ============================================================================
+
+/// 从 JNI sig 提取 type_name（用于 WrappedProxy mode）
+fn type_name_from_sig(sig: &str) -> String {
+    match sig.as_bytes().first() {
+        Some(b'L') => {
+            let inner = &sig[1..sig.len().saturating_sub(1)];
+            inner.replace('/', ".")
+        }
+        Some(b'[') => sig.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 构造 {id: BigUint64(field_id), sig: string, st: boolean, cls: string}
+unsafe fn make_field_meta_obj(
+    ctx: *mut ffi::JSContext,
+    field_id: *mut std::ffi::c_void,
+    sig: &str,
+    is_static: bool,
+    class_name: &str,
+) -> ffi::JSValue {
+    let obj = ffi::JS_NewObject(ctx);
+    let obj_val = JSValue(obj);
+    obj_val.set_property(ctx, "id", JSValue(ffi::JS_NewBigUint64(ctx, field_id as u64)));
+    obj_val.set_property(ctx, "sig", JSValue::string(ctx, sig));
+    obj_val.set_property(ctx, "st", JSValue::bool(is_static));
+    obj_val.set_property(ctx, "cls", JSValue::string(ctx, class_name));
+    obj
+}
+
+// JS API: Java._fieldMeta(className, fieldName, [objPtr])
+// 返回 {id, sig, st, cls} 或 undefined（一次性解析，JS 侧缓存）
+pub(super) unsafe extern "C" fn js_java_field_meta(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return ffi::qjs_undefined();
+    }
+
+    let class_arg = JSValue(*argv);
+    let field_arg = JSValue(*argv.add(1));
+
+    let class_name = match class_arg.to_string(ctx) {
+        Some(s) => s,
+        None => return ffi::qjs_undefined(),
+    };
+    let field_name = match field_arg.to_string(ctx) {
+        Some(s) => s,
+        None => return ffi::qjs_undefined(),
+    };
+
+    let env = match get_thread_env() {
+        Ok(e) => e,
+        Err(_) => return ffi::qjs_undefined(),
+    };
+
+    // 确保声明类已缓存
+    if !is_class_cached(&class_name) {
+        cache_fields_for_class(env, &class_name);
+    }
+
+    // 查找声明类
+    if let Some((sig, field_id, is_static, _)) = lookup_field_in_cache(&class_name, &field_name) {
+        return make_field_meta_obj(ctx, field_id, &sig, is_static, &class_name);
+    }
+
+    // Runtime class fallback（需要 objPtr）
+    if argc >= 3 {
+        use crate::jsapi::ptr::get_native_pointer_addr;
+        let obj_arg = JSValue(*argv.add(2));
+        let obj_ptr = get_native_pointer_addr(ctx, obj_arg)
+            .or_else(|| obj_arg.to_u64(ctx))
+            .unwrap_or(0);
+
+        if obj_ptr != 0 {
+            let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+            let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+            let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
+            if !local_obj.is_null() {
+                if let Some(ref rt_cls) = get_runtime_class_name(env, local_obj) {
+                    if rt_cls != &class_name {
+                        if !is_class_cached(rt_cls) {
+                            cache_fields_for_class(env, rt_cls);
+                        }
+                        if let Some((sig, field_id, is_static, _)) =
+                            lookup_field_in_cache(rt_cls, &field_name)
+                        {
+                            delete_local_ref(env, local_obj);
+                            return make_field_meta_obj(ctx, field_id, &sig, is_static, rt_cls);
+                        }
+                    }
+                }
+                delete_local_ref(env, local_obj);
+            }
+        }
+    }
+
+    ffi::qjs_undefined()
+}
+
+// JS API: Java._readField(objPtr, fieldId, sig, isStatic, cls)
+// 直接用预解析的 field_id 读值，无 FIELD_CACHE 锁
+pub(super) unsafe extern "C" fn js_java_read_field(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
     argc: i32,
@@ -614,51 +679,115 @@ pub(super) unsafe extern "C" fn js_java_set_field_auto(
 ) -> ffi::JSValue {
     use crate::jsapi::ptr::get_native_pointer_addr;
 
-    if argc < 4 {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"_setFieldAuto() requires 4 arguments: objPtr, className, fieldName, value\0".as_ptr() as *const _,
-        );
+    if argc < 5 {
+        return ffi::qjs_undefined();
     }
 
     let obj_arg = JSValue(*argv);
-    let class_arg = JSValue(*argv.add(1));
-    let field_arg = JSValue(*argv.add(2));
-    let value_arg = JSValue(*argv.add(3));
+    let id_arg = JSValue(*argv.add(1));
+    let sig_arg = JSValue(*argv.add(2));
+    let static_arg = JSValue(*argv.add(3));
+    let cls_arg = JSValue(*argv.add(4));
 
-    let field_name = match field_arg.to_string(ctx) {
-        Some(s) => s,
-        None => return ffi::qjs_undefined(),
-    };
-    let class_name = match class_arg.to_string(ctx) {
-        Some(s) => s,
-        None => return ffi::qjs_undefined(),
-    };
-
-    let obj_ptr = if let Some(addr) = get_native_pointer_addr(ctx, obj_arg) {
-        addr
-    } else if let Some(addr) = obj_arg.to_u64(ctx) {
-        addr
-    } else {
-        return ffi::qjs_undefined();
-    };
-
-    if obj_ptr == 0 {
+    let field_id = id_arg.to_u64(ctx).unwrap_or(0) as *mut std::ffi::c_void;
+    if field_id.is_null() {
         return ffi::qjs_undefined();
     }
+    let sig = match sig_arg.to_string(ctx) {
+        Some(s) => s,
+        None => return ffi::qjs_undefined(),
+    };
+    let is_static = static_arg.to_bool().unwrap_or(false);
+    let cls_name = match cls_arg.to_string(ctx) {
+        Some(s) => s,
+        None => return ffi::qjs_undefined(),
+    };
 
     let env = match get_thread_env() {
         Ok(e) => e,
         Err(_) => return ffi::qjs_undefined(),
     };
 
-    if !is_class_cached(&class_name) {
-        cache_fields_for_class(env, &class_name);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    let type_name = type_name_from_sig(&sig);
+    let mode = ObjectFieldMode::WrappedProxy { type_name };
+
+    if is_static {
+        let cls = find_class_safe(env, &cls_name);
+        if cls.is_null() {
+            return ffi::qjs_undefined();
+        }
+        let result = read_field_value(ctx, env, cls, field_id, &sig, true, mode);
+        jni_check_exc(env);
+        delete_local_ref(env, cls);
+        result
+    } else {
+        let obj_ptr = get_native_pointer_addr(ctx, obj_arg)
+            .or_else(|| obj_arg.to_u64(ctx))
+            .unwrap_or(0);
+        if obj_ptr == 0 {
+            return ffi::qjs_undefined();
+        }
+        let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+        let local_obj = new_local_ref(env, obj_ptr as *mut std::ffi::c_void);
+        if local_obj.is_null() {
+            return ffi::qjs_undefined();
+        }
+        let result = read_field_value(ctx, env, local_obj, field_id, &sig, false, mode);
+        jni_check_exc(env);
+        delete_local_ref(env, local_obj);
+        result
+    }
+}
+
+// JS API: Java._writeField(objPtr, fieldId, sig, isStatic, cls, value)
+// 直接用预解析的 field_id 写值，无 FIELD_CACHE 锁
+pub(super) unsafe extern "C" fn js_java_write_field(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    use crate::jsapi::ptr::get_native_pointer_addr;
+
+    if argc < 6 {
+        return ffi::qjs_undefined();
     }
 
-    if let Some((jni_sig, field_id, is_static, _type_name)) = lookup_field_in_cache(&class_name, &field_name) {
-        if !is_static {
-            write_instance_field(ctx, env, obj_ptr, &jni_sig, field_id, value_arg);
+    let obj_arg = JSValue(*argv);
+    let id_arg = JSValue(*argv.add(1));
+    let sig_arg = JSValue(*argv.add(2));
+    let static_arg = JSValue(*argv.add(3));
+    let cls_arg = JSValue(*argv.add(4));
+    let value_arg = JSValue(*argv.add(5));
+
+    let field_id = id_arg.to_u64(ctx).unwrap_or(0) as *mut std::ffi::c_void;
+    if field_id.is_null() {
+        return ffi::qjs_undefined();
+    }
+    let sig = match sig_arg.to_string(ctx) {
+        Some(s) => s,
+        None => return ffi::qjs_undefined(),
+    };
+    let is_static = static_arg.to_bool().unwrap_or(false);
+    let cls_name = match cls_arg.to_string(ctx) {
+        Some(s) => s,
+        None => return ffi::qjs_undefined(),
+    };
+
+    let env = match get_thread_env() {
+        Ok(e) => e,
+        Err(_) => return ffi::qjs_undefined(),
+    };
+
+    if is_static {
+        write_static_field(ctx, env, &cls_name, &sig, field_id, value_arg);
+    } else {
+        let obj_ptr = get_native_pointer_addr(ctx, obj_arg)
+            .or_else(|| obj_arg.to_u64(ctx))
+            .unwrap_or(0);
+        if obj_ptr != 0 {
+            write_instance_field(ctx, env, obj_ptr, &sig, field_id, value_arg);
         }
     }
 
