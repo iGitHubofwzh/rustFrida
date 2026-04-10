@@ -807,14 +807,17 @@ pub(super) unsafe extern "C" fn js_java_new_object(
         );
     }
 
-    // $new: 跳过容器转换，String/boxed primitives 自动 unbox
-    set_skip_container_conversion(true);
+    // $new 语义：**总是**返回 Java wrapper，不做 String/boxed primitive/容器
+    // 的自动 JS 类型转换。例如 `Java.use("java.lang.String").$new("hi")` 返回
+    // 可继续调用 `.length()` 的 wrapper，而不是 JS string "hi"；
+    // `Java.use("java.lang.Integer").$new(42)` 返回 Integer wrapper 而不是 42。
+    set_return_raw_wrapper(true);
     let class_sig = format!("L{};", class_name.replace('.', "/"));
     let result = match wrap_invoke_return_object(ctx, env, obj, &class_sig) {
         Ok(value) => value,
         Err(_) => ffi::qjs_null(),
     };
-    set_skip_container_conversion(false);
+    set_return_raw_wrapper(false);
 
     cleanup_local_refs(env, std::ptr::null_mut(), cls);
     result

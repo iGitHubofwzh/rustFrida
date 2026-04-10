@@ -9,13 +9,19 @@
 //   2. If file not readable (ONLINE mode) → use base_address as data pointer
 // ============================================================================
 
-/// Batch lookup symbols from an ELF module's .symtab.
+/// Batch lookup symbols from an ELF module's `.symtab` or `.dynsym`.
 ///
 /// Strategy (Frida-style, gum_elf_module):
-/// 1. Try read file from disk → parse .symtab in one pass
+/// 1. Try read file from disk → parse `.symtab`/`.dynsym` in one pass
 /// 2. If file not accessible → read from in-memory ELF mapping at base_address
 ///
-/// Returns HashMap of found symbols: name -> runtime_address (load_bias applied).
+/// **IFUNC handling**: on Android ARM64, libc exports many symbols
+/// (`strlen`, `memcpy`, `strcmp`, ...) as `STT_GNU_IFUNC`. The `.symtab`
+/// address is the *resolver*, not the real implementation. We detect
+/// IFUNC entries and call the resolver with the bionic (hwcap, &arg)
+/// convention so the returned address matches `dlsym()`.
+///
+/// Returns HashMap of found symbols: name -> resolved runtime address.
 unsafe fn elf_module_find_symbols(
     file_path: &str,
     base_address: u64,
@@ -27,26 +33,92 @@ unsafe fn elf_module_find_symbols(
 
     let wanted_set: HashSet<&str> = wanted.iter().copied().collect();
     let mut result = HashMap::new();
+    let mut ifunc_names: HashSet<String> = HashSet::new();
 
     // Compute load_bias from in-memory program headers
     let load_bias = elf_compute_load_bias(base_address);
 
-    // Strategy 1: read file from disk (one read, one pass)
-    if let Ok(data) = std::fs::read(file_path) {
-        elf_find_symbols_in_data(&data, &wanted_set, load_bias, &mut result);
-        if !result.is_empty() {
-            return result;
-        }
+    // Strategy 1: read file from disk (one read, one pass).
+    // If the file read succeeds we trust the result — an empty map just means
+    // the symbol isn't exported by this module. Falling through to the memory
+    // strategy only makes sense when the disk path is unreadable.
+    let file_read_ok = if let Ok(data) = std::fs::read(file_path) {
+        elf_find_symbols_in_data(&data, &wanted_set, load_bias, &mut result, &mut ifunc_names);
+        true
+    } else {
+        false
+    };
+
+    if !file_read_ok {
+        // Strategy 2: read from in-memory ELF at base_address (Frida fallback).
+        // Section headers usually are not in any PT_LOAD for stripped libs, so
+        // this rarely succeeds — keep the diagnostic in verbose mode only.
+        crate::jsapi::console::output_verbose(&format!(
+            "[module] file read failed for {}, trying memory at {:#x}",
+            file_path, base_address
+        ));
+        elf_find_symbols_in_memory(
+            base_address,
+            &wanted_set,
+            load_bias,
+            &mut result,
+            &mut ifunc_names,
+        );
     }
 
-    // Strategy 2: read from in-memory ELF at base_address (Frida fallback)
-    output_message(&format!(
-        "[module] file read failed for {}, trying memory at {:#x}",
-        file_path, base_address
-    ));
-    elf_find_symbols_in_memory(base_address, &wanted_set, load_bias, &mut result);
-
+    resolve_ifunc_entries(&ifunc_names, &mut result);
     result
+}
+
+/// Call IFUNC resolvers to replace resolver addresses with real implementation
+/// addresses.
+///
+/// Bionic's ARM64 IFUNC ABI (linker/linker_relocate.cpp):
+///   ```c
+///   typedef ElfW(Addr) (*resolver_t)(uint64_t, __ifunc_arg_t*);
+///   static __ifunc_arg_t arg = {
+///       ._size   = sizeof(__ifunc_arg_t),
+///       ._hwcap  = getauxval(AT_HWCAP),
+///       ._hwcap2 = getauxval(AT_HWCAP2),
+///   };
+///   resolver(arg._hwcap | _IFUNC_ARG_HWCAP, &arg);
+///   ```
+/// where `_IFUNC_ARG_HWCAP == 1ULL << 62`.
+unsafe fn resolve_ifunc_entries(ifunc_names: &HashSet<String>, result: &mut HashMap<String, u64>) {
+    if ifunc_names.is_empty() {
+        return;
+    }
+
+    #[repr(C)]
+    struct IfuncArg {
+        size: u64,
+        hwcap: u64,
+        hwcap2: u64,
+    }
+
+    const IFUNC_ARG_HWCAP: u64 = 1 << 62;
+
+    let arg = IfuncArg {
+        size: std::mem::size_of::<IfuncArg>() as u64,
+        hwcap: libc::getauxval(libc::AT_HWCAP),
+        hwcap2: libc::getauxval(libc::AT_HWCAP2),
+    };
+    let hwcap_arg = arg.hwcap | IFUNC_ARG_HWCAP;
+
+    for name in ifunc_names {
+        let Some(resolver_addr) = result.get(name).copied() else {
+            continue;
+        };
+        if resolver_addr == 0 {
+            continue;
+        }
+        type IfuncResolver = unsafe extern "C" fn(u64, *const IfuncArg) -> u64;
+        let resolver: IfuncResolver = std::mem::transmute(resolver_addr);
+        let resolved = resolver(hwcap_arg, &arg);
+        if resolved != 0 {
+            result.insert(name.clone(), resolved);
+        }
+    }
 }
 
 /// Compute load_bias from in-memory ELF at base_address.
@@ -69,12 +141,15 @@ unsafe fn elf_compute_load_bias(base_address: u64) -> u64 {
     base_address
 }
 
-/// Find symbols in .symtab from file data (byte slice). One pass.
+/// Find symbols in .symtab/.dynsym from file data (byte slice). One pass.
+/// Symbols whose type is `STT_GNU_IFUNC` have their names recorded in
+/// `ifunc_names` so the caller can resolve them after parsing.
 fn elf_find_symbols_in_data(
     data: &[u8],
     wanted: &HashSet<&str>,
     load_bias: u64,
     result: &mut HashMap<String, u64>,
+    ifunc_names: &mut HashSet<String>,
 ) {
     if data.len() < std::mem::size_of::<Elf64Ehdr>() {
         return;
@@ -94,17 +169,19 @@ fn elf_find_symbols_in_data(
             return;
         }
 
-        // Find SHT_SYMTAB
+        // Find SHT_SYMTAB first (more complete), fall back to SHT_DYNSYM for stripped libs.
         let mut symtab_shdr: Option<&Elf64Shdr> = None;
+        let mut dynsym_shdr: Option<&Elf64Shdr> = None;
         for i in 0..shnum {
             let shdr = &*(data.as_ptr().add(shdr_off + i * shdr_size) as *const Elf64Shdr);
-            if shdr.sh_type == SHT_SYMTAB {
-                symtab_shdr = Some(shdr);
-                break;
+            match shdr.sh_type {
+                SHT_SYMTAB if symtab_shdr.is_none() => symtab_shdr = Some(shdr),
+                SHT_DYNSYM if dynsym_shdr.is_none() => dynsym_shdr = Some(shdr),
+                _ => {}
             }
         }
 
-        let symtab = match symtab_shdr {
+        let symtab = match symtab_shdr.or(dynsym_shdr) {
             Some(s) => s,
             None => return,
         };
@@ -164,6 +241,9 @@ fn elf_find_symbols_in_data(
             if let Ok(name) = std::str::from_utf8(&name_slice[..name_len]) {
                 if wanted.contains(name) && !result.contains_key(name) {
                     result.insert(name.to_string(), load_bias + sym.st_value);
+                    if sym.st_type() == STT_GNU_IFUNC {
+                        ifunc_names.insert(name.to_string());
+                    }
                     remaining -= 1;
                 }
             }
@@ -171,7 +251,7 @@ fn elf_find_symbols_in_data(
     }
 }
 
-/// Find symbols in .symtab from in-memory ELF at base_address.
+/// Find symbols in .symtab/.dynsym from in-memory ELF at base_address.
 ///
 /// Fallback when file is not readable on disk.
 /// Uses mincore(2) to check page accessibility before each read.
@@ -183,6 +263,7 @@ unsafe fn elf_find_symbols_in_memory(
     wanted: &HashSet<&str>,
     load_bias: u64,
     result: &mut HashMap<String, u64>,
+    ifunc_names: &mut HashSet<String>,
 ) {
     if base_address == 0 {
         return;
@@ -204,29 +285,34 @@ unsafe fn elf_find_symbols_in_memory(
 
     // Check section headers accessible
     if !is_addr_accessible(shdr_addr, shnum * shdr_size) {
-        output_message("[module] section headers not accessible in memory");
+        crate::jsapi::console::output_verbose("[module] section headers not accessible in memory");
         return;
     }
 
-    // Find SHT_SYMTAB
+    // Find SHT_SYMTAB first (more complete), fall back to SHT_DYNSYM for stripped libs.
     let mut symtab_shdr: Option<Elf64ShdrCopy> = None;
+    let mut dynsym_shdr: Option<Elf64ShdrCopy> = None;
     for i in 0..shnum {
         let shdr = &*((shdr_addr as usize + i * shdr_size) as *const Elf64Shdr);
-        if shdr.sh_type == SHT_SYMTAB {
-            symtab_shdr = Some(Elf64ShdrCopy {
-                sh_offset: shdr.sh_offset,
-                sh_size: shdr.sh_size,
-                sh_link: shdr.sh_link,
-                sh_entsize: shdr.sh_entsize,
-            });
-            break;
+        let copy = Elf64ShdrCopy {
+            sh_offset: shdr.sh_offset,
+            sh_size: shdr.sh_size,
+            sh_link: shdr.sh_link,
+            sh_entsize: shdr.sh_entsize,
+        };
+        match shdr.sh_type {
+            SHT_SYMTAB if symtab_shdr.is_none() => symtab_shdr = Some(copy),
+            SHT_DYNSYM if dynsym_shdr.is_none() => dynsym_shdr = Some(copy),
+            _ => {}
         }
     }
 
-    let symtab = match symtab_shdr {
+    let symtab = match symtab_shdr.or(dynsym_shdr) {
         Some(s) => s,
         None => {
-            output_message("[module] .symtab not found in memory ELF");
+            crate::jsapi::console::output_verbose(
+                "[module] .symtab/.dynsym not found in memory ELF",
+            );
             return;
         }
     };
@@ -253,15 +339,15 @@ unsafe fn elf_find_symbols_in_memory(
     let strtab_size = strtab_shdr.sh_size as usize;
 
     if !is_addr_accessible(symtab_data_addr, nsyms * sym_size) {
-        output_message("[module] .symtab data not accessible in memory");
+        crate::jsapi::console::output_verbose("[module] .symtab data not accessible in memory");
         return;
     }
     if !is_addr_accessible(strtab_data_addr, strtab_size) {
-        output_message("[module] .strtab data not accessible in memory");
+        crate::jsapi::console::output_verbose("[module] .strtab data not accessible in memory");
         return;
     }
 
-    output_message(&format!(
+    crate::jsapi::console::output_verbose(&format!(
         "[module] reading .symtab from memory: {} symbols",
         nsyms
     ));
@@ -294,6 +380,9 @@ unsafe fn elf_find_symbols_in_memory(
         if let Ok(name) = std::str::from_utf8(&name_slice[..name_len]) {
             if wanted.contains(name) && !result.contains_key(name) {
                 result.insert(name.to_string(), load_bias + sym.st_value);
+                if sym.st_type() == STT_GNU_IFUNC {
+                    ifunc_names.insert(name.to_string());
+                }
                 remaining -= 1;
             }
         }

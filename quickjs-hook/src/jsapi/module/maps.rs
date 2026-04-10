@@ -31,6 +31,31 @@ pub(crate) fn probe_module_range(module_name: &str) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
+/// Find a loaded module's file path and base address by name.
+/// Returns `None` if not found. Used by `module_dlsym` for direct ELF parsing.
+fn find_module_path_and_base(module_name: &str) -> Option<(String, u64)> {
+    {
+        let guard = module_cache()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(info) = guard
+            .snapshot
+            .modules
+            .iter()
+            .find(|m| matches_module_lookup_name(&m.path, module_name))
+        {
+            return Some((info.path.clone(), info.base));
+        }
+    }
+
+    let snapshot = refresh_module_snapshot_cache();
+    snapshot
+        .modules
+        .iter()
+        .find(|m| matches_module_lookup_name(&m.path, module_name))
+        .map(|info| (info.path.clone(), info.base))
+}
+
 /// Parse /proc/self/maps to find a module's base address.
 fn find_module_base(module_name: &str) -> u64 {
     {

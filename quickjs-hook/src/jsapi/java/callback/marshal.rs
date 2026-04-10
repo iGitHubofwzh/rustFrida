@@ -6,10 +6,19 @@
 /// 用户直接调方法时设为 true，hook callback 上下文默认 false。
 std::thread_local! {
     static SKIP_CONTAINER_CONVERSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 控制 marshal 是否强制返回 Java 对象 wrapper。为 true 时不做任何自动
+    /// 类型转换（String 不转 JS string、Integer/Long/... 不 unbox、容器不转
+    /// Array），用户拿到的一定是可以继续链式调用 Java 方法的 wrapper。
+    /// 目前只在 `Java.use(...).$new(...)` 中打开。
+    static RETURN_RAW_WRAPPER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(super) fn set_skip_container_conversion(skip: bool) {
     SKIP_CONTAINER_CONVERSION.with(|c| c.set(skip));
+}
+
+pub(super) fn set_return_raw_wrapper(skip: bool) {
+    RETURN_RAW_WRAPPER.with(|c| c.set(skip));
 }
 
 /// 判断 JNI 类型签名是否表示浮点类型 (float/double)
@@ -256,6 +265,15 @@ unsafe fn marshal_java_object_to_js_inner(
             .map(jni_object_sig_to_class_name)
             .unwrap_or_else(|| "java.lang.Object".to_string())
     });
+
+    // `$new` 强制返回 wrapper：跳过 String/Boxed-primitive/容器的自动转换，
+    // 让 `Java.use("...").$new(...)` 一定返回可链式调用的 Java 对象代理。
+    if RETURN_RAW_WRAPPER.get() {
+        if release_local {
+            return wrap_java_object_ref(ctx, env, obj, &class_name, globalize_wrappers);
+        }
+        return wrap_java_object_value(ctx, obj as u64, &class_name);
+    }
 
     if class_name == "java.lang.String" {
         let get_str: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
