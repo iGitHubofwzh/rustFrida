@@ -875,20 +875,6 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
         }
     }
 
-    // JS engine 繁忙检查: 非 JS 线程且无法获取 JS engine lock 时 bypass。
-    // 防止进入 replacement → JNI → callback → invoke_original_jni 路径:
-    // JNI stub (art_quick_invoke_static_stub) 不保留 x17 等 Quick 约定寄存器，
-    // JIT 代码的 interface dispatch 读到脏 x17 → SIGSEGV。
-    // bypass 走 not_found → trampoline 路径，art_router prologue/epilogue 完整保存恢复
-    // 所有寄存器（x0-x7, x20-x29, lr, d0-d7），方法以原始状态执行。
-    {
-        let current_thread = crate::current_thread_id_u64();
-        if crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire) != current_thread {
-            if crate::JS_ENGINE.try_lock().is_err() {
-                return 0;
-            }
-        }
-    }
 
     // Fallback: managed stack check (对标 Frida, 覆盖其他递归场景)
     if should_replace_for_stack(replacement) { 1 } else { 0 }

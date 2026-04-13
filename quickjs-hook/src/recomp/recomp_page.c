@@ -59,12 +59,14 @@ static int encode_bl(uint64_t from_pc, uint64_t to_pc, uint32_t* out) {
 }
 
 /*
- * 安全 B 跳转：优先用 B（4 字节），失败时 fallback 到绝对跳转（MOVZ/MOVK X17 + BR X17）
- * 使用 X17 避免 clobber X16（ART 可能用作通用寄存器）
+ * 安全 B 跳转：优先用 B（4 字节），失败时 fallback 到 MOVZ/MOVK + BR。
+ * Fallback 用 X30 (LR) 做 scratch: 函数中间 LR 已存栈，不影响 X16/X17。
+ * X16/X17 是 ART 的 intra-procedure scratch，JIT 代码可能在分支前后保持
+ * 它们的值（如 X17 = IMT target method），trampoline 不能破坏。
  */
 static void put_b_safe(Arm64Writer* w, uint64_t target) {
     if (arm64_writer_put_b_imm(w, target) != 0) {
-        arm64_writer_put_branch_address_reg(w, target, ARM64_REG_X17);
+        arm64_writer_put_branch_address_reg(w, target, ARM64_REG_X16);
     }
 }
 
@@ -109,7 +111,7 @@ static int emit_fallthrough_trampoline(
          */
         arm64_writer_put_insn(w, insn);
         /* 使用 X17 替代 X16 做 scratch (保护 X16) */
-        arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
+        arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
         return 0;
     }
 
@@ -123,10 +125,10 @@ static int emit_fallthrough_trampoline(
             uint64_t taken = arm64_writer_new_label_id(w);
             arm64_writer_put_b_cond_label(w, info->cond, taken);
             /* not-taken → 下一页 */
-            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
+            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
             arm64_writer_put_label(w, taken);
             /* taken → 原始页内目标（内核重定向到重编译页） */
-            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
             break;
         }
         case ARM64_INSN_CBZ:
@@ -136,9 +138,9 @@ static int emit_fallthrough_trampoline(
                 arm64_writer_put_cbz_reg_label(w, info->reg, taken);
             else
                 arm64_writer_put_cbnz_reg_label(w, info->reg, taken);
-            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
+            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
             arm64_writer_put_label(w, taken);
-            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
             break;
         }
         case ARM64_INSN_TBZ:
@@ -148,18 +150,18 @@ static int emit_fallthrough_trampoline(
                 arm64_writer_put_tbz_reg_imm_label(w, info->reg, info->bit, taken);
             else
                 arm64_writer_put_tbnz_reg_imm_label(w, info->reg, info->bit, taken);
-            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
+            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
             arm64_writer_put_label(w, taken);
-            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
             break;
         }
         case ARM64_INSN_BL:
             /* BL 到页内目标：不会 fall-through（BL 跳走了），但保险起见还是处理 */
-            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+            arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
             break;
         default:
             arm64_writer_put_insn(w, insn);
-            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X17);
+            arm64_writer_put_branch_address_reg(w, next_page, ARM64_REG_X16);
             break;
         }
         return 0;
@@ -181,28 +183,24 @@ static int emit_trampoline(
 
     /* ---- B ---- */
     case ARM64_INSN_B:
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
         break;
 
     /* ---- BL ---- */
     case ARM64_INSN_BL:
-        /* LR 设为原始地址（让栈帧指向原始代码范围，ART 栈回溯正确）
-         * 被调函数 RET → orig_addr → 内核 fault → 重定向到 recomp_addr
-         * 重编译页中 BL 改为 B（不自动设 LR），LR 由跳板手动设置
-         * 注意: 使用 X17 替代 X16 做 scratch（X16 可能被编译器用作通用寄存器） */
+        /* LR = 原始返回地址，X16 = 跳转目标（进入新函数，clobber 无影响） */
         arm64_writer_put_mov_reg_imm(w, ARM64_REG_X30, orig_ret_addr);
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
         break;
 
     /* ---- BLR ---- */
     case ARM64_INSN_BLR:
-        /* BLR 同样会隐式写 LR = recomp_pc + 4，这会把返回地址泄露为 recomp VA。
-         * 改成手动设置 LR = 原始返回地址，再 BR 到原寄存器目标。 */
+        /* BLR 隐式写 LR = recomp_pc + 4，需手动设 LR = 原始返回地址 */
         if (info->reg == ARM64_REG_X30) {
-            /* 目标寄存器就是 LR，先借 X17 保存原目标，再覆写 LR。 */
-            arm64_writer_put_mov_reg_reg(w, ARM64_REG_X17, ARM64_REG_X30);
+            /* 目标寄存器就是 LR，先借 X16 保存原目标，再覆写 LR */
+            arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X30);
             arm64_writer_put_mov_reg_imm(w, ARM64_REG_X30, orig_ret_addr);
-            arm64_writer_put_br_reg(w, ARM64_REG_X17);
+            arm64_writer_put_br_reg(w, ARM64_REG_X16);
         } else {
             arm64_writer_put_mov_reg_imm(w, ARM64_REG_X30, orig_ret_addr);
             arm64_writer_put_br_reg(w, info->reg);
@@ -215,7 +213,7 @@ static int emit_trampoline(
         uint64_t skip = arm64_writer_new_label_id(w);
         Arm64Cond inv = (Arm64Cond)(info->cond ^ 1);
         arm64_writer_put_b_cond_label(w, inv, skip);
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
         arm64_writer_put_label(w, skip);
         put_b_safe(w, return_addr);
         break;
@@ -230,7 +228,7 @@ static int emit_trampoline(
             arm64_writer_put_cbnz_reg_label(w, info->reg, skip);
         else
             arm64_writer_put_cbz_reg_label(w, info->reg, skip);
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
         arm64_writer_put_label(w, skip);
         put_b_safe(w, return_addr);
         break;
@@ -244,7 +242,7 @@ static int emit_trampoline(
             arm64_writer_put_tbnz_reg_imm_label(w, info->reg, info->bit, skip);
         else
             arm64_writer_put_tbz_reg_imm_label(w, info->reg, info->bit, skip);
-        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+        arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X16);
         arm64_writer_put_label(w, skip);
         put_b_safe(w, return_addr);
         break;
