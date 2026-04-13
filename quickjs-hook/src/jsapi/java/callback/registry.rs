@@ -4,6 +4,7 @@
 
 /// Hook 类型：统一 Clone+Replace 策略
 /// 所有回调统一 JNI 调用约定: x0=JNIEnv*, x1=this/jclass, x2+=args
+#[derive(Debug)]
 pub(super) enum HookType {
     /// Unified replacement hook (art_router swaps ArtMethod*)
     /// - replacement_addr: heap-allocated replacement ArtMethod (native, jniCode=thunk)

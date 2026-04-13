@@ -735,34 +735,54 @@ pub fn register_java_api(ctx: &JSContext) {
     }
 }
 
-unsafe fn release_java_hook_resources(
-    data: &JavaHookData,
-    env_opt: Option<JniEnv>,
-    remove_runtime_hooks: bool,
-    free_replacement: bool,
-) {
-    match &data.hook_type {
-        callback::HookType::Replaced {
-            replacement_addr,
-            per_method_hook_target,
-        } => {
-            if remove_runtime_hooks {
-                if let Some(target) = per_method_hook_target {
-                    hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
-                    // stealth2: 恢复 recomp 代码页上的 B 指令
-                    let _ = crate::recomp::revert_slot_patch(data.original_entry_point as usize);
-                }
+// ============================================================================
+// Java hook 拆卸原子操作 — 供 js_java_unhook 和 cleanup_java_hooks 复用
+// ============================================================================
 
-                hook_ffi::hook_remove_redirect(data.art_method);
-            }
+/// 恢复 ArtMethod 原始字段 (access_flags, data_, entry_point) + flush icache。
+pub(super) unsafe fn restore_art_method_fields(data: &JavaHookData) {
+    if let Some(spec) = ART_METHOD_SPEC.get() {
+        std::ptr::write_volatile(
+            (data.art_method as usize + spec.access_flags_offset) as *mut u32,
+            data.original_access_flags,
+        );
+        std::ptr::write_volatile(
+            (data.art_method as usize + spec.data_offset) as *mut u64,
+            data.original_data,
+        );
+        std::ptr::write_volatile(
+            (data.art_method as usize + spec.entry_point_offset) as *mut u64,
+            data.original_entry_point,
+        );
+        hook_ffi::hook_flush_cache(
+            data.art_method as usize as *mut std::ffi::c_void,
+            spec.entry_point_offset + 8,
+        );
+    }
+}
 
-            if free_replacement && *replacement_addr != 0 {
-                libc::free(*replacement_addr as *mut std::ffi::c_void);
-            }
+/// 移除 Layer 3 per-method inline hook + stealth2 revert_slot_patch。
+pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
+    if let callback::HookType::Replaced { per_method_hook_target, .. } = &data.hook_type {
+        if let Some(target) = per_method_hook_target {
+            hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
+            let _ = crate::recomp::revert_slot_patch(data.original_entry_point as usize);
         }
     }
+}
 
-    // 2-ArtMethod 模型: clone 已去掉，无需释放
+/// 移除 native trampoline (hook_remove_redirect)。
+pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
+    hook_ffi::hook_remove_redirect(data.art_method);
+}
+
+/// 释放 replacement ArtMethod 堆内存 + JNI global ref + JS callback。
+pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Option<JniEnv>) {
+    if let callback::HookType::Replaced { replacement_addr, .. } = &data.hook_type {
+        if *replacement_addr != 0 {
+            libc::free(*replacement_addr as *mut std::ffi::c_void);
+        }
+    }
 
     if data.class_global_ref != 0 {
         if let Some(env) = env_opt {
@@ -827,24 +847,7 @@ pub fn cleanup_java_hooks() {
         if let Some(registry) = guard.as_ref() {
             for (_art_method, data) in registry.iter() {
                 unsafe {
-                    // 恢复 ArtMethod 字段 (flags, data_, entry_point)
-                    if let Some(spec) = ART_METHOD_SPEC.get() {
-                        let ep_offset = spec.entry_point_offset;
-                        let data_off = spec.data_offset;
-
-                        std::ptr::write_volatile(
-                            (data.art_method as usize + spec.access_flags_offset) as *mut u32,
-                            data.original_access_flags,
-                        );
-                        std::ptr::write_volatile((data.art_method as usize + data_off) as *mut u64, data.original_data);
-                        std::ptr::write_volatile(
-                            (data.art_method as usize + ep_offset) as *mut u64,
-                            data.original_entry_point,
-                        );
-                        hook_ffi::hook_flush_cache((data.art_method as usize) as *mut std::ffi::c_void, ep_offset + 8);
-                    }
-
-                    // 删除 replacedMethods 映射
+                    restore_art_method_fields(data);
                     callback::delete_replacement_method(data.art_method);
                 }
             }
@@ -868,19 +871,16 @@ pub fn cleanup_java_hooks() {
     // Pass 2: 移除 per-method hooks + 释放资源
     // ============================================================
 
-    // Get JNIEnv for global ref cleanup (best effort)
     let env_opt = unsafe { get_thread_env().ok() };
-
-    // try_lock JS_ENGINE: 通常已被当前线程持有（从 drop 调用），
-    // WouldBlock 时说明当前线程已持有锁，JS 操作安全
     let _js_guard = crate::JS_ENGINE.try_lock();
-    // 无论是否获取到锁，都继续清理（drop 路径下已持有锁）
 
     let mut guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(registry) = guard.take() {
         for (_art_method, data) in registry {
             unsafe {
-                release_java_hook_resources(&data, env_opt, true, true);
+                remove_per_method_hook(&data);
+                remove_native_trampoline(&data);
+                free_java_hook_resources(&data, env_opt);
             }
         }
     }
