@@ -126,6 +126,10 @@ struct SlotInfo {
     slot_addr: usize,
     /// 被覆盖前的原始 4 字节指令
     orig_insn: [u8; 4],
+    /// slot 字节数；决定能否放进固定 32B free list
+    slot_size: usize,
+    /// true = 32B 可复用 hook slot；false = writest 变长 slot，不进 free list
+    reusable: bool,
 }
 
 /// 一个已重编译的页
@@ -145,6 +149,8 @@ struct RecompiledPage {
     registered: bool,
     /// slot 分配记录: orig_addr → (recomp_addr, 原始指令)
     slots: HashMap<usize, SlotInfo>,
+    /// 回收的 32B hook slot 地址（从 revert_slot_patch 归还），alloc 优先 pop 复用
+    free_hook_slots: Vec<usize>,
 }
 
 // SAFETY: 指针只在当前进程内使用，由 Mutex 保护
@@ -248,6 +254,7 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
         tramp_used,
         tramp_capacity,
         slots: HashMap::new(),
+        free_hook_slots: Vec::new(),
         registered,
     };
 
@@ -500,14 +507,22 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
 
     // 跳板区在 recomp 页之后
     let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
-    let tramp_cap = page.tramp_capacity;
     let slot_size = 32usize; // 预留足够空间给 hook engine 写 full jump + trampoline
-    if page.tramp_used + slot_size > tramp_cap {
-        return Err("recomp 跳板区已满".into());
-    }
 
-    let slot_ptr = unsafe { tramp_base.add(page.tramp_used) };
-    let slot_addr = slot_ptr as usize;
+    // 优先复用 unhook 归还的 slot；否则 bump tramp_used。
+    // 不清零 —— hook engine 在 slot 上写 full jump 覆盖前 16~20B, fixup_slot_trampoline
+    // 会用 SlotInfo.orig_insn 重建 callOriginal trampoline 不依赖 slot 内容。
+    let slot_addr = if let Some(reused) = page.free_hook_slots.pop() {
+        reused
+    } else {
+        if page.tramp_used + slot_size > page.tramp_capacity {
+            return Err("recomp 跳板区已满".into());
+        }
+        let s = unsafe { tramp_base.add(page.tramp_used) as usize };
+        page.tramp_used += slot_size;
+        s
+    };
+
     let recomp_code_addr = unsafe { page.recomp_ptr.add(offset) as usize };
 
     // 保存 recomp 代码页上将被 B 覆盖的原始指令
@@ -516,19 +531,22 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
         ptr::copy_nonoverlapping(recomp_code_addr as *const u8, orig_insn.as_mut_ptr(), 4);
     }
 
-    // slot 区域可能含 BRK guard 填充，不清零:
-    // - hook engine 写 thunk 时会覆盖 BRK
-    // - fixup_slot_trampoline 用真正原始指令重建 trampoline
-    // - commit_slot_patch 最后才激活 B 指令
-
     // B 指令范围预检查（commit_slot_patch 时才真正写入）
     let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
     if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
         return Err(format!("B 指令范围超限: offset={}", b_offset));
     }
 
-    page.tramp_used += slot_size;
-    page.slots.insert(orig_addr, SlotInfo { recomp_addr: recomp_code_addr, slot_addr, orig_insn });
+    page.slots.insert(
+        orig_addr,
+        SlotInfo {
+            recomp_addr: recomp_code_addr,
+            slot_addr,
+            orig_insn,
+            slot_size,
+            reusable: true,
+        },
+    );
     // 注意: 此时 recomp 代码页上的原始指令未被修改，slot 已分配但内容是 0。
     // 调用方必须在 hook engine 写好 thunk + fixup trampoline 后调用 commit_slot_patch。
     Ok(slot_addr)
@@ -636,6 +654,8 @@ pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
             recomp_addr: recomp_code_addr,
             slot_addr,
             orig_insn,
+            slot_size,
+            reusable: false, // writest 变长 slot，不进 free list
         },
     );
 
@@ -714,6 +734,11 @@ pub fn revert_slot_patch(orig_addr: usize) -> Result<()> {
     unsafe {
         ptr::write_volatile(info.recomp_addr as *mut u32, u32::from_le_bytes(info.orig_insn));
         hook_flush_cache(info.recomp_addr as *mut libc::c_void, 4);
+    }
+
+    // 归还可复用的 32B hook slot 到 free list；writest 变长 slot 不回收。
+    if info.reusable {
+        page.free_hook_slots.push(info.slot_addr);
     }
 
     Ok(())

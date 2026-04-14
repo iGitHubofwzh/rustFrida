@@ -89,7 +89,7 @@ fn current_native_hook_frame() -> Option<(*mut hook_ffi::HookContext, u64)> {
         .map(|frame| (frame.ctx_ptr as *mut hook_ffi::HookContext, frame.trampoline))
 }
 
-pub(super) fn wait_for_in_flight_native_hook_callbacks(timeout: std::time::Duration) -> bool {
+pub(crate) fn wait_for_in_flight_native_hook_callbacks(timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     let mut in_flight = IN_FLIGHT_NATIVE_HOOK_CALLBACKS
         .lock()

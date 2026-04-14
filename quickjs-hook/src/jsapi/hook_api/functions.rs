@@ -80,6 +80,23 @@ unsafe fn install_hook(
 
     init_registry();
 
+    // 方案 (b): 同一 addr 重复 hook 自动替换老 hook。
+    // 先拆掉旧 hook（恢复 recomp 页字节 + 回收 slot + 释放老 callback），
+    // 等 in-flight native callback 退出，再装新 hook。避免 HashMap.insert
+    // 覆盖 HookData 后 slot 泄漏 + orig_insn 被当成"B→老 slot"污染 callOriginal。
+    if let Some(old_data) = with_registry_mut(&HOOK_REGISTRY, |registry| registry.remove(&addr))
+        .flatten()
+    {
+        super::remove_single_hook(addr, &old_data);
+        // 短 wait 给当前在 thunk 内的 callback 退出；超时就放弃 free（old callback
+        // 泄漏一次，callback_wrapper 自带 "not a function" 校验不会崩）。
+        if super::callback::wait_for_in_flight_native_hook_callbacks(
+            std::time::Duration::from_millis(20),
+        ) {
+            super::free_hook_callback(&old_data);
+        }
+    }
+
     // Recomp 模式：先重编译页，再分配跳板 slot
     // alloc_trampoline_slot 在 recomp 代码页写 B→slot，返回 slot 地址。
     // hook engine 以 stealth=0 在 slot 上写 full jump→thunk，无需碰原始 SO。
