@@ -632,7 +632,7 @@ addr.writest(new Uint8Array([
 
 - `writest` 的 patch 若不以 RET/B 结尾，执行完会自动 fall-through 到 `addr + 4`（跳过原第一条指令）
 - patch 中 `ADR / ADRP / BL / LDR literal / CBZ / TBZ / B.cond` 等 PC-relative 指令会被自动重写
-- patch 内部的跨指令分支（`B .+offset` 等）在 patch ≤ 8 条指令时正确工作；超过 8 条时内部分支会被当作跳出 patch
+- patch 内部的跨指令分支（`B .+offset` 等）在 patch ≤ 64 条指令（256B）时正确工作；超过会被当作跳出 patch
 - `writest` 同一地址已装过后再调会抛错；如需换 patch，先 `unhook(addr)`
 
 ## Module

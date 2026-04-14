@@ -80,8 +80,11 @@ typedef struct {
 
 /* Region label entry: maps one source instruction address to a writer label.
  * Used to fix up within-region branches so they target the relocated copy in
- * the trampoline rather than the original (now-overwritten) address. */
-#define ARM64_RELOC_MAX_REGION 8
+ * the trampoline rather than the original (now-overwritten) address.
+ *
+ * 64 entries × 16 bytes = 1KB stack footprint per Arm64Relocator; covers
+ * 256-byte patches which is plenty for any sane writest use case. */
+#define ARM64_RELOC_MAX_REGION 64
 typedef struct {
     uint64_t src_pc;    /* original source address of the instruction */
     uint64_t label_id;  /* writer label ID placed at its destination */
