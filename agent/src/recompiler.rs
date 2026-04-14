@@ -52,6 +52,17 @@ extern "C" {
     fn hook_write_jump(dst: *mut libc::c_void, target: *mut libc::c_void) -> i32;
     fn hook_mmap_near(target: *mut libc::c_void, alloc_size: usize) -> *mut libc::c_void;
     fn hook_register_pool(base: *mut libc::c_void, size: usize) -> i32;
+    fn arm64_install_user_patch(
+        user_bytes: *const u8,
+        user_len: usize,
+        user_src_pc: u64,
+        slot_buf: *mut u8,
+        slot_cap: usize,
+        slot_pc: u64,
+        fall_through_target: u64,
+        err_buf: *mut u8,
+        err_cap: usize,
+    ) -> i32;
     fn hook_rebuild_trampoline(
         trampoline: *mut libc::c_void,
         trampoline_size: usize,
@@ -518,6 +529,118 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
     // 注意: 此时 recomp 代码页上的原始指令未被修改，slot 已分配但内容是 0。
     // 调用方必须在 hook engine 写好 thunk + fixup trampoline 后调用 commit_slot_patch。
     Ok(slot_addr)
+}
+
+/// 在 recomp 页对应位置安装 "1 指令 → N 指令" 用户 patch (writest stealth-2)。
+///
+/// 步骤：
+/// 1. 分配 slot（足够大小：patch + reloc 膨胀 + fall-through B）
+/// 2. 通过 arm64_install_user_patch 把 user_bytes relocate 到 slot，末尾追加
+///    `B → recomp_addr + 4`（除非 patch 本身以 RET/B 等无条件终止）
+/// 3. flush_cache 整个 slot
+/// 4. 原子写 recomp 页对应 4 字节为 `B → slot`
+///
+/// 原页始终不动，取指通过 prctl 重定向到 recomp 页 → B→slot → reloc 后 patch。
+pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
+    ensure_init();
+
+    if orig_addr % 4 != 0 {
+        return Err("orig_addr must be 4-byte aligned".into());
+    }
+    if user_bytes.is_empty() || user_bytes.len() % 4 != 0 {
+        return Err("patch must be non-empty and 4-byte multiple".into());
+    }
+
+    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let orig_base = orig_addr & !(page_size - 1);
+    let offset = orig_addr - orig_base;
+
+    let mut guard = RECOMP_PAGES.lock().unwrap();
+    let pages = guard.as_mut().unwrap();
+
+    let page = pages
+        .get_mut(&orig_base)
+        .ok_or_else(|| format!("页 0x{:x} 未重编译", orig_base))?;
+
+    if page.slots.contains_key(&orig_addr) {
+        return Err(format!("地址 0x{:x} 已被占用（hook 或 patch 已在位）", orig_addr));
+    }
+
+    // Reloc 最坏情况：每条 PC-rel 指令膨胀到 ~20 字节（ADRP→MOVZ+MOVK*3）。
+    // 预留 user_len × 5 + 20 字节（fall-through put_b_safe 兜底）。
+    let slot_size_raw = user_bytes.len().saturating_mul(5).saturating_add(32);
+    let slot_size = (slot_size_raw + 15) & !15;
+
+    let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
+    if page.tramp_used + slot_size > page.tramp_capacity {
+        return Err(format!(
+            "recomp 跳板区已满 (need {} bytes, avail {})",
+            slot_size,
+            page.tramp_capacity - page.tramp_used
+        ));
+    }
+
+    let slot_ptr = unsafe { tramp_base.add(page.tramp_used) };
+    let slot_addr = slot_ptr as usize;
+    let recomp_code_addr = unsafe { page.recomp_ptr.add(offset) as usize };
+
+    // 备份被覆盖的 4 字节原始指令（供 unhook 恢复）
+    let mut orig_insn = [0u8; 4];
+    unsafe {
+        ptr::copy_nonoverlapping(recomp_code_addr as *const u8, orig_insn.as_mut_ptr(), 4);
+    }
+
+    // B 指令范围预检查
+    let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
+    if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
+        return Err(format!("B range exceeded: offset={}", b_offset));
+    }
+
+    // Relocate user patch into slot via C helper
+    let mut err_buf = [0u8; 128];
+    let fall_through_target = (recomp_code_addr + 4) as u64;
+    let written = unsafe {
+        arm64_install_user_patch(
+            user_bytes.as_ptr(),
+            user_bytes.len(),
+            orig_addr as u64,
+            slot_ptr,
+            slot_size,
+            slot_addr as u64,
+            fall_through_target,
+            err_buf.as_mut_ptr(),
+            err_buf.len(),
+        )
+    };
+    if written < 0 {
+        let nul = err_buf.iter().position(|&b| b == 0).unwrap_or(err_buf.len());
+        let msg = std::str::from_utf8(&err_buf[..nul]).unwrap_or("?");
+        return Err(format!("arm64_install_user_patch: {}", msg));
+    }
+
+    unsafe {
+        hook_flush_cache(slot_ptr as *mut _, written as usize);
+    }
+
+    page.tramp_used += slot_size;
+    page.slots.insert(
+        orig_addr,
+        SlotInfo {
+            recomp_addr: recomp_code_addr,
+            slot_addr,
+            orig_insn,
+        },
+    );
+
+    // 原子写 B→slot
+    let b_imm26 = ((b_offset >> 2) & 0x3FF_FFFF) as u32;
+    let b_insn: u32 = 0x14000000 | b_imm26;
+    unsafe {
+        ptr::write_volatile(recomp_code_addr as *mut u32, b_insn);
+        hook_flush_cache(recomp_code_addr as *mut libc::c_void, 4);
+    }
+
+    Ok(())
 }
 
 /// 在 recomp 代码页上写 B→slot 指令（原子 4 字节写入）。

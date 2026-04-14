@@ -4,6 +4,7 @@ mod alloc;
 mod helpers;
 mod read;
 mod write;
+mod writest;
 
 use crate::context::JSContext;
 use crate::jsapi::util::add_cfunction_to_object;
@@ -12,6 +13,7 @@ pub(crate) use alloc::cleanup_owned_allocs;
 use alloc::{memory_alloc, memory_alloc_utf8_string, memory_flush_code_cache};
 use read::*;
 use write::*;
+use writest::memory_writest;
 
 /// 把 Memory 读写方法注册到 NativePointer prototype，实现 Frida 兼容的
 /// `ptr.readXxx()` / `ptr.writeXxx(val)` 调用风格。
@@ -30,6 +32,8 @@ pub fn register_ptr_methods(ctx_ptr: *mut crate::ffi::JSContext, proto: crate::f
         add_cfunction_to_object(ctx_ptr, proto, "writeU32", memory_write_u32, 1);
         add_cfunction_to_object(ctx_ptr, proto, "writeU64", memory_write_u64, 1);
         add_cfunction_to_object(ctx_ptr, proto, "writePointer", memory_write_pointer, 1);
+        add_cfunction_to_object(ctx_ptr, proto, "writeBytes", memory_write_bytes, 2);
+        add_cfunction_to_object(ctx_ptr, proto, "writest", memory_writest, 1);
     }
 }
 
@@ -57,6 +61,8 @@ pub fn register_memory_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, obj, "writeU32", memory_write_u32, 2);
         add_cfunction_to_object(ctx_ptr, obj, "writeU64", memory_write_u64, 2);
         add_cfunction_to_object(ctx_ptr, obj, "writePointer", memory_write_pointer, 2);
+        add_cfunction_to_object(ctx_ptr, obj, "writeBytes", memory_write_bytes, 3);
+        add_cfunction_to_object(ctx_ptr, obj, "writest", memory_writest, 2);
     }
 
     // Set Memory on global object

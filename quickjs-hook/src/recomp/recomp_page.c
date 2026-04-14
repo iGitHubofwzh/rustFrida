@@ -11,6 +11,7 @@
 #include "../arm64_common.h"
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 /* ============================================================================
  * 内部辅助：判断指令是否为分支类
@@ -564,4 +565,94 @@ done:
     arm64_writer_clear(&tw);
 
     return local_stats.error ? -1 : 0;
+}
+
+/* ============================================================================
+ * arm64_install_user_patch — reloc a user patch body into a slot buffer and
+ * append a fall-through B to the next original instruction.
+ * ============================================================================ */
+
+static void set_err(char* err_buf, size_t err_cap, const char* msg) {
+    if (!err_buf || err_cap == 0) return;
+    size_t n = strlen(msg);
+    if (n >= err_cap) n = err_cap - 1;
+    memcpy(err_buf, msg, n);
+    err_buf[n] = '\0';
+}
+
+int arm64_install_user_patch(
+    const uint8_t* user_bytes, size_t user_len,
+    uint64_t user_src_pc,
+    uint8_t* slot_buf, size_t slot_cap, uint64_t slot_pc,
+    uint64_t fall_through_target,
+    char* err_buf, size_t err_cap
+) {
+    if (user_bytes == NULL || user_len == 0 || (user_len & 3) != 0) {
+        set_err(err_buf, err_cap, "user_len must be non-zero and 4-byte multiple");
+        return -1;
+    }
+    if (slot_buf == NULL || slot_cap < 16) {
+        set_err(err_buf, err_cap, "slot_cap too small");
+        return -1;
+    }
+
+    Arm64Writer w;
+    Arm64Relocator r;
+    arm64_writer_init(&w, slot_buf, slot_pc, slot_cap);
+    arm64_relocator_init(&r, user_bytes, user_src_pc, &w);
+
+    int last_was_unconditional = 0;
+
+    while (!arm64_relocator_eoi(&r)) {
+        int n = arm64_relocator_read_one(&r);
+        if (n <= 0) break;
+
+        Arm64RelocResult rr = arm64_relocator_write_one(&r);
+        if (rr != ARM64_RELOC_OK) {
+            set_err(err_buf, err_cap, "relocator_write_one failed (out of range or unsupported insn)");
+            arm64_relocator_clear(&r);
+            arm64_writer_clear(&w);
+            return -1;
+        }
+
+        last_was_unconditional = is_unconditional_transfer(r.current_info.type);
+        if (last_was_unconditional) {
+            /* An unconditional terminator already ends control flow — stop here.
+             * Anything past it in user_bytes would be dead code; we refuse so the
+             * caller notices rather than silently dropping bytes. */
+            if ((size_t)(r.input_cur - r.input_start) != user_len) {
+                set_err(err_buf, err_cap, "user patch has instructions after unconditional terminator");
+                arm64_relocator_clear(&r);
+                arm64_writer_clear(&w);
+                return -1;
+            }
+            break;
+        }
+    }
+
+    /* Fall-through B only if the user patch didn't terminate flow itself. */
+    if (!last_was_unconditional) {
+        put_b_safe(&w, fall_through_target);
+    }
+
+    if (arm64_writer_flush(&w) != 0) {
+        set_err(err_buf, err_cap, "arm64_writer_flush failed (label out of range)");
+        arm64_relocator_clear(&r);
+        arm64_writer_clear(&w);
+        return -1;
+    }
+
+    size_t written = arm64_writer_offset(&w);
+    arm64_relocator_clear(&r);
+    arm64_writer_clear(&w);
+
+    if (written == 0) {
+        set_err(err_buf, err_cap, "wrote zero bytes");
+        return -1;
+    }
+    if (written > (size_t)INT_MAX) {
+        set_err(err_buf, err_cap, "written size too large");
+        return -1;
+    }
+    return (int)written;
 }

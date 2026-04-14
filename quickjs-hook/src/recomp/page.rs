@@ -6,11 +6,13 @@ type RecompHandler = fn(usize) -> Result<usize, String>;
 type RecompAllocSlotHandler = fn(usize) -> Result<usize, String>;
 type RecompFixupHandler = fn(*mut u8, usize) -> Result<(), String>;
 type RecompCommitHandler = fn(usize) -> Result<(), String>;
+type RecompInstallPatchHandler = fn(usize, &[u8]) -> Result<(), String>;
 
 static HANDLER: Mutex<Option<RecompHandler>> = Mutex::new(None);
 static ALLOC_SLOT_HANDLER: Mutex<Option<RecompAllocSlotHandler>> = Mutex::new(None);
 static FIXUP_HANDLER: Mutex<Option<RecompFixupHandler>> = Mutex::new(None);
 static COMMIT_HANDLER: Mutex<Option<RecompCommitHandler>> = Mutex::new(None);
+static INSTALL_PATCH_HANDLER: Mutex<Option<RecompInstallPatchHandler>> = Mutex::new(None);
 
 pub fn set_handler(handler: RecompHandler) {
     *HANDLER.lock().unwrap() = Some(handler);
@@ -26,6 +28,21 @@ pub fn set_fixup_handler(handler: RecompFixupHandler) {
 
 pub fn set_commit_handler(handler: RecompCommitHandler) {
     *COMMIT_HANDLER.lock().unwrap() = Some(handler);
+}
+
+pub fn set_install_patch_handler(handler: RecompInstallPatchHandler) {
+    *INSTALL_PATCH_HANDLER.lock().unwrap() = Some(handler);
+}
+
+/// 安装 stealth-2 用户 patch：把 bytes relocate 到 recomp 跳板区 slot,
+/// 原子在 recomp 页对应位置写 B→slot, 取指命中 patch。
+pub fn install_patch(orig_addr: usize, bytes: &[u8]) -> Result<(), String> {
+    let guard = INSTALL_PATCH_HANDLER.lock().unwrap();
+    let handler = match guard.as_ref() {
+        Some(h) => h,
+        None => return Err("recomp install_patch handler not set".into()),
+    };
+    handler(orig_addr, bytes)
 }
 
 static REVERT_HANDLER: Mutex<Option<RecompCommitHandler>> = Mutex::new(None);

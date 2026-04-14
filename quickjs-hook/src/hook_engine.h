@@ -476,6 +476,22 @@ void hook_set_recomp_translate(recomp_translate_fn fn);
 void hook_set_stealth_mode(int mode);
 
 /*
+ * Stealth-write `len` bytes of `buf` to `addr` via the kernel wxshadow
+ * facility. Creates a shadow page, writes the bytes, and activates it as
+ * --x without ever exposing the target page as writable in /proc/self/maps.
+ * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure (kernel does
+ * not support wxshadow, target VMA is not 4KB-mapped after PMD-split COW
+ * retry, etc.).
+ */
+int wxshadow_patch(void* addr, const void* buf, size_t len);
+
+/*
+ * Release a wxshadow patch by its exact patch start address (must match the
+ * `addr` previously passed to wxshadow_patch). Returns 0 on success.
+ */
+int wxshadow_release(void* addr);
+
+/*
  * Diagnostic: 测试 hook_alloc_near 对给定 target 的有效性。
  * 打印 pool 状态、分配结果、ADRP 可达性。
  */

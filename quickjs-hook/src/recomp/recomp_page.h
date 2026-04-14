@@ -60,6 +60,39 @@ int recompile_page(
     RecompileStats* stats
 );
 
+/*
+ * Relocate a user-provided instruction stream into a preallocated slot buffer
+ * and append an unconditional B to `fall_through_target` (unless the last
+ * relocated instruction is itself an unconditional flow terminator — B/BR/RET).
+ *
+ * Intended for stealth-2 "one-instruction-for-N-instruction" patching: the
+ * caller overwrites one 4-byte instruction position in the recomp page with
+ * `B → slot_buf`; this function builds the slot body so that PC-relative
+ * instructions inside `user_bytes` are re-emitted correctly for execution at
+ * `slot_pc`, and execution falls back to the next original instruction after
+ * the user patch finishes.
+ *
+ * @param user_bytes              Raw patch bytes (must be 4-byte aligned and 4-byte multiple)
+ * @param user_len                Length of user_bytes in bytes
+ * @param user_src_pc             Address the user *thinks* the patch runs at
+ *                                (the original address, used for PC-rel math)
+ * @param slot_buf                Output buffer for relocated slot body
+ * @param slot_cap                Capacity of slot_buf
+ * @param slot_pc                 Runtime address where slot_buf will execute
+ * @param fall_through_target     Address to B to after the user patch finishes
+ *                                (typically `orig_addr + 4` in recomp-page space)
+ * @param err_buf                 Optional error message buffer, may be NULL
+ * @param err_cap                 Capacity of err_buf
+ * @return                        Bytes written into slot_buf on success, -1 on error
+ */
+int arm64_install_user_patch(
+    const uint8_t* user_bytes, size_t user_len,
+    uint64_t user_src_pc,
+    uint8_t* slot_buf, size_t slot_cap, uint64_t slot_pc,
+    uint64_t fall_through_target,
+    char* err_buf, size_t err_cap
+);
+
 #ifdef __cplusplus
 }
 #endif
