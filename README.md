@@ -607,61 +607,59 @@ Memory.flushCodeCache(code, 16);
 - 写入可执行代码后**必须**调 `Memory.flushCodeCache` 刷 ARM64 I-cache（DC CVAU + IC IVAU + ISB），否则 CPU 可能执行到 stale 指令
 - `writeXxx` 自动 mprotect 目标页为 RW，写完还原；只读段也能写
 
-**stealth 指令 patch（writeBytes / writest）**
+**writeBytes / writest — 隐身指令写入**
 
-| 模式 | API | 机制 | read 可见? | 限制 |
-| --- | --- | --- | --- | --- |
-| 0 | `p.writeBytes(bytes, 0)` | mprotect RWX + memcpy + 恢复 | 是 | 留 mprotect 痕迹 |
-| 1 | `p.writeBytes(bytes, 1)` | 内核 wxshadow PATCH（shadow 页只对取指可见） | 否 | 只支持 r-x 页 + 单页内 |
-| 2 | `p.writest(bytes)` | recomp 副本页 slot + `arm64_relocator`；原子写 4B `B→slot`；末尾自动 `B → addr+4` fall-through | 否 | `addr` 4B 对齐；`bytes` 4B 倍数；同地址不可重复 |
+| API | read 可见? | 长度限制 | 地址要求 |
+| --- | --- | --- | --- |
+| `p.writeBytes(bytes, 0)` 或省略 | 可见 | 任意 | 任意 |
+| `p.writeBytes(bytes, 1)` | 不可见 | 单页内（<4KB） | r-x 页 |
+| `p.writest(bytes)` | 不可见 | 任意（4B 倍数指令流） | 4B 对齐，同地址不可重装 |
 
 ```js
-// stealth=1 wxshadow：把 getpid 首指令换掉, 数据读仍是原字节
 var addr = Module.findExportByName("libc.so", "getpid");
-addr.writeBytes(new Uint8Array([0x40,0x05,0x80,0xd2, 0xc0,0x03,0x5f,0xd6]), 1);
-// getpid() 现在返回 42；addr.readByteArray(8) 仍看到原始字节
 
-// stealth=2 writest：1 条原指令 → N 条用户指令（PC-relative 自动修正）
+// 隐身写: getpid() 返回 42, 但 readByteArray 仍看到原字节
+addr.writeBytes(new Uint8Array([0x40,0x05,0x80,0xd2, 0xc0,0x03,0x5f,0xd6]), 1);
+
+// 多指令替换 (PC-relative 指令会被自动修正)
 addr.writest(new Uint8Array([
     0x80,0x46,0x82,0x52,  // MOVZ W0, #0x1234
     0xa0,0x79,0xb5,0x72,  // MOVK W0, #0xABCD, LSL #16
     0xc0,0x03,0x5f,0xd6,  // RET
 ]));
-// getpid() 返回 0xABCD1234；原 SO 字节完全不动
+// getpid() → 0xABCD1234
 ```
 
-- **stealth=2** 首次调用会触发整页 recomp + prctl 注册（取指透明重定向到副本页），后续同页 writest/recompHook 复用该 slot 池（每页 16×4KB）
-- `writest` 的 user patch 若**不以 RET/B 结尾**，末尾自动追加 `B → addr+4` 让执行流落回原函数下一条指令
-- user patch 里的 PC-rel 指令（ADR/ADRP/BL/LDR literal/CBZ/TBZ...）由 `arm64_relocator` 改写为绝对 MOVZ/MOVK + BR 序列，slot 位置与原 addr 距离无影响
-- 内部跨指令分支（patch 里的 `B .+offset`）不保证正确，relocator 当外部分支处理 — 需要内部控制流请用绝对 MOVZ+BR
+- `writest` 的 patch 若不以 RET/B 结尾，执行完会自动 fall-through 到 `addr + 4`（跳过原第一条指令）
+- patch 中 `ADR / ADRP / BL / LDR literal / CBZ / TBZ` 等 PC-relative 指令会被自动重写；但 **patch 内部的跨指令分支不支持**，需要内部控制流请用绝对跳转
+- `writest` 同一地址已装过后再调会抛错；如需换 patch，先 `unhook(addr)`
 
 ## Module
 
 | API | 参数 | 返回 |
 | --- | --- | --- |
-| `Module.findExportByName(module, symbol)` | `string, string` | `NativePointer \| null`（ELF 直查 + IFUNC 解析）|
+| `Module.findExportByName(module, symbol)` | `string, string` | `NativePointer \| null` |
 | `Module.findBaseAddress(module)` | `string` | `NativePointer \| null` |
 | `Module.findByAddress(addr)` | `AddressLike` | `ModuleInfo \| null` |
 | `Module.enumerateModules()` | — | `ModuleInfo[]` |
-| `Module.enumerateExports(name)` | `string` | `{type, name, address}[]` — `.dynsym` 里 defined + GLOBAL/WEAK，IFUNC 已解析 |
-| `Module.enumerateImports(name)` | `string` | `{type, name, slot, address}[]` — `.rela.dyn` + `.rela.plt` 外部符号，按名字 dedup，`address` 是 slot 当前值 |
-| `Module.enumerateSymbols(name)` | `string` | `{type, name, address, isGlobal, isDefined}[]` — `.symtab` ∪ `.dynsym` 并集，按 raw name dedup |
-| `Module.enumerateRanges(name, prot?)` | `string, "rwx" 风格` | `{base, size, protection, file:{path}}[]` — `prot` 槽位 `-` 为通配，如 `"r-x"` 匹配 `r-x` 和 `rwx` |
+| `Module.enumerateExports(name)` | `string` | `{type, name, address}[]` |
+| `Module.enumerateImports(name)` | `string` | `{type, name, slot, address}[]` |
+| `Module.enumerateSymbols(name)` | `string` | `{type, name, address, isGlobal, isDefined}[]` |
+| `Module.enumerateRanges(name, prot?)` | `string, "rwx" 风格` | `{base, size, protection, file:{path}}[]` |
 
 ```js
-// 枚举 libc 导出（实测 1473 条，与 readelf --dyn-syms 完全一致）
+// 导出：defined + global/weak 符号
 Module.enumerateExports("libc.so").slice(0, 3);
 // [{type:"function", name:"__cxa_finalize", address:"0x7200f0e0a0"}, ...]
 
-// 按 protection 过滤代码段
+// 按内存权限过滤 (prot 里 '-' 是通配, "r-x" 会匹配 r-x 和 rwx)
 Module.enumerateRanges("libc.so", "r-x");
-// [{base:"0x7200eee000", size:638976, protection:"r-x", file:{path:"/apex/.../libc.so"}}]
 
-// 所有 r-x 段的 PLT import 地址
+// 外部引用符号 + PLT/GOT slot 地址
 Module.enumerateImports("libart.so").filter(i => i.type === "function");
 ```
 
-全部走 ELF 直查（绕 linker namespace + IFUNC resolver），memfd-loaded 合成模块会返回空数组。
+枚举的来源是模块的磁盘 ELF；memfd 或无文件支撑的合成模块返回空数组。
 
 ## ptr / NativePointer
 
@@ -687,10 +685,10 @@ p.readPointer().readCString(); // 链式解引用
 | `p.readCString()` / `p.readUtf8String()` | — | `string` |
 | `p.readByteArray(len)` | `number` | `ArrayBuffer` |
 | `p.writeU8/U16/U32/U64/Pointer(val)` | 值 | `undefined` |
-| `p.writeBytes(bytes, stealth?)` | `ArrayBuffer\|TypedArray\|number[], 0\|1` | `undefined` — `stealth=0` 普通写, `stealth=1` wxshadow（read 不可见）|
-| `p.writest(bytes)` | `ArrayBuffer\|TypedArray\|number[]` (4B 倍数) | `undefined` — stealth-2 slot relocator，PC-rel 自动修正 |
+| `p.writeBytes(bytes, stealth?)` | `ArrayBuffer\|TypedArray\|number[], 0\|1` | `undefined` |
+| `p.writest(bytes)` | `ArrayBuffer\|TypedArray\|number[]` (4B 倍数) | `undefined` |
 
-所有读写方法的语义、错误处理、i-cache 约束与 `Memory.*` 完全一致。stealth 语义见 Memory 章节的对比表。
+所有读写方法的语义、错误处理、i-cache 约束与 `Memory.*` 完全一致；`writeBytes` / `writest` 的行为见 Memory 章节的表格。
 
 ## console
 
