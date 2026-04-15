@@ -31,18 +31,29 @@ pub(super) unsafe fn extract_bytes(
     let mut bpe: usize = 0;
     let typed_ab =
         ffi::JS_GetTypedArrayBuffer(ctx, val.raw(), &mut byte_offset, &mut byte_length, &mut bpe);
-    if ffi::qjs_is_exception(typed_ab) == 0 && byte_length > 0 {
-        let mut ab_size: usize = 0;
-        let ab_ptr = ffi::JS_GetArrayBuffer(ctx, &mut ab_size, typed_ab);
-        let typed_ab_val = JSValue(typed_ab);
-        typed_ab_val.free(ctx);
-        if !ab_ptr.is_null() && byte_offset + byte_length <= ab_size {
-            let slice = std::slice::from_raw_parts(ab_ptr.add(byte_offset), byte_length);
-            return Ok(slice.to_vec());
-        }
-    } else if ffi::qjs_is_exception(typed_ab) != 0 {
+    if ffi::qjs_is_exception(typed_ab) != 0 {
         let exc = ffi::JS_GetException(ctx);
         ffi::qjs_free_value(ctx, exc);
+    } else {
+        // 非异常 = val 是 TypedArray (含空 TypedArray)。typed_ab 持有 ArrayBuffer
+        // 引用必须 free。空 TypedArray 直接返回空 Vec，不再 fall-through 到 Array
+        // 分支误判为非法输入。
+        let typed_ab_val = JSValue(typed_ab);
+        let mut result: Option<Vec<u8>> = None;
+        if byte_length == 0 {
+            result = Some(Vec::new());
+        } else {
+            let mut ab_size: usize = 0;
+            let ab_ptr = ffi::JS_GetArrayBuffer(ctx, &mut ab_size, typed_ab);
+            if !ab_ptr.is_null() && byte_offset + byte_length <= ab_size {
+                let slice = std::slice::from_raw_parts(ab_ptr.add(byte_offset), byte_length);
+                result = Some(slice.to_vec());
+            }
+        }
+        typed_ab_val.free(ctx);
+        if let Some(v) = result {
+            return Ok(v);
+        }
     }
 
     if ffi::JS_IsArray(ctx, val.raw()) != 0 {

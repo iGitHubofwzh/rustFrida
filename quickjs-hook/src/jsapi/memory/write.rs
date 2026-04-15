@@ -168,21 +168,65 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
             JSValue::undefined().raw()
         }
         1 => {
-            let rc = ffi::hook::wxshadow_patch(
-                addr as *mut std::ffi::c_void,
-                bytes.as_ptr() as *const std::ffi::c_void,
-                bytes.len(),
-            );
-            if rc != 0 {
-                let msg = format!("writeBytes(stealth=1): wxshadow_patch rc={}\0", rc);
-                return ffi::JS_ThrowInternalError(
-                    ctx,
-                    b"%s\0".as_ptr() as *const _,
-                    msg.as_ptr(),
+            // wxshadow_patch 走 KPM copy_from_user_via_pte，单次只能写一页。
+            // bytes 跨 4KB 边界时手工拆成两段：先写第二段 (jump 尾部，未含取指首
+            // 字节)，再写第一段；首段失败回滚第二段。> 2 页直接拒绝。
+            let len = bytes.len();
+            let page_off = (addr & 0xFFF) as usize;
+            if page_off + len > 0x2000 {
+                let msg = format!(
+                    "writeBytes(stealth=1): bytes len={} 跨 >2 页 (page_off=0x{:x})，wxshadow 不支持\0",
+                    len, page_off
                 );
+                return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
             }
-            ffi::hook::hook_flush_cache(addr as *mut _, bytes.len());
-            track_wxshadow_addr(addr);
+            if page_off + len > 0x1000 {
+                let first_len = 0x1000 - page_off;
+                let second_len = len - first_len;
+                let second_addr = addr + first_len as u64;
+                let rc2 = ffi::hook::wxshadow_patch(
+                    second_addr as *mut std::ffi::c_void,
+                    bytes.as_ptr().add(first_len) as *const std::ffi::c_void,
+                    second_len,
+                );
+                if rc2 != 0 {
+                    let msg = format!(
+                        "writeBytes(stealth=1): wxshadow_patch second-page rc={}\0", rc2
+                    );
+                    return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
+                }
+                let rc1 = ffi::hook::wxshadow_patch(
+                    addr as *mut std::ffi::c_void,
+                    bytes.as_ptr() as *const std::ffi::c_void,
+                    first_len,
+                );
+                if rc1 != 0 {
+                    ffi::hook::wxshadow_release(second_addr as *mut std::ffi::c_void);
+                    let msg = format!(
+                        "writeBytes(stealth=1): first-page rc={}, second 已回滚\0", rc1
+                    );
+                    return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
+                }
+                ffi::hook::hook_flush_cache(addr as *mut _, len);
+                track_wxshadow_addr(addr);
+                track_wxshadow_addr(second_addr);
+            } else {
+                let rc = ffi::hook::wxshadow_patch(
+                    addr as *mut std::ffi::c_void,
+                    bytes.as_ptr() as *const std::ffi::c_void,
+                    len,
+                );
+                if rc != 0 {
+                    let msg = format!("writeBytes(stealth=1): wxshadow_patch rc={}\0", rc);
+                    return ffi::JS_ThrowInternalError(
+                        ctx,
+                        b"%s\0".as_ptr() as *const _,
+                        msg.as_ptr(),
+                    );
+                }
+                ffi::hook::hook_flush_cache(addr as *mut _, len);
+                track_wxshadow_addr(addr);
+            }
             JSValue::undefined().raw()
         }
         other => {
