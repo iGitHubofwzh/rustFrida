@@ -51,6 +51,7 @@ struct _ZymbioteContext
 
     /* 控制标志（由 Rust 侧填充） */
     uint64_t prop_remap;            /* 非零 = 启用属性 remap */
+    uint64_t block_in_setcontext;   /* 非零 = 降级模式：在 setcontext 阻塞（setArgV0 slot 未找到） */
 };
 
 /* 全局上下文实例（运行时由 Rust 侧通过 /proc/pid/mem 填充） */
@@ -516,6 +517,32 @@ rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, cons
         zymbiote.package_name = zymbiote.strdup(name);
     }
 
+    /* 降级模式：setArgV0 slot 未找到时在这里阻塞。
+     * 时序比 setArgV0 稍早（Java init 之前），但 seinfo 上下文已应用、
+     * caps 已 drop、package_name 已确定，足够用于 agent 注入。 */
+    if (zymbiote.block_in_setcontext && zymbiote.package_name != NULL)
+    {
+        bool revert_now;
+
+        if (zymbiote.prop_remap)
+            rustfrida_remap_prop_areas_mounted();
+
+        rustfrida_wait_for_permission_to_resume(zymbiote.package_name, &revert_now);
+
+        /* 还原状态：释放 package_name、恢复页保护 */
+        zymbiote.free(zymbiote.package_name);
+        zymbiote.package_name = NULL;
+        zymbiote.mprotect(zymbiote.payload_base, zymbiote.payload_size,
+                          zymbiote.payload_original_protection);
+
+        if (revert_now)
+        {
+            /* setcontext 无法尾调 raise(SIGSTOP) 后再返回 int（签名不匹配），
+             * 直接同步 raise 然后继续返回 res（与 setArgV0 的尾调等价）。 */
+            zymbiote.raise(SIGSTOP);
+        }
+    }
+
     return res;
 }
 
@@ -530,6 +557,10 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
 
     zymbiote.original_set_argv0(env, clazz, name);
 
+    /* 降级模式：阻塞已在 setcontext 完成（setArgV0 slot 未找到时的兼容路径） */
+    if (zymbiote.block_in_setcontext)
+        return 0;
+
     if (zymbiote.package_name != NULL)
         name_utf8 = zymbiote.package_name;
     else
@@ -537,56 +568,7 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
 
     /* 属性伪装: remap（仅当 Rust 侧设置 prop_remap 标志时） */
     if (zymbiote.prop_remap)
-    {
-        struct prop_remap_entry re[MAX_PROP_ENTRIES];
-        int rc = 0;
-        int mf = (int)raw_syscall6(__NR_openat, MY_AT_FDCWD,
-                                   (long)"/proc/self/maps", MY_O_RDONLY, 0, 0, 0);
-        if (mf >= 0)
-        {
-            char mb[512];
-            int lo = 0;
-            for (;;)
-            {
-                long rn = raw_syscall6(__NR_read, (long)mf, (long)(mb + lo),
-                                       (long)(sizeof(mb) - 1 - (unsigned)lo), 0, 0, 0);
-                if (rn <= 0) {
-                    if (lo > 0) { mb[lo] = '\0'; rc = collect_prop_map_line(mb, re, rc); }
-                    break;
-                }
-                int tt = lo + (int)rn;
-                mb[tt] = '\0';
-                char *ls = mb, *pp = mb;
-                while (pp < mb + tt) {
-                    if (*pp == '\n') { *pp = '\0'; rc = collect_prop_map_line(ls, re, rc); ls = pp + 1; }
-                    pp++;
-                }
-                lo = (int)((mb + tt) - ls);
-                if (lo > 0 && ls != mb) { for (int j = 0; j < lo; j++) mb[j] = ls[j]; }
-                if (lo >= (int)sizeof(mb) - 1) lo = 0;
-            }
-            raw_syscall6(__NR_close, (long)mf, 0, 0, 0, 0, 0);
-
-            for (int i = 0; i < rc; i++)
-            {
-                char rp[128];
-                unsigned int bi = 0, fi = 0;
-                char base[] = "/dev/__properties__/";
-                while (base[bi]) { rp[bi] = base[bi]; bi++; }
-                while (re[i].filename[fi] && (bi + fi) < sizeof(rp) - 1) { rp[bi + fi] = re[i].filename[fi]; fi++; }
-                rp[bi + fi] = '\0';
-
-                int rf = (int)raw_syscall6(__NR_openat, MY_AT_FDCWD, (long)rp, MY_O_RDONLY, 0, 0, 0);
-                if (rf < 0) continue;
-
-                raw_syscall6(__NR_mmap, (long)re[i].addr, (long)re[i].size,
-                             (long)re[i].prot, MY_MAP_SHARED | MY_MAP_FIXED,
-                             (long)rf, (long)re[i].offset);
-
-                raw_syscall6(__NR_close, (long)rf, 0, 0, 0, 0, 0);
-            }
-        }
-    }
+        rustfrida_remap_prop_areas_mounted();
 
     rustfrida_wait_for_permission_to_resume(name_utf8, &revert_now);
 

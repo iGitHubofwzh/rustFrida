@@ -46,9 +46,8 @@ struct ZygotePatch {
     payload_path: String,
     #[allow(dead_code)]
     payload_file_offset: u64,
-    /// setArgV0 指针位置和原始值
-    setargv0_ptr_addr: u64,
-    setargv0_ptr_backup: [u8; 8],
+    /// setArgV0 指针位置和原始值（None = 三层扫描均 miss，走 setcontext-only 降级）
+    setargv0_slot: Option<(u64, [u8; 8])>,
     /// setcontext GOT slot（可选）
     setcontext_got: Option<(u64, [u8; 8])>,
     /// prctl GOT slot（可选，用于保留 CAP_SYS_ADMIN）
@@ -170,6 +169,7 @@ const CTX_RECV: usize = 184;
 const CTX_CLOSE: usize = 192;
 const CTX_RAISE: usize = 200;
 const CTX_PROP_REMAP: usize = 208;
+const CTX_BLOCK_IN_SETCONTEXT: usize = 216;
 /// 读取 stream 直到 EOF 或错误（用于等待子进程关闭 socket）
 fn drain_until_eof(stream: &mut std::os::unix::net::UnixStream, timeout: std::time::Duration) {
     stream.set_read_timeout(Some(timeout)).ok();
@@ -804,9 +804,11 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
     );
     mem.pwrite_all(&patch.payload_backup, patch.payload_base)?;
 
-    // 还原 setArgV0 指针
-    log_verbose!("还原子进程 {} setArgV0 指针 at 0x{:x}", pid, patch.setargv0_ptr_addr);
-    mem.pwrite_all(&patch.setargv0_ptr_backup, patch.setargv0_ptr_addr)?;
+    // 还原 setArgV0 指针（降级模式下为 None）
+    if let Some((addr, backup)) = &patch.setargv0_slot {
+        log_verbose!("还原子进程 {} setArgV0 指针 at 0x{:x}", pid, addr);
+        mem.pwrite_all(backup, *addr)?;
+    }
 
     // 还原 setcontext GOT（如果有）
     if let Some((addr, backup)) = &patch.setcontext_got {
@@ -988,7 +990,13 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     }
 
     // 6. 先构建 payload 获取替换函数地址（用于 already-patched 检测）
-    let (payload_data, replacement_setargv0_addr, replacement_setcontext_addr, replacement_prctl_addr) = build_payload(
+    let (
+        payload_data,
+        replacement_setargv0_addr,
+        replacement_setcontext_addr,
+        replacement_prctl_addr,
+        ctx_base_in_payload,
+    ) = build_payload(
         socket_name,
         loc.base,
         loc.prot,
@@ -1008,16 +1016,39 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         ));
     }
 
-    // 7. 找到 boot heap 中的 setArgV0 指针
-    //    传入 replacement 地址用于 already-patched 检测（与 Frida 一致）
-    let (setargv0_ptr_addr, setargv0_ptr_backup, already_patched) =
-        find_setargv0_pointer_in_heap(pid, &maps, setargv0_addr, Some(replacement_setargv0_addr))?;
-    log_verbose!(
-        "setArgV0 指针位置: 0x{:x} (原始值 0x{:x}){}",
-        setargv0_ptr_addr,
-        u64::from_ne_bytes(setargv0_ptr_backup),
-        if already_patched { " [already patched]" } else { "" }
-    );
+    // 7. 找到 setArgV0 指针（三层兜底扫描：boot heap → RW private → 全读）
+    //    None: 三层全 miss，启用 setcontext-only 降级阻塞（要求 setcontext GOT 可用）
+    let mut payload_data = payload_data;
+    let setargv0_search = find_setargv0_pointer_in_heap(pid, &maps, setargv0_addr, Some(replacement_setargv0_addr))?;
+    let already_patched = setargv0_search.as_ref().map(|(_, _, p)| *p).unwrap_or(false);
+
+    if let Some((addr, backup, patched)) = &setargv0_search {
+        log_verbose!(
+            "setArgV0 指针位置: 0x{:x} (原始值 0x{:x}){}",
+            addr,
+            u64::from_ne_bytes(*backup),
+            if *patched { " [already patched]" } else { "" }
+        );
+    } else {
+        // 降级模式：要求 setcontext GOT 必须可用
+        if !matches!(&setcontext_info, Some((_, Some(_)))) {
+            return Err(
+                "boot heap / RW private / 全读映射均未命中 setArgV0 指针，\
+                 且 setcontext GOT 不可用 — 无法建立阻塞点，目标 Android 版本可能不兼容。"
+                    .to_string(),
+            );
+        }
+        log_warn!("降级为 setcontext-only 阻塞（Android 版本兼容路径）");
+        let flag_offset = ctx_base_in_payload + CTX_BLOCK_IN_SETCONTEXT - CTX_SOCKET_PATH;
+        if flag_offset + 8 > payload_data.len() {
+            return Err(format!(
+                "block_in_setcontext 偏移越界: {} + 8 > {}",
+                flag_offset,
+                payload_data.len()
+            ));
+        }
+        payload_data[flag_offset..flag_offset + 8].copy_from_slice(&1u64.to_ne_bytes());
+    }
 
     // 8. SIGSTOP zygote
     let ret = unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
@@ -1058,13 +1089,19 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     mem.pwrite_all(&payload_data, loc.base)?;
     log_verbose!("Payload 写入完成");
 
-    // 10. 替换 setArgV0 指针 → zymbiote replacement
-    mem.pwrite_all(&replacement_setargv0_addr.to_ne_bytes(), setargv0_ptr_addr)?;
-    log_verbose!(
-        "setArgV0 指针已替换: 0x{:x} → 0x{:x}",
-        u64::from_ne_bytes(setargv0_ptr_backup),
-        replacement_setargv0_addr
-    );
+    // 10. 替换 setArgV0 指针 → zymbiote replacement（Some 时）
+    let setargv0_slot = if let Some((addr, backup, _)) = setargv0_search {
+        mem.pwrite_all(&replacement_setargv0_addr.to_ne_bytes(), addr)?;
+        log_verbose!(
+            "setArgV0 指针已替换: 0x{:x} → 0x{:x}",
+            u64::from_ne_bytes(backup),
+            replacement_setargv0_addr
+        );
+        Some((addr, backup))
+    } else {
+        // 降级模式：block_in_setcontext 已置 1，阻塞由 setcontext GOT 替换承担
+        None
+    };
 
     // 11. 替换 setcontext GOT slot（可选）
     //     与 Frida 一致：already-patched 时 GOT 中可能是旧的替换值，
@@ -1123,8 +1160,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         payload_backup,
         payload_path: loc.path,
         payload_file_offset: loc.file_offset,
-        setargv0_ptr_addr,
-        setargv0_ptr_backup,
+        setargv0_slot,
         setcontext_got,
         prctl_got,
     })
@@ -1342,7 +1378,7 @@ fn find_setargv0_pointer_in_heap(
     maps: &[MapEntry],
     setargv0_addr: u64,
     replaced_setargv0_addr: Option<u64>,
-) -> Result<(u64, [u8; 8], bool), String> {
+) -> Result<Option<(u64, [u8; 8], bool)>, String> {
     let original_needle = setargv0_addr.to_ne_bytes();
     let replaced_needle = replaced_setargv0_addr.map(|a| a.to_ne_bytes());
     let mem = ProcMem::open(pid)?;
@@ -1447,7 +1483,7 @@ fn find_setargv0_pointer_in_heap(
     let preferred: Vec<&MapEntry> = maps.iter().filter(|e| is_boot_heap(e)).collect();
     log_verbose!("搜索 {} 个 boot heap 区域查找 setArgV0 指针", preferred.len());
     if let Some(found) = search_candidates(&preferred)? {
-        return Ok(found);
+        return Ok(Some(found));
     }
 
     // Android 16 / 新版本 ART 上，slot 可能不再落在传统 boot heap/LinearAlloc 区域。
@@ -1462,7 +1498,7 @@ fn find_setargv0_pointer_in_heap(
         fallback.len()
     );
     if let Some(found) = search_candidates(&fallback)? {
-        return Ok(found);
+        return Ok(Some(found));
     }
 
     // 再退一层：某些新系统可能把 slot 放在只读或 shared 映射中。
@@ -1477,18 +1513,21 @@ fn find_setargv0_pointer_in_heap(
         final_fallback.len()
     );
     if let Some(found) = search_candidates(&final_fallback)? {
-        return Ok(found);
+        return Ok(Some(found));
     }
 
-    Err(format!(
-        "未在 boot heap、RW private 或其余可读区域中找到 setArgV0 指针 (0x{:x})，目标进程可能不兼容",
+    // 所有层均未命中：返回 None，上层降级为 setcontext GOT 阻塞（最后的兼容路径）
+    log_warn!(
+        "未在 boot heap、RW private 或其余可读区域中找到 setArgV0 指针 (0x{:x})，切换降级模式",
         setargv0_addr
-    ))
+    );
+    Ok(None)
 }
 
 /// 构建 zymbiote payload：解析 ELF，填充上下文
 /// 与 Frida 一致：使用可执行 LOAD 段（而非 section）提取 payload，
 /// 用 segment vm_address 计算符号偏移。不做 GOT 重定位（ARM64 PC-relative 寻址）。
+/// 返回: (payload, replacement_setargv0, replacement_setcontext, replacement_prctl, ctx_base_in_payload)
 fn build_payload(
     socket_name: &str,
     payload_base: u64,
@@ -1496,7 +1535,7 @@ fn build_payload(
     libc_funcs: &LibcFunctions,
     original_setargv0: u64,
     original_setcontext: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64, u64), String> {
+) -> Result<(Vec<u8>, u64, u64, u64, usize), String> {
     // 解析 zymbiote ELF
     let elf = goblin::elf::Elf::parse(ZYMBIOTE_ELF).map_err(|e| format!("解析 zymbiote ELF 失败: {}", e))?;
 
@@ -1601,11 +1640,19 @@ fn build_payload(
     let prop_remap = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() { 1u64 } else { 0u64 };
     log_verbose!("build_payload: prop_remap={} (PROP_PROFILE_DIR={:?})", prop_remap, PROP_PROFILE_DIR.get());
     write_u64(ctx, CTX_PROP_REMAP - CTX_SOCKET_PATH, prop_remap);
+    // block_in_setcontext 默认 0，由调用者在三层 slot 全部 miss 时 flip 为 1
+    write_u64(ctx, CTX_BLOCK_IN_SETCONTEXT - CTX_SOCKET_PATH, 0);
     // 无需 GOT 重定位：zymbiote 用 -shared -nostdlib 构建，
     // ARM64 ADRP+ADD 为 PC-relative 寻址，代码和数据在同一段内，
     // 移动到新地址后相对偏移不变。实测 .got 为空且无动态重定位。
 
-    Ok((payload, replacement_setargv0_addr, replacement_setcontext_addr, replacement_prctl_addr))
+    Ok((
+        payload,
+        replacement_setargv0_addr,
+        replacement_setcontext_addr,
+        replacement_prctl_addr,
+        ctx_base,
+    ))
 }
 
 /// 在 payload 缓冲区内写入 u64 值
@@ -1724,9 +1771,11 @@ pub(crate) fn cleanup_zygote_patches() {
                     log_error!("还原 zygote {} payload 失败: {}", patch.pid, e);
                 }
 
-                // 还原 setArgV0 指针
-                if let Err(e) = mem.pwrite_all(&patch.setargv0_ptr_backup, patch.setargv0_ptr_addr) {
-                    log_error!("还原 zygote {} setArgV0 指针失败: {}", patch.pid, e);
+                // 还原 setArgV0 指针（降级模式下为 None）
+                if let Some((addr, backup)) = &patch.setargv0_slot {
+                    if let Err(e) = mem.pwrite_all(backup, *addr) {
+                        log_error!("还原 zygote {} setArgV0 指针失败: {}", patch.pid, e);
+                    }
                 }
 
                 // 还原 setcontext GOT
