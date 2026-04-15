@@ -117,12 +117,14 @@ unsafe extern "C" fn hook_engine_log_impl(msg: *const std::os::raw::c_char) {
     let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
     let formatted = format!("[hook_engine] {}", s);
     // 错误/警告永远输出（失败类消息对排错重要），其余全部 verbose 静默
-    // 识别关键字: FAILED/failed/失败/ERROR/\033[31m (ANSI 红色)
+    // 识别关键字: FAILED/failed/失败/ERROR/WARN/\033[31m 红/\033[33m 黄
     let is_error = s.contains("FAILED")
         || s.contains("failed")
         || s.contains("失败")
         || s.contains("ERROR")
-        || s.contains("\x1b[31m");
+        || s.contains("WARN")
+        || s.contains("\x1b[31m")
+        || s.contains("\x1b[33m");
     if is_error {
         crate::jsapi::console::output_message(&formatted);
     } else {

@@ -7,7 +7,7 @@
  *
  * 策略 (对标 Frida maybeInstrumentGetOatQuickMethodHeaderInlineCopies):
  *   1. 扫描 libart 可执行段，用字节模式匹配找到内联的 GetOatQuickMethodHeader
- *   2. 对每个匹配点创建 trampoline:
+ *   2. 对每个匹配点创建 oat_thunk:
  *      - 重定位前 2 条指令 (LDR + CMN)
  *      - 如果 data_ == -1 (runtime method) → 跳到原始 runtime 路径
  *      - 保存寄存器 → 调用 is_replacement(method) → 恢复寄存器
@@ -60,7 +60,7 @@ typedef struct {
 
 typedef struct {
     uint64_t original_addr;     /* address of patched code in libart */
-    void*    trampoline;        /* allocated trampoline */
+    void*    oat_thunk;         /* inline patch 直接跳转目标 (thunk 角色,在 patch_addr 附近) */
     uint8_t  original_bytes[24]; /* saved original bytes (up to 20 needed) */
     int      patch_size;        /* bytes overwritten */
 } OatInlinePatchEntry;
@@ -71,7 +71,7 @@ static int g_oat_patch_count = 0;
 /* ============================================================================
  * is_replacement_in_table — check g_art_router_table for replacement match
  *
- * 从 trampoline 通过 BLR 调用: x0 = ArtMethod*, 返回 1 如果是 replacement
+ * 从 oat_thunk 通过 BLR 调用: x0 = ArtMethod*, 返回 1 如果是 replacement
  * ============================================================================ */
 
 static uint64_t is_replacement_in_table(uint64_t method) {
@@ -281,7 +281,7 @@ static int scan_for_oat_inline_patterns(
 /* ============================================================================
  * Trampoline generation
  *
- * 对每个匹配点, 生成 trampoline:
+ * 对每个匹配点, 生成 oat_thunk:
  *   1. 重定位前 2 条指令 (LDR W?, [Xn, #8] + CMN W?, #1)
  *   2. B.EQ → label runtime_or_replacement (如果 data_ == -1)
  *   3. 保存 caller-saved 寄存器 (d0-d7, x0-x17)
@@ -295,27 +295,42 @@ static int scan_for_oat_inline_patterns(
  *      或直接跳到 target_when_true
  * ============================================================================ */
 
-static void* generate_oat_inline_trampoline(
+/* 命名说明: 此函数返回的是 inline patch 的 ADRP/B 直接跳转目标 (thunk 角色)。
+ * 函数体内同时包含 relocated 原指令 + dispatch 逻辑 (这部分是 trampoline 角色,
+ * 回跳走绝对地址不要求近), 但 thunk 角色决定了距离约束。
+ * 命名为 thunk 而非 trampoline, 避免和真正的 callOriginal trampoline 混淆。 */
+static void* generate_oat_inline_thunk(
     uint64_t patch_addr,
     uint8_t* original_bytes,
     int patch_size,
     OatInlineMatch* match)
 {
-    /* Allocate trampoline: 优先在 ±128MB 内分配（recomp hook slot pool），
+    /* Allocate oat_thunk: 优先在 ±128MB 内分配（recomp hook slot pool），
      * 这样 apply_oat_inline_patch 可以用 ADRP+ADD+BR (12字节) 跳过来，
      * 只覆盖 pattern 的 3 条指令，不会吞掉第 4 条 ADRP。
      * 如果 near_range 失败（非 stealth2），退回 hook_alloc_near。 */
-    void* trampoline = hook_alloc_near_range(512, (void*)(uintptr_t)patch_addr, (int64_t)1 << 27);
-    if (!trampoline) {
-        trampoline = hook_alloc_near(512, (void*)(uintptr_t)patch_addr);
+    void* oat_thunk = hook_alloc_near_range(512, (void*)(uintptr_t)patch_addr, (int64_t)1 << 27);
+    if (!oat_thunk) {
+        oat_thunk = hook_alloc_near(512, (void*)(uintptr_t)patch_addr);
+        /* 检查回退后实际距离: > ±4GB 则 patch 走 16/20B MOVZ 序列, 有溢出 OAT pattern (4 指令 = 16B)
+         * 写到下一个 ArtMethod / 函数 prologue 的风险, 打警告. */
+        if (oat_thunk) {
+            int64_t dist = (int64_t)(uintptr_t)oat_thunk - (int64_t)patch_addr;
+            int64_t adrp_range = (int64_t)1 << 32;  /* ±4GB */
+            if (dist <= -adrp_range || dist >= adrp_range) {
+                hook_log("\033[33m[oat_patch] WARN: oat_thunk %p 距 patch %#lx 超 ±4GB (dist=%lld), "
+                         "patch 将走 16/20B MOVZ, 可能溢出 OAT pattern 写坏相邻代码\033[0m",
+                         oat_thunk, (unsigned long)patch_addr, (long long)dist);
+            }
+        }
     }
-    if (!trampoline) {
-        hook_log("[oat_patch] trampoline alloc failed");
+    if (!oat_thunk) {
+        hook_log("[oat_patch] oat_thunk alloc failed");
         return NULL;
     }
 
     Arm64Writer w;
-    arm64_writer_init(&w, trampoline, (uint64_t)trampoline, 512);
+    arm64_writer_init(&w, oat_thunk, (uint64_t)oat_thunk, 512);
 
     /* Labels */
     uint64_t lbl_runtime_or_replacement = arm64_writer_new_label_id(&w);
@@ -475,35 +490,35 @@ static void* generate_oat_inline_trampoline(
     }
 
     if (arm64_writer_flush(&w) != 0) {
-        hook_log("[oat_patch] trampoline flush failed");
+        hook_log("[oat_patch] oat_thunk flush failed");
         arm64_writer_clear(&w);
         arm64_relocator_clear(&reloc);
         return NULL;
     }
 
     size_t code_size = arm64_writer_offset(&w);
-    hook_flush_cache(trampoline, code_size);
+    hook_flush_cache(oat_thunk, code_size);
 
     arm64_writer_clear(&w);
     arm64_relocator_clear(&reloc);
 
-    hook_log("[oat_patch] trampoline at %p, size=%zu, method_reg=x%d",
-             trampoline, code_size, match->method_reg);
-    return trampoline;
+    hook_log("[oat_patch] oat_thunk at %p, size=%zu, method_reg=x%d",
+             oat_thunk, code_size, match->method_reg);
+    return oat_thunk;
 }
 
 /* ============================================================================
  * Patch the original code in libart
  *
  * Replace 4 instructions (16 bytes) with:
- *   LDR Xscratch, =trampoline
+ *   LDR Xscratch, =oat_thunk
  *   BR Xscratch
  *   (remaining bytes: NOP padding)
  * ============================================================================ */
 
 static int apply_oat_inline_patch(
     uint64_t patch_addr,
-    void* trampoline,
+    void* oat_thunk,
     OatInlineMatch* match,
     uint8_t* saved_original,
     int* patch_size_out)
@@ -511,7 +526,7 @@ static int apply_oat_inline_patch(
     int scratch = match->scratch_reg;
     /* Use Xscratch (64-bit version of the W scratch register) for the jump.
      * Since the original code only uses Wscratch (which is clobbered by the
-     * LDR that was relocated to the trampoline), using Xscratch is safe. */
+     * LDR that was relocated to the oat_thunk), using Xscratch is safe. */
     Arm64Reg scratch_reg = (Arm64Reg)(ARM64_REG_X0 + scratch);
 
     /* 确定 exec_pc：stealth2 (recomp) 代码在 recomp 页执行，ADRP 偏移必须基于 recomp 地址。
@@ -533,7 +548,7 @@ static int apply_oat_inline_patch(
     }
 
     uint8_t redirect[MIN_HOOK_SIZE] __attribute__((aligned(32)));
-    int jump_len = hook_write_jump_at(redirect, exec_pc, trampoline);
+    int jump_len = hook_write_jump_at(redirect, exec_pc, oat_thunk);
     if (jump_len < 0) {
         hook_log("[oat_patch] hook_write_jump failed: %d", jump_len);
         return -1;
@@ -675,17 +690,17 @@ int hook_patch_inlined_oat_header_checks(void) {
             continue;
         }
 
-        /* Generate trampoline — patch_size 由 hook_write_jump 动态决定 (12 or 16) */
+        /* 生成 oat_thunk — patch_size 由 hook_write_jump 动态决定 (12 or 16) */
         uint8_t tmp_jump[MIN_HOOK_SIZE];
         int tmp_len = hook_write_jump(tmp_jump, (void*)(uintptr_t)match_addrs[i]);
-        int tramp_patch_size = (tmp_len > 0) ? tmp_len : 16;
-        void* trampoline = generate_oat_inline_trampoline(
-            match_addrs[i], orig_bytes, tramp_patch_size, &match_infos[i]);
-        if (!trampoline) continue;
+        int thunk_patch_size = (tmp_len > 0) ? tmp_len : 16;
+        void* oat_thunk = generate_oat_inline_thunk(
+            match_addrs[i], orig_bytes, thunk_patch_size, &match_infos[i]);
+        if (!oat_thunk) continue;
 
         /* Apply the patch */
         int patch_size;
-        if (apply_oat_inline_patch(match_addrs[i], trampoline, &match_infos[i],
+        if (apply_oat_inline_patch(match_addrs[i], oat_thunk, &match_infos[i],
                                     entry->original_bytes, &patch_size) != 0) {
             hook_log("[oat_patch] failed to apply patch at %#lx",
                      (unsigned long)match_addrs[i]);
@@ -693,7 +708,7 @@ int hook_patch_inlined_oat_header_checks(void) {
         }
 
         entry->original_addr = match_addrs[i];
-        entry->trampoline = trampoline;
+        entry->oat_thunk = oat_thunk;
         entry->patch_size = patch_size;
         g_oat_patch_count++;
         patched++;
