@@ -402,7 +402,7 @@ unsafe fn detect_state_and_flags(thread: u64) -> Option<(usize, u16)> {
 /// 1. dlsym TransitionFromSuspendedToRunnable — 最安全，处理 checkpoint 和 suspend flag
 /// 2. 直接写 state_and_flags — 轻量但跳过 checkpoint（操作时间 <1μs，风险极低）
 /// 3. 无切换 fallback — 接受微小 GC 竞争风险
-unsafe fn with_runnable_thread<F, R>(env: JniEnv, f: F) -> R
+pub(in crate::jsapi::java) unsafe fn with_runnable_thread<F, R>(env: JniEnv, f: F) -> R
 where
     F: FnOnce() -> R,
 {

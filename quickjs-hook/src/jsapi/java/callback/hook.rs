@@ -108,6 +108,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         return_type_sig,
         param_types,
         class_global_ref,
+        quick_trampoline,
     ) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
@@ -142,6 +143,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             hook_data.return_type_sig.clone(),
             hook_data.param_types.clone(),
             hook_data.class_global_ref,
+            hook_data.quick_trampoline,
         )
     }; // lock released
 
@@ -257,16 +259,43 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         },
     );
 
-    // Fallback: if JS callback threw an exception, handle_result was NOT called.
-    // We must still invoke the original method to preserve semantics.
+    // Fallback: JS callback 未执行 (busy skip / 异常). 原地继续执行原方法,
+    // 不通过 JNI CallXxx 重新 invoke (避免 ART 把它当"第二次方法调用"引入额外 state).
     //
-    // 注意: JS engine busy 导致的 skip 不会走到这里 — art_router_stack_check
-    // 在路由前检测到 JS lock 不可用时直接 bypass（走 not_found → trampoline），
-    // 完整保留 Quick 约定寄存器，方法以原始状态执行，不进入 replacement/callback。
-    // 这里只处理 JS 异常等极端情况。
+    // 策略:
+    //   1. 优先 trampoline (Layer 3 compiled instance method, quick_trampoline != 0):
+    //      - Quick ABI: x0=ArtMethod, x1=this, x2+=args
+    //      - 当前 ctx 寄存器是 JNI ABI: x0=env, x1=this, x2+=args (x1..x7 对齐 Quick)
+    //      - 只需把 x0 从 env 改成原 ArtMethod, 然后 hook_invoke_trampoline 跳
+    //      - 切到 Runnable state 避免 GC 移动 heap 对象时 quick code 崩
+    //   2. 回退 invoke_original_jni (static method / 非 compiled / env==null):
+    //      - 这些方法没 quick_trampoline, 只能走 JNI CallXxx
     if !result_was_set {
-        let hook_ctx = &*ctx_ptr;
+        let hook_ctx = &mut *ctx_ptr;
         let env: JniEnv = hook_ctx.x[0] as JniEnv;
+
+        // 路径 1: trampoline 原地执行
+        // 条件: instance method + 有 quick_trampoline + env 非空 (需要切 Runnable state)
+        if !is_static && quick_trampoline != 0 && !env.is_null() {
+            // Quick ABI 约定 x0 = ArtMethod*, 覆盖 JNI env
+            // x1 (this) / x2+ (args) 在 JNI 和 Quick ABI 位置相同, 不用改
+            hook_ctx.x[0] = art_method_addr;
+
+            // 切到 Runnable state 执行 trampoline (访问 Java heap 需要)
+            let ret = super::art_class::with_runnable_thread(env, || {
+                hook_ffi::hook_invoke_trampoline(ctx_ptr, quick_trampoline as *mut std::ffi::c_void)
+            });
+
+            (*ctx_ptr).x[0] = if return_type == b'V' {
+                // void 方法, 返回值由 trampoline 的 ret 给出但实际无意义, 保留原 env 值
+                env as u64
+            } else {
+                ret
+            };
+            return;
+        }
+
+        // 路径 2: 原 JNI fallback (static method / shared stub method)
         if !env.is_null() {
             let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
             let jargs_ptr = if param_count > 0 {
