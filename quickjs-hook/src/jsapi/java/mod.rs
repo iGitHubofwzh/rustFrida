@@ -848,10 +848,12 @@ pub fn cleanup_java_hooks() {
         hook_ffi::hook_art_router_table_dump();
     }
 
-    // 【关键】先清空 C 侧 ART router 查表，切断路由 → 防止并发线程通过
-    unsafe {
-        hook_ffi::hook_art_router_table_clear();
-    }
+    // ART router table 推迟到最后清空 (cleanup_art_controller 之后, OAT patch
+    // revert 的同一阶段)。原本在这里先清 → 让 OAT inline patch 的
+    // is_replacement_in_table 立刻返回 0 → bypass 失效 → 在 in-flight 线程
+    // 栈上还有 thunk PC frame 时, 任意 WalkStack → StackMap 查找失败 → abort.
+    // 延后到 OAT patch 也移除的阶段, 这段时间继续让 bypass 工作, 覆盖更多
+    // 在途线程。
 
     // ============================================================
     // Pass 1: 恢复所有 ArtMethod 字段 + 删除 replacedMethods 映射
@@ -882,9 +884,15 @@ pub fn cleanup_java_hooks() {
         ));
     }
 
-    // 移除 artController 全局 hook (Layer 1/2/GC)
-    // 此时 ArtMethod 已全部恢复，移除 Layer 1 hook 后不会有线程进入 thunk
+    // 移除 artController 全局 hook (Layer 1/2/GC) + OAT inline patch
+    // 此时 ArtMethod 已全部恢复，移除 Layer 1 hook 后不会有线程进入 thunk。
     art_controller::cleanup_art_controller();
+
+    // 现在 OAT patch 已 revert, bypass 代码不再被 libart 调用, 清空 router 表
+    // 已无实际影响 (也避免 stale 指针在未来误匹配)
+    unsafe {
+        hook_ffi::hook_art_router_table_clear();
+    }
 
     // ============================================================
     // Pass 2: 移除 per-method hooks + 释放资源
