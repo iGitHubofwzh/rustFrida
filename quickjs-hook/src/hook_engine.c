@@ -108,17 +108,39 @@ void hook_engine_cleanup(void) {
     }
 
     /* HookEntry lifetime note:
-     * All HookEntry structs (including trampoline and thunk memory) live inside
-     * g_engine.exec_mem (the executable pool). The pool is a single mmap'd region
-     * that is released via munmap by the caller after hook_engine_cleanup() returns.
-     * Therefore we do NOT iterate the list to free individual entries here — the
-     * munmap in the caller frees the entire pool at once.
+     * All HookEntry structs (including trampoline and thunk memory) live in one of
+     * two executable pool regions:
+     *   1. 初始 pool (exec_mem)  — 由 Rust 侧 ExecMemory 拥有，调用方负责 munmap
+     *   2. 扩展 pool (pools[])   — 由 create_pool_near_range_sized 经 mmap 创建，
+     *                              本次 cleanup 负责 munmap，否则会作为隐藏 VMA
+     *                              残留进程地址空间（wwb_hook_pool，KPM 隐藏）
      *
      * WARNING: Do NOT add malloc()/free() fallback paths for alloc_entry(). If pool
      * allocations ever fall back to malloc, those pointers would be invalid after a
-     * munmap and would require explicit free() here. Keep all hook memory in the pool. */
+     * munmap and would require explicit free() here. Keep all hook memory in the pool.
+     *
+     * 调用方必须已 wait_for_in_flight_*_hook_callbacks，否则 munmap 时可能有线程
+     * 仍在 trampoline 内执行 → SIGSEGV。 */
 
-    /* Reset state — the list pointers are now dangling (pool about to be unmapped) */
+    /* 释放所有扩展 pool（保留初始 exec_mem 由调用方处理） */
+    int freed_pools = 0;
+    size_t freed_bytes = 0;
+    for (int i = 0; i < g_engine.pool_count; i++) {
+        if (g_engine.pools[i].base && g_engine.pools[i].size) {
+            munmap(g_engine.pools[i].base, g_engine.pools[i].size);
+            freed_bytes += g_engine.pools[i].size;
+            freed_pools++;
+        }
+        g_engine.pools[i].base = NULL;
+        g_engine.pools[i].size = 0;
+        g_engine.pools[i].used = 0;
+    }
+    if (freed_pools > 0) {
+        hook_log("hook_engine_cleanup: released %d pool(s), %zu bytes", freed_pools, freed_bytes);
+    }
+    g_engine.pool_count = 0;
+
+    /* Reset state — the list pointers are now dangling (pool memory unmapped) */
     g_engine.hooks = NULL;
     g_engine.free_list = NULL;
     g_engine.redirects = NULL;
