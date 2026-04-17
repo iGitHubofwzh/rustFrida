@@ -53,6 +53,8 @@
 /* --- Shared state (defined in hook_engine.c) --- */
 extern HookEngine g_engine;
 extern HookLogFn g_log_fn;
+extern ExecPoolRange g_retained_pool_ranges[MAX_EXEC_POOLS];
+extern int g_retained_pool_range_count;
 
 /* --- ART router globals (defined in hook_engine_art.c) --- */
 extern ArtRouterEntry g_art_router_table[ART_ROUTER_TABLE_MAX];
@@ -62,6 +64,16 @@ extern volatile uint64_t g_art_router_miss_count;
 /* --- Diagnostic log (hook_engine.c) --- */
 void hook_log(const char* fmt, ...);
 
+/* --- Thunk in-flight counter helpers (hook_engine.c) ---
+ * 所有 thunk 入口/出口都应调用这两个 helper，覆盖整个 thunk 生命周期。
+ * cleanup drain 轮询 g_thunk_in_flight==0 即可安全 munmap pool。 */
+void emit_thunk_inflight_inc(Arm64Writer* w);
+void emit_thunk_inflight_dec(Arm64Writer* w);
+
+/* 同步 munmap 所有 pool。仅在 drain 到 0 后由 orchestrator 调用（无 in-flight）。
+ * drain 失败路径不应调用，让 pool 泄漏到进程退出。 */
+void hook_engine_munmap_pools_direct(void);
+
 /* --- Memory management (hook_engine_mem.c) --- */
 int page_has_read_perm(uintptr_t addr);
 int read_target_safe(void* target, void* buf, size_t len);
@@ -70,7 +82,12 @@ HookEntry* alloc_entry(void);
 void free_entry(HookEntry* entry);
 int wxshadow_patch(void* addr, const void* buf, size_t len);
 int wxshadow_release(void* addr);
-int write_jump_back(void* dst, void* target, uint32_t written_regs);
+/* 写 trampoline 尾 "mov scratch, target; br scratch".
+ * emit_dec_before_jump=1: 在 mov 前插入 emit_thunk_inflight_dec，
+ * 用于 art_router 的 not_found 路径（thunk 已 tail-BR 到 trampoline, 需要
+ * 在真正离开 pool 前才 dec counter）。其他 caller 传 0 保持原有语义。 */
+int write_jump_back(void* dst, void* target, uint32_t written_regs,
+                    int emit_dec_before_jump);
 int hook_write_jump_at(void* dst, uint64_t exec_pc, void* target);
 void* hook_alloc_near_range(size_t size, void* target, int64_t max_range);
 
@@ -94,9 +111,12 @@ HookEntry* setup_hook_entry(void* target);
  * Relocate original instructions to the entry's trampoline and write jump-back.
  *
  * @param entry     HookEntry with target, original_bytes, trampoline set
+ * @param emit_dec_before_jumpback  1=trampoline 尾 dec thunk_in_flight 后再 BR
+ *                                   (art_router not_found 路径用)
+ *                                   0=正常，不 dec (attach 模式，counter 由 thunk RET 管)
  * @return          0 on success, negative error code on failure
  */
-int build_trampoline(HookEntry* entry);
+int build_trampoline(HookEntry* entry, int emit_dec_before_jumpback);
 
 /*
  * Patch the target address to jump to jump_dest.

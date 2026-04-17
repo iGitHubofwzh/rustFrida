@@ -467,13 +467,22 @@ fn main() {
         spawn::cleanup_zygote_patches();
     }
 
-    // 等待 agent 断开连接
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // 等待 agent 完成清理并主动关闭 socket (disconnected=true)。
+    // cleanup 里 drain thunk_in_flight 可能耗时 (HashMap.put 高频场景 1~2 分钟)。
+    // 不设硬超时：agent 清理完才算真正退出，否则 munmap pool 未完成，app 仍可能崩。
+    // 每 10s 打印一次进度，用户 Ctrl-C 可随时中断。
+    let start = std::time::Instant::now();
+    let mut next_report = std::time::Duration::from_secs(10);
     while !session.disconnected.load(Ordering::Acquire) {
-        if std::time::Instant::now() >= deadline {
-            log_warn!("等待 agent 断开超时 (5s)，强制退出");
-            break;
-        }
         std::thread::sleep(std::time::Duration::from_millis(100));
+        let elapsed = start.elapsed();
+        if elapsed >= next_report {
+            log_info!("等待 agent 清理中... ({}s)", elapsed.as_secs());
+            next_report += std::time::Duration::from_secs(10);
+        }
+    }
+    let total = start.elapsed();
+    if total.as_secs() >= 10 {
+        log_info!("agent 已断开 (总耗时 {}s)", total.as_secs());
     }
 }

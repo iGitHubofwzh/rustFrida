@@ -25,7 +25,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
 
     entry->replacement = replacement;
 
-    if (build_trampoline(entry) < 0) {
+    if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
@@ -47,6 +47,10 @@ void* hook_install(void* target, void* replacement, int stealth) {
 /* --- Shared thunk emit helpers --- */
 
 void emit_save_hook_context(Arm64Writer* w, uint64_t target_pc, uint64_t trampoline_ptr) {
+    /* 所有 inline hook thunk（attach / replace）在入口即 inc thunk_in_flight。
+     * 配对的 dec 在 emit_replace_epilogue 和 generate_attach_thunk 各自 RET 前。 */
+    emit_thunk_inflight_inc(w);
+
     /* HookContext: x0-x30 (31*8=248) + sp (8) + pc (8) + nzcv (8) + trampoline (8) + d[8] (64) = 344 bytes
      * Round up to 16-byte alignment: 352 bytes */
     uint64_t stack_size = 352;
@@ -126,7 +130,8 @@ void emit_replace_epilogue(Arm64Writer* w) {
     /* Deallocate stack (352 bytes) */
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 352);
 
-    /* Return to caller */
+    /* dec thunk_in_flight + ret */
+    emit_thunk_inflight_dec(w);
     arm64_writer_put_ret(w);
 }
 
@@ -216,7 +221,8 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     /* Deallocate stack */
     arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
 
-    /* Return */
+    /* dec + ret */
+    emit_thunk_inflight_dec(&w);
     arm64_writer_put_ret(&w);
 
     /* Flush any pending labels */
@@ -247,7 +253,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     entry->on_leave = on_leave;
     entry->user_data = user_data;
 
-    if (build_trampoline(entry) < 0) {
+    if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
         return HOOK_ERROR_ALLOC_FAILED;
@@ -341,7 +347,7 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
     entry->on_enter = on_enter;
     entry->user_data = user_data;
 
-    if (build_trampoline(entry) < 0) {
+    if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;

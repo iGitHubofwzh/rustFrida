@@ -38,12 +38,18 @@ pub use context::JSContext;
 pub use jsapi::console::{set_console_callback, set_verbose};
 pub use jsapi::deferred_java_init;
 pub use jsapi::hook_api::cleanup_hooks;
+pub use jsapi::hook_api::{cut_native_hooks, free_native_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
 #[cfg(feature = "qbdi")]
 pub use jsapi::hook_api::preload_qbdi_helper;
 #[cfg(feature = "qbdi")]
 pub use jsapi::hook_api::shutdown_qbdi_helper;
 pub use jsapi::java::cleanup_java_hooks;
+pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
+pub use jsapi::java::art_controller::{
+    cut_art_controller_hooks, cut_art_controller_routing_hooks,
+    cut_art_controller_walkstack_guards, free_art_controller_state,
+};
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 
@@ -210,10 +216,12 @@ impl JSEngine {
 
 impl Drop for JSEngine {
     fn drop(&mut self) {
-        // Cleanup Java hooks first (they depend on redirect thunks in the hook engine)
-        cleanup_java_hooks();
-        // Cleanup inline hooks before dropping context
-        cleanup_hooks();
+        // 外部编排器 (agent::quickjs_loader::cleanup) 在调用 cleanup_engine 之前
+        // 已按 cut → drain → free 完成所有 hook 清理。此处不再重复调用 cleanup_java_hooks
+        // / cleanup_hooks — 否则 drain 会再跑一次 30s 上限（hook registry 已空，
+        // 但 g_thunk_in_flight 可能仍 > 0，纯粹浪费时间）。
+        //
+        // 若 JSEngine 被独立 drop（非经 orchestrator），调用方负责先 cut/drain/free。
     }
 }
 

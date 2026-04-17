@@ -114,6 +114,17 @@ unsafe fn wrap_java_object_value(
 
 const MAX_JAVA_CONTAINER_DEPTH: usize = 16;
 
+/// 给 java_array_api 用的包装函数：从 local ref 转全局 + 返回 JS wrapper，
+/// 语义对标 `wrap_java_object_ref(... globalize=true)` (删 local, 加 global)。
+pub(crate) unsafe fn wrap_java_object_ref_for_array_elem(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    obj: *mut std::ffi::c_void,
+    class_name: &str,
+) -> ffi::JSValue {
+    wrap_java_object_ref(ctx, env, obj, class_name, true)
+}
+
 unsafe fn wrap_java_object_ref(
     ctx: *mut ffi::JSContext,
     env: JniEnv,

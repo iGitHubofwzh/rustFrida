@@ -132,6 +132,7 @@ fn main() {
         .allowlist_type("RecompileStats")
         .allowlist_var("ARM64_.*")
         .allowlist_var("RECOMP_.*")
+        .allowlist_var("g_thunk_in_flight")
         .use_core()
         .generate()
         .expect("Unable to generate hook_engine bindings");

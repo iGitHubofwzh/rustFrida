@@ -17,7 +17,7 @@ use crate::value::JSValue;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 
 use super::jni_core::*;
 use super::reflect::{find_class_safe, REFLECT_IDS};

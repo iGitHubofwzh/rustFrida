@@ -51,7 +51,9 @@ static void* generate_redirect_thunk(void* original_entry,
     /* Deallocate stack */
     arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
 
-    /* Tail-call to original entry: BR x16 (NOT BLR — preserves caller's LR) */
+    /* dec thunk_in_flight 然后 br x16 (dec 会 clobber x16, 之后 ldr x16 重新加载 target) */
+    emit_thunk_inflight_dec(&w);
+    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)original_entry);
     arm64_writer_put_br_reg(&w, ARM64_REG_X16);
 
     arm64_writer_flush(&w);
@@ -204,8 +206,9 @@ static void* generate_native_hook_thunk(HookCallback on_enter,
     /* Restore x18 (platform register) before returning */
     arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X18, ARM64_REG_SP, 144);
 
-    /* Deallocate stack and return */
+    /* Deallocate stack + dec + ret */
     arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
+    emit_thunk_inflight_dec(&w);
     arm64_writer_put_ret(&w);
 
     arm64_writer_flush(&w);

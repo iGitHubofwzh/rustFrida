@@ -164,6 +164,8 @@ void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0) {
 #define ROUTER_SAVED_LR_OFF  (ROUTER_FRAME_GPR_OFF + 128 + 8)  /* 152 */
 
 static void emit_art_router_prologue(Arm64Writer* w) {
+    /* 第一步：inc thunk_in_flight (使用 x16/x17 作 scratch, 此时它们尚未被使用) */
+    emit_thunk_inflight_inc(w);
     /* 分配整个帧 */
     arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
     /* FPR: d0-d7 at SP+160 */
@@ -227,6 +229,8 @@ static void emit_art_router_restore_all(Arm64Writer* w) {
     }
     /* 释放帧 */
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
+    /* 离开 thunk: dec thunk_in_flight。x16/x17 scratch，caller 即将 ldr x16, target */
+    emit_thunk_inflight_dec(w);
 }
 
 /* Debug: store X0 to g_art_router_last_x0, increment g_art_router_miss_count */
@@ -288,10 +292,11 @@ static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
     /* Overwrite saved X0 on stack (SP+0) with replacement ArtMethod* */
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
 
-    /* Restore all regs — X0 now holds replacement ArtMethod* */
+    /* Restore all regs — X0 now holds replacement ArtMethod*
+     * (dec 在 restore_all 尾部) */
     emit_art_router_restore_all(w);
 
-    /* Load replacement.entry_point_ (= jni_trampoline) and branch to it. */
+    /* Load replacement.entry_point_ (= jni_trampoline) 到 x16, BR 出 thunk */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X0, quickcode_offset);
     arm64_writer_put_br_reg(w, ARM64_REG_X16);
 }
@@ -302,7 +307,7 @@ static void emit_art_router_not_found_path(Arm64Writer* w, uint64_t lbl_not_foun
                                             uint64_t fallback_target) {
     arm64_writer_put_label(w, lbl_not_found);
     emit_art_router_debug_counters(w);
-    /* 恢复全部寄存器（包括原始 x0） */
+    /* 恢复全部寄存器（含原始 x0, dec 在 restore_all 尾部） */
     emit_art_router_restore_all(w);
     /* Jump to fallback target (relocated original or trampoline) */
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, fallback_target);
@@ -454,7 +459,7 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         return NULL;
     }
 
-    if (build_trampoline(entry) < 0) {
+    if (build_trampoline(entry, 0) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;

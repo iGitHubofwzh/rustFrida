@@ -144,6 +144,39 @@ void* hook_get_trampoline(void* target);
  */
 void hook_engine_cleanup(void);
 
+/* 扩展 pool 的地址区间描述。供 Rust 侧 safepoint 校验 + munmap 使用。 */
+typedef struct {
+    uint64_t base;
+    uint64_t size;
+} ExecPoolRange;
+
+/*
+ * 读取最近一次 hook_engine_cleanup 快照的扩展 pool 范围。
+ *
+ * hook_engine_cleanup 仅快照范围到内部表、重置 metadata，**不** munmap。
+ * Rust 侧拿到范围后做"全线程 PC/LR safepoint"检查，确认无线程驻留再 munmap。
+ *
+ * @param out 输出数组
+ * @param cap 数组容量
+ * @return 实际写入 out 的条数（可能小于内部总数，调用者应保证 cap >= MAX_EXEC_POOLS）
+ */
+int hook_engine_get_pool_ranges(ExecPoolRange* out, int cap);
+
+/* 清空快照（Rust 在 munmap 完成后调用，防止跨次 cleanup 误认） */
+void hook_engine_clear_pool_ranges(void);
+
+/* Thunk 在途计数。由 thunk 入口 LDADDAL inc, 出口 LDADDAL dec 直接配对。
+ * cleanup 侧：
+ *   1. 先反装所有 hook (切断新入口)
+ *   2. 轮询此值 → 0 表示无 in-flight thunk
+ *   3. 若归零：Rust 调 hook_engine_munmap_pools_direct 同步清
+ *   4. 若超时：放弃同步清，pool/walkstack guards 泄漏到进程退出 */
+extern volatile uint64_t g_thunk_in_flight;
+
+/* 同步 munmap 所有扩展 pool。仅在 g_thunk_in_flight == 0 时调用才安全。
+ * drain 超时不应调用此函数，让 pool 泄漏到进程退出。 */
+void hook_engine_munmap_pools_direct(void);
+
 /* Internal functions - exposed for advanced use */
 
 /*

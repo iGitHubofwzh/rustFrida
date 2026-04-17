@@ -316,6 +316,7 @@ pub fn release_all() {
     };
 
     let keys: Vec<usize> = pages.keys().cloned().collect();
+    let mut snapshot = Vec::with_capacity(keys.len());
     for orig_base in keys {
         if let Some(page) = pages.remove(&orig_base) {
             if page.registered {
@@ -329,12 +330,49 @@ pub fn release_all() {
                     );
                 }
             }
-            // 不 munmap: prctl release 后内核恢复原始页 X 权限，
-            // 但其他线程可能仍在 recomp 页上执行（icache 里有旧指令）。
-            // 保留 recomp 页直到进程退出，避免 SIGSEGV。
+            // 不在此处 munmap。保留 (ptr, size) 到 RETAINED_RANGES，由 quickjs_loader
+            // 完成全线程 PC/LR safepoint 后统一 munmap；失败则 leak 到进程退出。
+            snapshot.push((page.recomp_ptr as u64, page.recomp_total_size as u64));
         }
     }
-    log_msg("[recompiler] release_all: 所有 recomp 页已释放".to_string());
+    let mut retained = RETAINED_RANGES.lock().unwrap();
+    retained.extend(snapshot.iter().cloned());
+    log_msg(format!(
+        "[recompiler] release_all: snapshot {} recomp range(s) for caller-side munmap",
+        snapshot.len()
+    ));
+}
+
+/// 全局保留：release_all 快照的 recomp 页区间 (base, size)。
+/// 由 quickjs_loader 的 safepoint 路径读取并 munmap。
+static RETAINED_RANGES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// 获取上次 release_all 快照的 recomp 页区间列表
+pub fn get_retained_ranges() -> Vec<(u64, u64)> {
+    RETAINED_RANGES.lock().unwrap().clone()
+}
+
+/// Rust 侧完成 munmap 后清空快照
+pub fn clear_retained_ranges() {
+    RETAINED_RANGES.lock().unwrap().clear();
+}
+
+/// munmap 已快照的 recomp 页。调用者必须已通过 safepoint 验证无线程 PC 驻留。
+/// 返回 (munmap 成功数, 失败数, 释放字节数)
+pub unsafe fn munmap_retained_ranges() -> (usize, usize, u64) {
+    let ranges: Vec<(u64, u64)> = RETAINED_RANGES.lock().unwrap().drain(..).collect();
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    let mut bytes = 0u64;
+    for (base, size) in ranges {
+        if munmap(base as *mut _, size as usize) == 0 {
+            ok += 1;
+            bytes += size;
+        } else {
+            fail += 1;
+        }
+    }
+    (ok, fail, bytes)
 }
 
 /// 获取重编译页的可写指针（用于 hook 修改代码）

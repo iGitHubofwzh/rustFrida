@@ -14,6 +14,74 @@
 /* Global engine state */
 HookEngine g_engine = {0};
 
+/* hook_engine_cleanup 快照的扩展 pool 范围。Rust 侧 safepoint + munmap 共用。 */
+ExecPoolRange g_retained_pool_ranges[MAX_EXEC_POOLS];
+int g_retained_pool_range_count = 0;
+
+/* Thunk 入口 / 出口由汇编 LDADDAL 直接 inc/dec。
+ * 覆盖整个 thunk 路径 (art_router prologue→restore_all BR;
+ * inline attach save_ctx→restore→RET; inline replace save_ctx→epilogue RET)。
+ * cleanup drain 轮询此计数归 0 后再 munmap，避免栈上残留 thunk LR。 */
+volatile uint64_t g_thunk_in_flight = 0;
+
+/* LDADDAL X17, XZR, [X16] — ARMv8.1 LSE atomic add-and-ignore.
+ * Encoding: 0xF8F1021F (base 0xF8E00000 | Rs=17<<16 | Rn=16<<5 | Rt=31). */
+#define LDADDAL_X17_XZR_X16 0xF8F1021Fu
+
+/* 进入 thunk: atomic_inc(&g_thunk_in_flight)。使用 x16/x17 作 scratch，
+ * x16/x17 是 PCS IP0/IP1 caller-scratch，所有 thunk 入口均可自由使用。
+ * 每个 thunk 必须在有效 entry 之后、任何可能 BR 离开 thunk 的指令之前调用。 */
+void emit_thunk_inflight_inc(Arm64Writer* w) {
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)&g_thunk_in_flight);
+    arm64_writer_put_mov_reg_imm(w, ARM64_REG_X17, 1);
+    uint32_t insn = LDADDAL_X17_XZR_X16;
+    arm64_writer_put_bytes(w, (const uint8_t*)&insn, 4);
+}
+
+/* 离开 thunk: atomic_dec(&g_thunk_in_flight)。x17 = ~0 = -1 → LDADDAL += -1。
+ * 必须在 RET / BR 之前的最后窗口（回调、原始函数调用都已返回后）插入。 */
+void emit_thunk_inflight_dec(Arm64Writer* w) {
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)&g_thunk_in_flight);
+    arm64_writer_put_movn_reg_imm(w, ARM64_REG_X17, 0, 0);
+    uint32_t insn = LDADDAL_X17_XZR_X16;
+    arm64_writer_put_bytes(w, (const uint8_t*)&insn, 4);
+}
+
+/* 同步 munmap 所有 pool. 仅在 drain_thunk_in_flight == 0 时调用 (无 in-flight)。
+ * drain 成功 → orchestrator 调此函数释放。drain 失败 → 不调, pool 泄漏到进程退出。 */
+void hook_engine_munmap_pools_direct(void) {
+    int freed = 0;
+    uint64_t bytes = 0;
+    for (int i = 0; i < MAX_EXEC_POOLS; i++) {
+        if (g_engine.pools[i].base && g_engine.pools[i].size) {
+            if (munmap(g_engine.pools[i].base, g_engine.pools[i].size) == 0) {
+                freed++;
+                bytes += g_engine.pools[i].size;
+            }
+            g_engine.pools[i].base = NULL;
+            g_engine.pools[i].size = 0;
+            g_engine.pools[i].used = 0;
+        }
+    }
+    g_engine.pool_count = 0;
+    if (freed > 0) {
+        hook_log("munmap_pools_direct: %d pool(s), %llu bytes",
+                 freed, (unsigned long long)bytes);
+    }
+}
+
+int hook_engine_get_pool_ranges(ExecPoolRange* out, int cap) {
+    if (!out || cap <= 0) return 0;
+    int n = g_retained_pool_range_count;
+    if (n > cap) n = cap;
+    for (int i = 0; i < n; i++) out[i] = g_retained_pool_ranges[i];
+    return n;
+}
+
+void hook_engine_clear_pool_ranges(void) {
+    g_retained_pool_range_count = 0;
+}
+
 /* --- Diagnostic log infrastructure --- */
 
 HookLogFn g_log_fn = NULL;
@@ -113,31 +181,27 @@ void hook_engine_cleanup(void) {
      *   1. 初始 pool (exec_mem)  — 由 Rust 侧 ExecMemory 拥有，进程生命周期保留
      *   2. 扩展 pool (pools[])   — 由 create_pool_near_range_sized 经 mmap 创建
      *
-     * 扩展 pool 不再 munmap —— 对标 Frida (alloc.js freeSlice 只推回 free list,
-     * Memory.alloc 返回的页永不释放)。理由:
-     *   - 即使 wait_for_in_flight_*_hook_callbacks 归零, 线程仍可能:
-     *     a) 在 thunk 汇编尾巴 (regs restore + RET) 的几条指令窗口
-     *     b) 栈深处有 HashMap.put 之类 frame, PC 在 thunk, 但线程正在 park/sleep
-     *   - munmap 任一扩展 pool 都可能让这些线程崩溃 (pc=lr=unmapped 的典型症状)
-     *   - 放弃 munmap 换稳定性, VMA 漏直到进程退出 (KPM 隐藏 wwb_hook_pool 名字即可)
-     *
-     * WARNING: Do NOT add malloc()/free() fallback paths for alloc_entry(). */
+     * 扩展 pool 在此 **不 munmap**：snapshot 到 g_retained_pool_ranges，供 Rust 侧
+     * 通过 hook_engine_get_pool_ranges 查询。Rust 完成全线程 PC/LR safepoint 验证后
+     * 自行 munmap；验证失败则 leak 到进程退出（对标 Frida alloc.js 风格兜底）。 */
 
-    /* 不 munmap 扩展 pool, 只记录内存量作诊断. VMA 漏到进程退出, 新 init 分新 pool. */
-    size_t retained_bytes = 0;
-    int retained_pools = 0;
+    g_retained_pool_range_count = 0;
     for (int i = 0; i < g_engine.pool_count; i++) {
-        if (g_engine.pools[i].base && g_engine.pools[i].size) {
-            retained_bytes += g_engine.pools[i].size;
-            retained_pools++;
+        if (g_engine.pools[i].base && g_engine.pools[i].size
+                && g_retained_pool_range_count < MAX_EXEC_POOLS) {
+            g_retained_pool_ranges[g_retained_pool_range_count].base =
+                (uint64_t)g_engine.pools[i].base;
+            g_retained_pool_ranges[g_retained_pool_range_count].size =
+                (uint64_t)g_engine.pools[i].size;
+            g_retained_pool_range_count++;
         }
         g_engine.pools[i].base = NULL;
         g_engine.pools[i].size = 0;
         g_engine.pools[i].used = 0;
     }
-    if (retained_pools > 0) {
-        hook_log("hook_engine_cleanup: retained %d extension pool(s), %zu bytes (leaked until process exit, Frida-style)",
-                 retained_pools, retained_bytes);
+    if (g_retained_pool_range_count > 0) {
+        hook_log("hook_engine_cleanup: snapshot %d extension pool range(s) for caller-side munmap",
+                 g_retained_pool_range_count);
     }
     g_engine.pool_count = 0;
 

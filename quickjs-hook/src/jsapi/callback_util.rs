@@ -11,10 +11,7 @@ use crate::value::JSValue;
 use crate::JSEngine;
 use std::ffi::CString;
 use std::sync::MutexGuard;
-use std::time::{Duration, Instant};
 
-const CALLBACK_LOCK_WAIT_SPIN_LIMIT: usize = 32;
-const CALLBACK_LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(20);
 const JS_MAX_SAFE_INTEGER: u64 = 1u64 << 53;
 
 pub(crate) enum JsEngineCallbackGuard {
@@ -32,17 +29,17 @@ impl Drop for JsEngineCallbackGuard {
     }
 }
 
-/// Acquire JS_ENGINE lock for a hook callback (try_lock to avoid deadlock).
+/// Acquire JS_ENGINE lock for a hook callback.
 ///
-/// Same-thread reentrant callbacks are allowed without re-locking the mutex,
-/// because the current thread already owns the global engine.
-///
-/// Returns None if another thread holds the engine past the wait timeout.
-/// On success, calls qjs_update_stack_top for cross-thread safety.
+/// Same-thread reentrant callbacks短路返回（当前线程已持有引擎）。
+/// 其他线程无条件等锁 —— callback 必须执行，不走 skip/timeout fallback。
+/// 代价: 高并发 hook 线程串行化，吞吐降但行为正确（避免并发 ART 状态切换 /
+/// cleanup 窗口并发 JNI crash）。
+/// 成功时调用 qjs_update_stack_top 完成跨线程栈同步。
 pub(crate) unsafe fn acquire_js_engine_for_callback(
     ctx: *mut ffi::JSContext,
-    context_name: &str,
-    target_id: u64,
+    _context_name: &str,
+    _target_id: u64,
 ) -> Option<JsEngineCallbackGuard> {
     let current_thread = crate::current_thread_id_u64();
 
@@ -51,46 +48,17 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
         return Some(JsEngineCallbackGuard::Reentrant);
     }
 
-    let start = Instant::now();
-    let mut spins = 0usize;
-
-    loop {
-        match crate::JS_ENGINE.try_lock() {
-            Ok(g) => {
-                crate::mark_js_engine_owner_current_thread();
-                ffi::qjs_update_stack_top(ctx);
-                return Some(JsEngineCallbackGuard::Locked { _guard: g });
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire) == current_thread {
-                    ffi::qjs_update_stack_top(ctx);
-                    return Some(JsEngineCallbackGuard::Reentrant);
-                }
-
-                if start.elapsed() >= CALLBACK_LOCK_WAIT_TIMEOUT {
-                    output_message(&format!(
-                        "[{}] callback skipped (JS engine busy > {} ms), target={:#x}",
-                        context_name,
-                        CALLBACK_LOCK_WAIT_TIMEOUT.as_millis(),
-                        target_id
-                    ));
-                    return None;
-                }
-
-                if spins < CALLBACK_LOCK_WAIT_SPIN_LIMIT {
-                    spins += 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-            Err(std::sync::TryLockError::Poisoned(e)) => {
-                crate::mark_js_engine_owner_current_thread();
-                ffi::qjs_update_stack_top(ctx);
-                return Some(JsEngineCallbackGuard::Locked { _guard: e.into_inner() });
-            }
-        }
-    }
+    // 无条件等锁，callback 必须跑完。不走 skip/fallback 路径以避免:
+    // 1. 并发触发 JNI ART 状态切换(GC safepoint 挂)
+    // 2. cleanup 期间 ArtMethod 字段被改 vs 旧 x1 受害者
+    // 代价: 高并发 hook 下所有线程被 JS 锁串行化 → 吞吐下降，但正确。
+    let g = match crate::JS_ENGINE.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    crate::mark_js_engine_owner_current_thread();
+    ffi::qjs_update_stack_top(ctx);
+    Some(JsEngineCallbackGuard::Locked { _guard: g })
 }
 
 /// Check for JS exception, extract message, and output error.

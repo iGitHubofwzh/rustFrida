@@ -9,9 +9,11 @@ use crate::vma_name::set_anon_vma_name_raw;
 use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 
 use quickjs_hook::{
-    cleanup_engine, cleanup_hook_engine, cleanup_hooks, cleanup_java_hooks, cleanup_wxshadow_patches,
-    complete_script, get_or_init_engine, init_hook_engine, load_script, load_script_with_filename,
-    set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
+    cleanup_engine, cleanup_wxshadow_patches, complete_script,
+    cut_art_controller_routing_hooks, cut_art_controller_walkstack_guards, cut_java_hooks,
+    cut_native_hooks, drain_thunk_in_flight, free_art_controller_state, free_java_hooks,
+    free_native_hooks, get_or_init_engine, init_hook_engine, load_script,
+    load_script_with_filename, set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
 };
 #[cfg(feature = "qbdi")]
 use quickjs_hook::{preload_qbdi_helper, shutdown_qbdi_helper};
@@ -185,35 +187,115 @@ pub fn is_initialized() -> bool {
     ENGINE_INITIALIZED.load(Ordering::SeqCst)
 }
 
-/// Cleanup QuickJS resources
+/// Cleanup QuickJS resources — 4 阶段编排
+///
+/// Phase 1: **切断所有 hook 入口** (Java + Native + OAT inline)。之后 g_thunk_in_flight 只减不增。
+/// Phase 2: **drain g_thunk_in_flight → 0**。归零表示无线程在 thunk 或 callee 中。
+/// Phase 3: **释放资源** (ArtMethod 堆、JNI global ref、JS callback、JS runtime、art_controller state)。
+/// Phase 4: **hook_engine cleanup + munmap pool/recomp 页**。
 pub fn cleanup() {
-    log_msg("[quickjs] cleanup start\n".to_string());
+    use std::time::Instant;
+    let t0 = Instant::now();
+    let mut t = t0;
+    let mut stage = |label: &str, prev: &mut Instant| {
+        let now = Instant::now();
+        let delta = now.duration_since(*prev).as_millis();
+        let total = now.duration_since(t0).as_millis();
+        log_msg(format!("[quickjs] {} (+{}ms, total {}ms)\n", label, delta, total));
+        *prev = now;
+    };
+
+    stage("cleanup start", &mut t);
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    // Unhook Java hooks (restore ArtMethod + OAT inline patches on recomp 页)
-    log_msg("[quickjs] cleanup_java_hooks\n".to_string());
-    cleanup_java_hooks();
-    // Unhook all inline hooks while the JS context (ctx) is still valid
-    log_msg("[quickjs] cleanup_hooks\n".to_string());
-    cleanup_hooks();
+
+    // ============================================================
+    // Phase 1: 切断所有 "入口 / 路由" hook，阻止新 thunk 进入。
+    //   - Java per-method inline patch (Layer 3)
+    //   - Native hook (export 入口)
+    //   - art_controller 路由: Layer1 (shared stub) / Layer2 (DoCall) / GC 同步 / Fixup
+    //
+    //   **刻意保留** walkstack 防护 (OAT header hook / PrettyMethod / 内联 OAT patch) ——
+    //   它们只影响 ART 看到 thunk frame 时会不会 abort，与路由无关。
+    //   必须等 drain=0 (栈上无任何 thunk PC) 后才能拆。
+    // ============================================================
+    cut_java_hooks();
+    stage("phase1 cut_java_hooks", &mut t);
+    cut_native_hooks();
+    stage("phase1 cut_native_hooks", &mut t);
+    cut_art_controller_routing_hooks();
+    stage("phase1 cut_art_controller_routing", &mut t);
+
+    // ============================================================
+    // Phase 2: drain g_thunk_in_flight → 0
+    //   归零 → 无 in-flight thunk → 栈上不可能再有 thunk LR
+    //   → OAT bypass 可以安全卸载
+    //   → pool 可以安全 munmap
+    // ============================================================
+    let drained = drain_thunk_in_flight();
+    stage("phase2 drain_thunk_in_flight", &mut t);
+
+    if !drained {
+        log_msg(format!(
+            "[quickjs] drain 未归零：保留 OAT bypass + pool + 所有资源 (原子不变量). \
+             Agent 退出后 hunter 继续带着 bypass 跑, WalkStack 见到残留 thunk 也不炸. \
+             资源 leak 到进程退出 (total {}ms)\n",
+            t0.elapsed().as_millis()
+        ));
+        return;
+    }
+
+    // ============================================================
+    // Phase 3: 释放资源 (drain 归零后才安全拆 OAT bypass)
+    //   OAT bypass 拆和 pool munmap 是原子事件 —— 一旦拆了 bypass, pool 必须立刻 munmap
+    //   (否则残留 PC 访问 pool → no bypass 保护 → WalkStack 炸)
+    // ============================================================
+    cut_art_controller_walkstack_guards();
+    stage("phase3 cut_art_controller_walkstack_guards", &mut t);
+    free_art_controller_state();
+    stage("phase3 free_art_controller_state", &mut t);
+    free_java_hooks();
+    stage("phase3 free_java_hooks", &mut t);
+    free_native_hooks();
+    stage("phase3 free_native_hooks", &mut t);
     #[cfg(feature = "qbdi")]
     {
-        log_msg("[quickjs] shutdown_qbdi_helper\n".to_string());
         shutdown_qbdi_helper();
+        stage("phase3 shutdown_qbdi_helper", &mut t);
     }
-    // Destroy JSEngine (JS_FreeContext + JS_FreeRuntime)
-    log_msg("[quickjs] cleanup_engine\n".to_string());
     cleanup_engine();
-    // Reset hook engine state and free the executable pool metadata
-    log_msg("[quickjs] cleanup_hook_engine\n".to_string());
-    cleanup_hook_engine();
-    // 清理 writeBytes(bytes, 1) 装的 wxshadow patch. 这些不进 hook_engine,
-    // 所以 hook_engine_cleanup 看不到, 需要独立的轨迹清理.
-    log_msg("[quickjs] cleanup_wxshadow_patches\n".to_string());
+    stage("phase3 cleanup_engine", &mut t);
+
+    // ============================================================
+    // Phase 4: 同步释放 pool + recomp (drain 已归零, 确认无 in-flight)
+    //
+    // drain=true 路径走快道：直接 Rust/C 同步 munmap。Janitor 存在但不会被
+    // 触发 (counter=0, 无 thunk 进入)。若未来 agent 再次 init, pool 从头分配。
+    // ============================================================
     cleanup_wxshadow_patches();
-    // 最后释放 recomp 页: prctl release 注销重定向，内核恢复原始页 X 权限。
-    // 必须在所有 hook cleanup 之后: OAT patch restore 需要写 recomp 页，
-    // hook_engine_cleanup 恢复 slot 原始字节也在 recomp 跳板区。
-    // 不 munmap: 其他线程 icache 可能仍有 recomp 页指令。
+    stage("phase4 cleanup_wxshadow_patches", &mut t);
     crate::recompiler::release_all();
-    log_msg("[quickjs] cleanup done\n".to_string());
+    stage("phase4 release_all_recomp", &mut t);
+    // 先同步 munmap recomp 页 (Rust 侧管理)
+    let (recomp_ok, recomp_fail, recomp_bytes) =
+        unsafe { crate::recompiler::munmap_retained_ranges() };
+    if recomp_ok + recomp_fail > 0 {
+        log_msg(format!(
+            "[quickjs] munmap recomp: ok={} fail={} bytes={}\n",
+            recomp_ok, recomp_fail, recomp_bytes
+        ));
+    }
+    // 再同步 munmap hook pool (C 侧 g_engine.pools[])
+    unsafe {
+        quickjs_hook::ffi::hook::hook_engine_munmap_pools_direct();
+    }
+    stage("phase4 munmap_pools_direct", &mut t);
+
+    log_msg(format!(
+        "[quickjs] cleanup done (total {}ms)\n",
+        t0.elapsed().as_millis()
+    ));
 }
+
+// 注：旧的 munmap_retained_ranges_final (快照 snap → munmap) 已废弃，由
+// hook_engine_munmap_pools_direct (C 侧直读 g_engine.pools[] 同步 munmap) 取代。
+// drain 超时路径不释放 pool/recomp/walkstack guards，泄漏到进程退出。

@@ -438,6 +438,10 @@ pub(super) fn ensure_art_controller_initialized(
     // 线程后 patch，我们目前没有这个机制。
     // replacement 方法的 quickCode 仍指向 jni_trampoline（不经过 Layer 1），
     // 路由通过 Layer 2 (DoCall) 和 Layer 3 (per-method hook) 覆盖。
+    //
+    // 实测 Layer 1 对 has_independent_code=true 方法 100% 冗余（Layer 3 已截获
+    // compiled caller 的 BL）。保留 Layer 1 作为 deopt / GC FixupStaticTrampolines
+    // 把 entry_point 改回 libart trampoline 的 edge case 安全网。
     let stubs = [
         ("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge),
         ("quick_resolution_trampoline", bridge.quick_resolution_trampoline),
@@ -497,27 +501,38 @@ pub(super) fn ensure_art_controller_initialized(
     }
 
     // --- Layer 2: DoCall hook (解释器路径) ---
-    for (i, &addr) in bridge.do_call_addrs.iter().enumerate() {
-        if addr == 0 {
-            continue;
+    // **实验性跳过**: DoCall 触发率极高 (~每 interpreter 方法调度 1 次, 实测 98 万次),
+    // 命中率极低 (实测 0.05%, 472/98 万). 对 compiled-only hook 场景纯冗余, 且
+    // 任何 Java 阻塞方法 (synchronized/wait/IO) 都会把 DoCall thunk 卡在 trampoline 里
+    // → thunk_in_flight counter 无法归 0, cleanup drain 超时.
+    //
+    // 保留代码便于未来对 non-compiled / interpreter-only 方法需要时再启用.
+    let skip_do_call = true;
+    if !skip_do_call {
+        for (i, &addr) in bridge.do_call_addrs.iter().enumerate() {
+            if addr == 0 {
+                continue;
+            }
+            let (ha, sf) = unsafe { prepare_hook_target(addr, std::ptr::null_mut()) }.unwrap_or((addr, 0));
+            let ret = unsafe {
+                hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_do_call_enter), None, std::ptr::null_mut(), sf)
+            };
+            if ret == 0 {
+                unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), addr) };
+                do_call_targets.push(addr);
+                output_verbose(&format!(
+                    "[artController] Layer 2: DoCall[{}] hook 安装成功: {:#x}",
+                    i, addr
+                ));
+            } else {
+                output_verbose(&format!(
+                    "[artController] Layer 2: DoCall[{}] hook 安装失败: {:#x} (ret={})",
+                    i, addr, ret
+                ));
+            }
         }
-        let (ha, sf) = unsafe { prepare_hook_target(addr, std::ptr::null_mut()) }.unwrap_or((addr, 0));
-        let ret = unsafe {
-            hook_ffi::hook_attach(ha as *mut std::ffi::c_void, Some(on_do_call_enter), None, std::ptr::null_mut(), sf)
-        };
-        if ret == 0 {
-            unsafe { try_fixup_trampoline(hook_ffi::hook_get_trampoline(ha as *mut std::ffi::c_void), addr) };
-            do_call_targets.push(addr);
-            output_verbose(&format!(
-                "[artController] Layer 2: DoCall[{}] hook 安装成功: {:#x}",
-                i, addr
-            ));
-        } else {
-            output_verbose(&format!(
-                "[artController] Layer 2: DoCall[{}] hook 安装失败: {:#x} (ret={})",
-                i, addr, ret
-            ));
-        }
+    } else {
+        output_verbose("[artController] Layer 2: DoCall hook 已跳过 (skip_do_call=true)");
     }
 
     // --- GC 同步 hooks ---
@@ -932,20 +947,21 @@ unsafe extern "C" fn on_gc_sync_enter(_ctx_ptr: *mut hook_ffi::HookContext, _use
 
 /// Fix 4: GetOatQuickMethodHeader replace-mode 回调
 ///
-/// 对 replacement ArtMethod 返回 dummy header，防止 ART 查找堆分配方法的 OAT 代码头。
-/// 返回 NULL 会导致 API 36 的 WalkStack 空指针崩溃（offset 0x18 解引用），
-/// 所以改为返回一个全零的静态 dummy header，让 WalkStack 安全跳过。
-/// 对其他方法调用原始实现。
+/// 对标 Frida (android.js:1981): **对 replacement ArtMethod 返回 NULL**。
+/// NULL 让 ART StackVisitor 走 `IsNative()` 兜底路径，把 frame 标记为 native method,
+/// Thread.getStackTrace() / Throwable.printStackTrace() 能显示
+/// `className.methodName(Native method)`，和 Frida 行为一致。
 ///
-/// dummy header 全零意味着 code_size=0，WalkStack 的 PC 范围检查不通过，
-/// 会跳过该帧继续遍历，不会崩溃。
+/// 之前用全零 dummy header 规避 NULL deref, 副作用是 WalkStack 认为 header 有效
+/// 但 code_size=0 → 整帧被 skip → 栈里看不到 replacement。
+///
+/// NULL deref 的兜底在 `walkstack_sigsegv_handler`：精准匹配 fault_addr == 0x18 的
+/// OAT header 字段访问, 把寄存器指向 dummy buffer 重执行。Frida 用等价的
+/// `fixupArtQuickDeliverExceptionBug` 做同样的事。
 unsafe extern "C" fn on_get_oat_quick_method_header(
     ctx_ptr: *mut hook_ffi::HookContext,
     _user_data: *mut std::ffi::c_void,
 ) {
-    // 64 字节全零 dummy header — 足够覆盖 OatQuickMethodHeader 各版本的字段
-    static DUMMY_OAT_HEADER: [u8; 64] = [0u8; 64];
-
     if ctx_ptr.is_null() {
         return;
     }
@@ -953,8 +969,8 @@ unsafe extern "C" fn on_get_oat_quick_method_header(
     let method = ctx.x[0]; // ArtMethod* this
 
     if is_replacement_method(method) {
-        // replacement method → 返回 dummy header（非 NULL，但所有字段为 0）
-        ctx.x[0] = DUMMY_OAT_HEADER.as_ptr() as u64;
+        // replacement method → NULL (让 StackVisitor 走 IsNative 兜底)
+        ctx.x[0] = 0;
     } else {
         // 非 replacement → 调用原始实现
         let trampoline = ctx.trampoline;
@@ -1135,61 +1151,112 @@ unsafe fn install_walkstack_sigsegv_guard() {
 // 清理
 // ============================================================================
 
-/// 清理所有 artController 全局 hook
+/// Phase 1 - 切断所有 "路由入口" 类 hook，阻止新 thunk 进入。
 ///
-/// 移除 Layer 1 (共享 stub 路由 hook) 和 Layer 2 (DoCall hook)。
-pub(super) fn cleanup_art_controller() {
-    // 恢复 instrumentation 状态 (在移除 hooks 之前)
-    unsafe {
-        restore_forced_interpret_only();
-    }
-
-    let state = {
-        let mut guard = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
-        guard.take()
+/// 包含 Layer1 (shared stub) / Layer2 (DoCall) / GC 同步 / FixupStaticTrampolines。
+/// 这些 hook 要么把调用 route 进 thunk，要么在 GC/class-init 里把 entry_point
+/// 重写回 thunk —— 不切掉它们，drain 永远追不上 inflow。
+///
+/// 刻意不动 OAT header / PrettyMethod / 内联 OAT patch 等 walkstack 防护 ——
+/// 它们要在 drain=0 之后、pool munmap 之前才 cut (见 cut_art_controller_walkstack_guards)。
+pub fn cut_art_controller_routing_hooks() {
+    let targets: Vec<(&'static str, u64)> = {
+        let guard = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut all: Vec<(&str, u64)> = Vec::new();
+        for &addr in &state.shared_stub_targets { all.push(("Layer1", addr)); }
+        for &addr in &state.do_call_targets { all.push(("Layer2", addr)); }
+        for &addr in &state.gc_hook_targets { all.push(("GC", addr)); }
+        if state.fixup_hook_target != 0 { all.push(("Fixup", state.fixup_hook_target)); }
+        all
     };
-    let state = match state {
-        Some(s) => s,
-        None => return, // 从未初始化，无需清理
-    };
 
-    output_verbose("[artController] 开始清理全局 ART hook...");
-
-    // 收集所有需要移除的地址，统一移除
-    let mut all_targets: Vec<(&str, u64)> = Vec::new();
-    for &addr in &state.shared_stub_targets {
-        all_targets.push(("Layer1", addr));
-    }
-    for &addr in &state.do_call_targets {
-        all_targets.push(("Layer2", addr));
-    }
-    for &addr in &state.gc_hook_targets {
-        all_targets.push(("GC", addr));
-    }
-    if state.oat_header_hook_target != 0 {
-        all_targets.push(("OatHeader", state.oat_header_hook_target));
-    }
-    if state.fixup_hook_target != 0 {
-        all_targets.push(("Fixup", state.fixup_hook_target));
-    }
-    if state.pretty_method_hook_target != 0 {
-        all_targets.push(("PrettyMethod", state.pretty_method_hook_target));
+    if targets.is_empty() {
+        return;
     }
 
-    for (_label, addr) in &all_targets {
+    output_verbose(&format!(
+        "[artController] cut routing: {} 个 hook_remove (Layer1/2/GC/Fixup)",
+        targets.len()
+    ));
+
+    for (_label, addr) in &targets {
         unsafe {
             hook_ffi::hook_remove(*addr as *mut std::ffi::c_void);
         }
     }
+}
 
-    // 恢复内联 OAT header patch
-    unsafe {
-        let restored = hook_ffi::hook_restore_inlined_oat_header_patches();
-        if restored > 0 {
-            output_verbose(&format!("[artController] 恢复了 {} 个内联 OAT patch", restored));
+/// Phase 3 - 切断 walkstack 防护类 hook (drain=0 之后才安全)。
+///
+/// 包含 OAT header replace / PrettyMethod / 内联 OAT header patch。
+/// 这些 hook 本身不路由进 thunk，只是让 ART WalkStack 在看到 thunk frame 时不 abort。
+/// 在 drain 归零 (栈上无任何 thunk PC) 之后才能 cut。
+pub fn cut_art_controller_walkstack_guards() {
+    let targets: Vec<(&'static str, u64)> = {
+        let guard = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut all: Vec<(&str, u64)> = Vec::new();
+        if state.oat_header_hook_target != 0 { all.push(("OatHeader", state.oat_header_hook_target)); }
+        if state.pretty_method_hook_target != 0 { all.push(("PrettyMethod", state.pretty_method_hook_target)); }
+        all
+    };
+
+    if !targets.is_empty() {
+        output_verbose(&format!(
+            "[artController] cut walkstack guards: {} 个 hook_remove",
+            targets.len()
+        ));
+        for (_label, addr) in &targets {
+            unsafe {
+                hook_ffi::hook_remove(*addr as *mut std::ffi::c_void);
+            }
         }
     }
 
-    LAST_SEEN_ART_METHOD.store(0, Ordering::Relaxed);
-    output_verbose("[artController] 全局 ART hook 清理完成");
+    // 恢复内联 OAT header patch (直写的内联检查代码)
+    unsafe {
+        let restored = hook_ffi::hook_restore_inlined_oat_header_patches();
+        if restored > 0 {
+            output_verbose(&format!(
+                "[artController] 恢复 {} 个内联 OAT patch",
+                restored
+            ));
+        }
+    }
+}
+
+/// 兼容旧调用：路由 + walkstack 防护一起 cut。
+/// 新代码请分阶段调用 cut_art_controller_routing_hooks / cut_art_controller_walkstack_guards。
+pub fn cut_art_controller_hooks() {
+    cut_art_controller_routing_hooks();
+    cut_art_controller_walkstack_guards();
+}
+
+/// Phase 3 - 释放 art_controller 状态 + 恢复 instrumentation (drain 之后)。
+pub fn free_art_controller_state() {
+    unsafe {
+        restore_forced_interpret_only();
+    }
+
+    let taken = {
+        let mut guard = ART_CONTROLLER.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take()
+    };
+    if taken.is_some() {
+        LAST_SEEN_ART_METHOD.store(0, Ordering::Relaxed);
+        output_verbose("[artController] 全局 ART hook 状态已释放");
+    }
+}
+
+/// 兼容旧调用：cut → free 一次性做完。新代码请按 phase 排程。
+pub(super) fn cleanup_art_controller() {
+    cut_art_controller_hooks();
+    free_art_controller_state();
 }

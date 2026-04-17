@@ -45,8 +45,19 @@
     }
 
     function _wrapJavaReturn(value) {
+        if (value === null || value === undefined) return value;
         if (_isWrappedJavaObject(value)) {
             return _wrapJavaObj(value.__jptr, value.__jclass);
+        }
+        // Rust marshal 把 Java 对象数组自动转 JS Array, 元素为裸 {__jptr, __jclass}。
+        // 这里递归把每个元素包成 Proxy, 让 `arr[i].method()` 生效。
+        if (Array.isArray(value)) {
+            for (var i = 0; i < value.length; i++) {
+                var e = value[i];
+                if (_isWrappedJavaObject(e)) {
+                    value[i] = _wrapJavaObj(e.__jptr, e.__jclass);
+                }
+            }
         }
         return value;
     }
@@ -470,6 +481,7 @@
     // 内部：用已存在的 target 创建 Proxy（共享 mutable target 用于"释放"语义）
     function _wrapJavaObjOnTarget(target) {
         var fieldWrappers = {};  // per-instance FieldWrapper 缓存
+        var isArray = typeof target.__jclass === "string" && target.__jclass[0] === "[";
 
         var handler = {
             get: function(target, prop) {
@@ -481,12 +493,36 @@
                 if (prop === "$orig") return target.__$orig;
                 if (prop === Symbol.toPrimitive) return function(hint) {
                     if (hint === "string" || hint === "default") {
+                        if (isArray) {
+                            try {
+                                var n = Java._arrayLength(target.__jptr);
+                                return "[" + target.__jclass + " length=" + n + "]";
+                            } catch(e) {}
+                        }
                         try {
                             return String(_invokeJavaMethod(target.__jptr, target.__jclass, "toString", "()Ljava/lang/String;", []));
                         } catch(e) {}
                     }
                     return "[JavaObject:" + target.__jclass + "@" + target.__jptr + "]";
                 };
+                if (typeof prop === "symbol") return undefined;
+
+                // Java 数组特殊路径：`.length` + 数字索引 → JNI array op
+                if (isArray) {
+                    if (prop === "length") {
+                        return Java._arrayLength(target.__jptr);
+                    }
+                    // 数字索引 (prop 可能是字符串 "0" 或实际数字转来的 string)
+                    if (typeof prop === "string" && /^\d+$/.test(prop)) {
+                        return Java._arrayGet(target.__jptr, +prop, target.__jclass);
+                    }
+                    // toString 特殊: 让 JS side 显示一个简略摘要
+                    if (prop === "toString") return function() {
+                        var n = Java._arrayLength(target.__jptr);
+                        return "[" + target.__jclass + " length=" + n + "]";
+                    };
+                    // 其他 prop 走通用路径（可能是 Object 方法比如 hashCode）
+                }
                 if (typeof prop !== "string") return undefined;
                 if (prop === "toString") return function() {
                     try {

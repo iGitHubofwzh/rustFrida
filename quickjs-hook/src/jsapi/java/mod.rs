@@ -30,11 +30,12 @@ macro_rules! jni_fn {
 pub(crate) const PAC_STRIP_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 mod art_class;
-mod art_controller;
+pub mod art_controller;
 mod art_method;
 mod art_thread;
 mod callback;
 mod heap_scan;
+mod java_array_api;
 mod java_choose_api;
 mod java_field_api;
 mod java_hook_api;
@@ -718,6 +719,22 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "_readField", js_java_read_field, 5);
         add_cfunction_to_object(ctx_ptr, java_obj, "_writeField", js_java_write_field, 6);
 
+        // Java 数组访问 (arr.length / arr[i])
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_arrayLength",
+            java_array_api::js_java_array_length,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_arrayGet",
+            java_array_api::js_java_array_get,
+            3,
+        );
+
         // 检测面测试 API
         add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
         add_cfunction_to_object(
@@ -849,7 +866,12 @@ pub(super) unsafe fn free_java_hook_resources(data: &JavaHookData, env_opt: Opti
 /// 因此不能再次 lock()（非重入锁会死锁）。使用 try_lock() 安全处理两种情况：
 /// - WouldBlock: 当前线程已持有锁（正常路径），JS callback 释放安全
 /// - Ok: 意外的非锁定路径调用，获取锁后释放 JS callback
-pub fn cleanup_java_hooks() {
+/// Phase 1 - 切断 Java hook 入口 (不释放资源)。
+///
+/// 新 caller 立即走原方法，不再进入 thunk；in-flight counter 之后只减不增。
+/// 必须与 `cut_native_hooks` / `cut_art_controller_hooks` 一起在 drain 之前完成，
+/// 否则 g_thunk_in_flight 永远 ≠ 0。
+pub fn cut_java_hooks() {
     if let Ok(env) = ensure_jni_initialized() {
         unsafe {
             cleanup_enumerated_classloader_refs(env);
@@ -857,101 +879,84 @@ pub fn cleanup_java_hooks() {
         }
     }
 
-    // DEBUG: cleanup 前打印 art_router hit/miss 计数
-    unsafe {
-        let mut last_x0: u64 = 0;
-        let mut miss_count: u64 = 0;
-        let mut hit_count: u64 = 0;
-        hook_ffi::hook_art_router_get_debug(&mut last_x0, &mut miss_count);
-        hook_ffi::hook_art_router_get_hit_debug(&mut hit_count, std::ptr::null_mut());
-        let do_call_total = art_controller::DO_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        let do_call_hits = art_controller::DO_CALL_HIT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        output_verbose(&format!(
-            "[art_router_debug] cleanup: router_hit={}, router_miss={}, last_x0={:#x}, docall_total={}, docall_hit={}",
-            hit_count, miss_count, last_x0, do_call_total, do_call_hits
-        ));
-        hook_ffi::hook_art_router_table_dump();
-    }
-
-    // ============================================================
-    // Phase 1 - 切断入口: unpatch per-method hook 字节 + 恢复 ArtMethod 字段
-    //
-    // 目的: 新 caller 立即走原方法, 不再进入我们的 thunk, in-flight 计数只减不增.
-    // 这是 drain+verify 策略的前提.
-    //
-    // 顺序: per-method hook 字节先 unpatch (原子 4B 写, 立即生效),
-    // 再恢复 ArtMethod 字段. 这样 Layer 3 和 Layer 1/2 两条路径都被切断.
-    // ============================================================
-    {
-        let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(registry) = guard.as_ref() {
-            for (_art_method, data) in registry.iter() {
-                unsafe {
-                    // 1a: unpatch per-method hook 首字节 → 新 caller 立即走原方法
-                    remove_per_method_hook(data);
-                    // 1b: 恢复 ArtMethod 字段 (Layer 1/2 路由也切断)
-                    restore_art_method_fields(data);
-                    // 1c: router 表条目保留 → OAT bypass 对 in-flight 仍生效
-                    //     router 表清空放到 Phase 3 之后
-                }
-            }
-        }
-    } // guard dropped
-
-    // ============================================================
-    // Phase 2 - Drain: 循环 500ms 粒度等待 in-flight callback 全部退出
-    //
-    // Phase 1 已切断新 caller 入口, in-flight counter 只减不增, 必然归 0.
-    // 每 500ms 检查一次 — counter 归 0 立即推进, 否则继续等.
-    // 总上限 30s 兜底, 超过说明某个回调卡在 JS I/O 或 Java 锁里, 放弃等待.
-    // ============================================================
-    {
-        let total_limit = std::time::Duration::from_secs(30);
-        let start = std::time::Instant::now();
-        let mut rounds = 0u32;
-        loop {
-            if wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(500)) {
-                // counter 归 0, 正常退出
-                if rounds > 0 {
-                    output_verbose(&format!("[java cleanup] drain 完成 ({} 轮 500ms)", rounds + 1));
-                }
-                break;
-            }
-            rounds += 1;
-            let remaining = in_flight_java_hook_callbacks();
-            if start.elapsed() >= total_limit {
-                output_verbose(&format!(
-                    "[java cleanup] drain 总超时 {}s, remaining={} (继续但可能崩)",
-                    total_limit.as_secs(),
-                    remaining
-                ));
-                break;
-            }
-            // 每 10 轮 (5s) 输出一次诊断, 避免日志爆炸
-            if rounds % 10 == 0 {
-                output_verbose(&format!(
-                    "[java cleanup] drain 进行中 ({} 轮, {}ms 已过), remaining={}",
-                    rounds,
-                    start.elapsed().as_millis(),
-                    remaining
-                ));
+    let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(registry) = guard.as_ref() {
+        for (_art_method, data) in registry.iter() {
+            unsafe {
+                // unpatch per-method hook 首字节 → 新 caller 立即走原方法
+                remove_per_method_hook(data);
+                // 恢复 ArtMethod 字段 (Layer 1/2 路由也切断)
+                restore_art_method_fields(data);
+                // router 表条目保留 → OAT bypass 对 in-flight 仍生效
+                // router 表清空放到 free 阶段
             }
         }
     }
+}
 
-    // ============================================================
-    // Phase 3 - 安全移除: 此时无 in-flight, revert OAT patch / Layer 1 hook 安全
-    // ============================================================
-    art_controller::cleanup_art_controller();
+/// Phase 2 - Drain g_thunk_in_flight → 0。返回 true 表示真的归零，false 超时。
+///
+/// 调用方必须保证所有 hook 入口（Java + native + OAT inline）已在此之前切断，
+/// 否则 counter 可能永不归 0 → 走到 30s 硬上限超时。
+///
+/// **超时处理很重要**：超时意味着有线程阻塞在 callback 深处的 JNI/Java monitor，
+/// 它们未来可能醒来返回 thunk。**false 时调用方必须跳过 free 资源和 munmap**，
+/// 否则线程醒来会访问已释放内存 → 崩溃。安全做法：让资源 leak 到进程退出。
+///
+/// 循环 500ms 粒度轮询，每 5s 输出诊断，30s 总上限兜底。
+/// 诊断走 `output_message` 保证始终可见（不依赖 VERBOSE 开关）。
+pub fn drain_thunk_in_flight() -> bool {
+    use crate::jsapi::console::output_message;
+    // 30s 硬上限。Phase 1 已 cut 全部 routing 入口，counter 只减不增；
+    // 到 30s 还没归零 = 剩下的线程 parked 在 hooked 深处（Looper.pollOnce / JNI
+    // monitor 等），醒不过来也没关系 —— 调用方见 false 会走 leak 分支，
+    // 保留 pool + walkstack guards 到进程退出，parked 线程 PC 永远 valid。
+    let total_limit = std::time::Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    let initial = in_flight_java_hook_callbacks();
+    output_message(&format!("[drain] start, thunk_in_flight={}", initial));
+    let mut rounds = 0u32;
+    loop {
+        if wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(500)) {
+            output_message(&format!(
+                "[drain] done, thunk_in_flight=0 after {}ms ({} rounds)",
+                start.elapsed().as_millis(),
+                rounds + 1
+            ));
+            return true;
+        }
+        rounds += 1;
+        let remaining = in_flight_java_hook_callbacks();
+        if start.elapsed() >= total_limit {
+            output_message(&format!(
+                "[drain] TIMEOUT {}s, thunk_in_flight={} — 跳过 free/munmap, leak 到进程退出",
+                total_limit.as_secs(),
+                remaining
+            ));
+            return false;
+        }
+        if rounds % 10 == 0 {
+            output_message(&format!(
+                "[drain] round {}, {}ms, thunk_in_flight={}",
+                rounds,
+                start.elapsed().as_millis(),
+                remaining
+            ));
+        }
+    }
+}
 
-    // router 表最后清 (此时 OAT patch 已 revert, bypass 路径不再走)
+/// Phase 3 - 释放 Java hook 资源（clone/replacement ArtMethod、JNI global ref、JS callback）。
+///
+/// 必须在 `drain_thunk_in_flight` 之后调用。此时无任何线程在 thunk 或其 callee 中，
+/// 释放 ArtMethod 堆内存 + JNI ref 安全。router 表最后清空。
+pub fn free_java_hooks() {
+    // router 表清空 (art_controller 的 OAT patch 已由 cut_art_controller_hooks revert)
     unsafe {
         hook_ffi::hook_art_router_table_clear();
     }
 
-    // ============================================================
-    // Phase 4 - 释放资源: delete_replacement_method + native trampoline + 资源
-    // ============================================================
+    // delete_replacement_method (先批量做，避免后面 drop guard 释放)
     {
         let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(registry) = guard.as_ref() {
@@ -975,4 +980,17 @@ pub fn cleanup_java_hooks() {
             }
         }
     }
+}
+
+/// 兼容旧调用: 依次执行 cut → drain → art_controller cleanup → free。
+/// drain 超时则跳过 free（避免线程苏醒踩已释放资源）。
+/// 新代码应该用编排器模式 (cut_* → drain → free_*) 以便与 native/OAT 并行切断。
+pub fn cleanup_java_hooks() {
+    cut_java_hooks();
+    let drained = drain_thunk_in_flight();
+    if !drained {
+        return;
+    }
+    art_controller::cleanup_art_controller();
+    free_java_hooks();
 }

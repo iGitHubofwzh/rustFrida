@@ -429,7 +429,8 @@ static int finalize_jump_writer(Arm64Writer* w) {
  *   - Fall back to X16 (IP0) if X17 is written
  *   - If both are written, still use X17 (extremely rare edge case)
  */
-int write_jump_back(void* dst, void* target, uint32_t written_regs) {
+int write_jump_back(void* dst, void* target, uint32_t written_regs,
+                    int emit_dec_before_jump) {
     if (!dst || !target) {
         return HOOK_ERROR_INVALID_PARAM;
     }
@@ -444,6 +445,14 @@ int write_jump_back(void* dst, void* target, uint32_t written_regs) {
         hook_log("[hook] WARNING: both X16 and X17 written by relocated code, "
                  "X17 may be clobbered");
     }
+
+    /* 注：emit_dec_before_jump 参数保留但不再在 trampoline 尾发射 dec。
+     * 试验发现在 trampoline 尾插入 LDADDAL + STP/LDP 会改变代码长度，触发
+     * ART fault_handler 的 "Failed to recognize implicit suspend check" abort
+     * (ART 把 patched target 的 compiled code 区域纳入 JIT code range，
+     *  要求这个范围内任何 fault 必须匹配 implicit suspend check 指令模式)。
+     * 线程在 trampoline 的小窗口交给 50ms BR_SETTLE_MS 覆盖，概率极低。 */
+    (void)emit_dec_before_jump;
 
     Arm64Writer w;
     arm64_writer_init(&w, dst, (uint64_t)dst, MIN_HOOK_SIZE);
@@ -762,9 +771,10 @@ int hook_rebuild_trampoline(void* trampoline, size_t trampoline_size,
     size_t relocated_size = hook_relocate_instructions(
         orig_bytes, orig_pc, trampoline, 4, &written_regs);
 
+    /* rebuild_trampoline 用于 stealth2 slot 模式，不参与 art_router 路径，保持无 dec */
     int jump_len = write_jump_back(
         (uint8_t*)trampoline + relocated_size,
-        jump_back_target, written_regs);
+        jump_back_target, written_regs, 0);
     if (jump_len < 0) return jump_len;
 
     size_t total = relocated_size + (size_t)jump_len;
@@ -1054,7 +1064,7 @@ HookEntry* setup_hook_entry(void* target) {
     return entry;
 }
 
-int build_trampoline(HookEntry* entry) {
+int build_trampoline(HookEntry* entry, int emit_dec_before_jumpback) {
     /* Relocate original instructions to trampoline.
      * 用 original_size（= 实际 patch 大小，ADRP=12 或 MOVZ=16），不用 MIN_HOOK_SIZE。 */
     uint32_t written_regs = 0;
@@ -1067,7 +1077,7 @@ int build_trampoline(HookEntry* entry) {
     void* jump_back_target = (uint8_t*)entry->target + overwrite;
     int jump_result = write_jump_back(
         (uint8_t*)entry->trampoline + relocated_size,
-        jump_back_target, written_regs);
+        jump_back_target, written_regs, emit_dec_before_jumpback);
 
     return jump_result;
 }

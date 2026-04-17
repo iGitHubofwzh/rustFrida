@@ -80,23 +80,37 @@ pub(crate) unsafe fn free_hook_callback(data: &registry::HookData) {
     ffi::qjs_free_value(ctx, callback);
 }
 
-/// Cleanup all hooks (call before dropping context)
-pub fn cleanup_hooks() {
-    let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(registry) = guard.take() {
-        // 第一阶段：移除所有 hook，阻止新回调触发
+/// Phase 1 - 切断 native hook 入口 (hook() JS API 装的所有 hook，不释放 callback)。
+/// 注册表条目不 take，保留到 `free_native_hooks` 再批量释放 JS callback。
+pub fn cut_native_hooks() {
+    let guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(registry) = guard.as_ref() {
         for (addr, data) in registry.iter() {
             unsafe { remove_single_hook(*addr, data); }
         }
-        if !wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(200)) {
-            crate::jsapi::console::output_message(&format!(
-                "[hook cleanup] waiting for in-flight callbacks timed out, remaining={}",
-                in_flight_native_hook_callbacks()
-            ));
-        }
-        // 第二阶段：安全释放 callback
+    }
+}
+
+/// Phase 3 - 释放 native hook 的 JS callback。必须在全局 drain 之后调用，
+/// 保证 callback 引用的 JSValue 不再被正在执行的 thunk 访问。
+pub fn free_native_hooks() {
+    let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(registry) = guard.take() {
         for (_addr, data) in registry {
             unsafe { free_hook_callback(&data); }
         }
     }
+}
+
+/// 兼容旧调用: 依次 cut → 本地 200ms 小 drain → free。
+/// 新代码应该用编排器模式 (cut_native_hooks → 全局 drain → free_native_hooks)。
+pub fn cleanup_hooks() {
+    cut_native_hooks();
+    if !wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(200)) {
+        crate::jsapi::console::output_message(&format!(
+            "[hook cleanup] waiting for in-flight callbacks timed out, remaining={}",
+            in_flight_native_hook_callbacks()
+        ));
+    }
+    free_native_hooks();
 }

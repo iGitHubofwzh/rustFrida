@@ -17,6 +17,7 @@ mod crash_handler;
 mod exec_mem;
 mod gumlibc;
 pub mod recompiler;
+pub mod safepoint;
 mod trace;
 mod vma_name;
 

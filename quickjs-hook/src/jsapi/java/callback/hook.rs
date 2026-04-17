@@ -271,6 +271,8 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     //   2. 回退 invoke_original_jni (static method / 非 compiled / env==null):
     //      - 这些方法没 quick_trampoline, 只能走 JNI CallXxx
     if !result_was_set {
+        // 现在 acquire_js_engine_for_callback 无条件等锁, 正常不会走到这里。
+        // 唯一到达场景: JS 抛异常 (handle_result 未被调用)。保留 fallback 作为兜底。
         let hook_ctx = &mut *ctx_ptr;
         let env: JniEnv = hook_ctx.x[0] as JniEnv;
 
