@@ -403,14 +403,6 @@
         return out;
     }
 
-    function _callJni(name) {
-        var args = [_getAddress(name), _getCurrentThreadEnv()];
-        for (var i = 1; i < arguments.length; i++) {
-            args.push(arguments[i]);
-        }
-        return callNative.apply(null, args);
-    }
-
     function _makeEnvHelper() {
         return {
             get ptr() {
@@ -418,11 +410,14 @@
             },
             getObjectClass: function(envOrObj, maybeObj) {
                 var resolved = _resolveEnvAndRef.apply(null, arguments);
-                return _toPtr(_api._getObjectClass(resolved.env, resolved.ref));
+                var raw = _api._getObjectClass(resolved.env, resolved.ref);
+                return raw === null || raw === undefined ? null : _toPtr(raw);
             },
             getSuperclass: function(envOrClazz, maybeClazz) {
                 var resolved = _resolveEnvAndRef.apply(null, arguments);
-                return _toPtr(_api._getSuperclass(resolved.env, resolved.ref));
+                var raw = _api._getSuperclass(resolved.env, resolved.ref);
+                // Object / interface 的 superclass 为 null，不是错误
+                return raw === null || raw === undefined ? null : _toPtr(raw);
             },
             isSameObject: function(envOrA, aOrB, maybeB) {
                 var env = arguments.length >= 3 ? _getEnvPtr(envOrA) : _getCurrentThreadEnv();
@@ -436,14 +431,18 @@
                 var clazz = arguments.length >= 3 ? _getRefPtr(maybeClazz) : _getRefPtr(objOrClazz);
                 return !!_api._isInstanceOf(env, obj, clazz);
             },
-            exceptionCheck: function() {
-                return Number(_callJni("ExceptionCheck")) !== 0;
+            exceptionCheck: function(env) {
+                var e = arguments.length >= 1 ? _getEnvPtr(env) : _getCurrentThreadEnv();
+                return !!_api._exceptionCheck(e);
             },
-            exceptionOccurred: function() {
-                return _toPtr(_callJni("ExceptionOccurred"));
+            exceptionOccurred: function(env) {
+                var e = arguments.length >= 1 ? _getEnvPtr(env) : _getCurrentThreadEnv();
+                var raw = _api._exceptionOccurred(e);
+                return raw === null || raw === undefined ? null : _toPtr(raw);
             },
-            exceptionClear: function() {
-                _callJni("ExceptionClear");
+            exceptionClear: function(env) {
+                var e = arguments.length >= 1 ? _getEnvPtr(env) : _getCurrentThreadEnv();
+                _api._exceptionClear(e);
                 return true;
             },
             readJString: function(envOrJstr, maybeJstr) {

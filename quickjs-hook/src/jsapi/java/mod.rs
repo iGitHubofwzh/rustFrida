@@ -67,19 +67,14 @@ use java_method_list_api::*;
 use jni_core::*;
 use reflect::*;
 
-#[inline]
-unsafe fn validate_jni_ref(env: JniEnv, obj: *mut std::ffi::c_void) -> bool {
-    !obj.is_null() && art_class::is_valid_jni_ref(env, obj)
-}
+// DecodeJObject 前置验证在 hook 回调拿到的 indirect JNI ref 上会误判失败。
+// 这批 JNI 包装函数统一不做前置验证——JNI 自身能安全处理无效引用
+// （返回 null 或抛异常），调用后 jni_check_exc 清一下异常兜底。
 
 pub(crate) unsafe fn try_read_jstring(env_ptr: u64, obj_ptr: u64) -> Option<String> {
     let env = env_ptr as JniEnv;
     let obj = obj_ptr as *mut std::ffi::c_void;
     if env.is_null() || obj.is_null() {
-        return None;
-    }
-
-    if !validate_jni_ref(env, obj) {
         return None;
     }
 
@@ -140,7 +135,7 @@ pub(crate) unsafe fn try_get_class_name(env_ptr: u64, cls_ptr: u64) -> Option<St
 pub(crate) unsafe fn try_get_object_class(env_ptr: u64, obj_ptr: u64) -> Option<u64> {
     let env = env_ptr as JniEnv;
     let obj = obj_ptr as *mut std::ffi::c_void;
-    if env.is_null() || !validate_jni_ref(env, obj) {
+    if env.is_null() || obj.is_null() {
         return None;
     }
 
@@ -156,13 +151,14 @@ pub(crate) unsafe fn try_get_object_class(env_ptr: u64, obj_ptr: u64) -> Option<
 pub(crate) unsafe fn try_get_superclass(env_ptr: u64, cls_ptr: u64) -> Option<u64> {
     let env = env_ptr as JniEnv;
     let cls = cls_ptr as *mut std::ffi::c_void;
-    if env.is_null() || !validate_jni_ref(env, cls) {
+    if env.is_null() || cls.is_null() {
         return None;
     }
 
     let get_superclass: GetSuperclassFn = jni_fn!(env, GetSuperclassFn, JNI_GET_SUPERCLASS);
     let super_cls = get_superclass(env, cls);
     if super_cls.is_null() || jni_check_exc(env) {
+        // Object / interface 的 superclass 就是 null，不是错误；清异常兜底
         None
     } else {
         Some(super_cls as u64)
@@ -176,9 +172,6 @@ pub(crate) unsafe fn try_is_same_object(env_ptr: u64, a_ptr: u64, b_ptr: u64) ->
     if env.is_null() {
         return false;
     }
-    if (!a.is_null() && !validate_jni_ref(env, a)) || (!b.is_null() && !validate_jni_ref(env, b)) {
-        return false;
-    }
 
     let is_same_object: IsSameObjectFn = jni_fn!(env, IsSameObjectFn, JNI_IS_SAME_OBJECT);
     is_same_object(env, a, b) != 0 && !jni_check_exc(env)
@@ -188,7 +181,7 @@ pub(crate) unsafe fn try_is_instance_of(env_ptr: u64, obj_ptr: u64, cls_ptr: u64
     let env = env_ptr as JniEnv;
     let obj = obj_ptr as *mut std::ffi::c_void;
     let cls = cls_ptr as *mut std::ffi::c_void;
-    if env.is_null() || !validate_jni_ref(env, obj) || !validate_jni_ref(env, cls) {
+    if env.is_null() || obj.is_null() || cls.is_null() {
         return false;
     }
 
@@ -204,6 +197,38 @@ pub(crate) unsafe fn try_get_object_class_name(env_ptr: u64, obj_ptr: u64) -> Op
     let name = try_get_class_name(env_ptr, cls as u64);
     delete_local_ref(env, cls);
     name
+}
+
+pub(crate) unsafe fn try_exception_check(env_ptr: u64) -> bool {
+    let env = env_ptr as JniEnv;
+    if env.is_null() {
+        return false;
+    }
+    let check: ExcCheckFn = jni_fn!(env, ExcCheckFn, JNI_EXCEPTION_CHECK);
+    check(env) != 0
+}
+
+pub(crate) unsafe fn try_exception_clear(env_ptr: u64) {
+    let env = env_ptr as JniEnv;
+    if env.is_null() {
+        return;
+    }
+    let clear: ExcClearFn = jni_fn!(env, ExcClearFn, JNI_EXCEPTION_CLEAR);
+    clear(env);
+}
+
+pub(crate) unsafe fn try_exception_occurred(env_ptr: u64) -> Option<u64> {
+    let env = env_ptr as JniEnv;
+    if env.is_null() {
+        return None;
+    }
+    let occurred: ExcOccurredFn = jni_fn!(env, ExcOccurredFn, JNI_EXCEPTION_OCCURRED);
+    let exc = occurred(env);
+    if exc.is_null() {
+        None
+    } else {
+        Some(exc as u64)
+    }
 }
 
 /// JS CFunction: Java.deopt() — 清空 JIT 缓存 (InvalidateAllMethods)

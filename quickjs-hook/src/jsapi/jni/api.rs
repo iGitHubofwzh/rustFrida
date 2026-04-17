@@ -243,6 +243,49 @@ unsafe extern "C" fn js_jni_get_object_class_name(
     }
 }
 
+unsafe extern "C" fn js_jni_exception_check(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let (env_ptr, _) = match resolve_env_ptr(ctx, argc, argv, "Jni._exceptionCheck", 1) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    JSValue::bool(crate::jsapi::java::try_exception_check(env_ptr)).raw()
+}
+
+unsafe extern "C" fn js_jni_exception_clear(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let (env_ptr, _) = match resolve_env_ptr(ctx, argc, argv, "Jni._exceptionClear", 1) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    crate::jsapi::java::try_exception_clear(env_ptr);
+    JSValue::bool(true).raw()
+}
+
+unsafe extern "C" fn js_jni_exception_occurred(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let (env_ptr, _) = match resolve_env_ptr(ctx, argc, argv, "Jni._exceptionOccurred", 1) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    match crate::jsapi::java::try_exception_occurred(env_ptr) {
+        Some(exc) => create_native_pointer(ctx, exc).raw(),
+        None => JSValue::null().raw(),
+    }
+}
+
 pub fn register_jni_api(ctx: &JSContext) {
     let global = ctx.global_object();
 
@@ -256,6 +299,9 @@ pub fn register_jni_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, jni_obj, "_isInstanceOf", js_jni_is_instance_of, 3);
         add_cfunction_to_object(ctx_ptr, jni_obj, "_getObjectClassName", js_jni_get_object_class_name, 2);
         add_cfunction_to_object(ctx_ptr, jni_obj, "_readJString", js_jni_read_jstring, 2);
+        add_cfunction_to_object(ctx_ptr, jni_obj, "_exceptionCheck", js_jni_exception_check, 1);
+        add_cfunction_to_object(ctx_ptr, jni_obj, "_exceptionClear", js_jni_exception_clear, 1);
+        add_cfunction_to_object(ctx_ptr, jni_obj, "_exceptionOccurred", js_jni_exception_occurred, 1);
         add_cfunction_to_object(ctx_ptr, jni_obj, "_threadEnv", js_jni_thread_env, 0);
         global.set_property(ctx_ptr, "Jni", JSValue(jni_obj));
     }

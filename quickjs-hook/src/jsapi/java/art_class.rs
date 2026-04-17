@@ -556,14 +556,3 @@ unsafe fn decode_jclass(env: JniEnv, cls: *mut std::ffi::c_void) -> Option<u64> 
     output_verbose("[art class] jclass 解码失败: DecodeJObject 不可用且 fallback 无效");
     None
 }
-
-/// Best-effort JNI ref validation for hook callbacks.
-///
-/// This avoids passing obviously bad register values into JNI object APIs.
-pub(super) unsafe fn is_valid_jni_ref(env: JniEnv, obj: *mut std::ffi::c_void) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-
-    with_runnable_thread(env, || decode_jobject(env, obj).is_some())
-}
