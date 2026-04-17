@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use crate::communication::send_command;
-use crate::log_error;
 use crate::logger::{GRAY, GREEN, HIGHLIGHT_BG, HIGHLIGHT_FG, RED, RESET, YELLOW};
 use crate::session::Session;
+use crate::{log_error, log_info, log_warn};
 
 /// 构造一个带可选 filename 前缀的 `loadjs` 命令字符串。
 ///
@@ -51,6 +51,7 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
             ("jseval", "<expr>", "求值 JS 表达式并显示结果"),
             ("jsclean", "", "清理 QuickJS 引擎"),
             ("jsrepl", "", "进入 JS REPL 模式（Tab 动态补全）"),
+            ("%reload", "[path]", "重载脚本（jsclean+jsinit+loadjs，不退出）"),
             ("help", "", "显示此帮助信息"),
             ("exit", "", "退出程序（quit 同效）"),
         ];
@@ -230,6 +231,62 @@ impl Highlighter for JsReplCompleter {
 }
 impl Validator for JsReplCompleter {}
 impl Helper for JsReplCompleter {}
+
+/// 加载脚本文件并在 agent 中执行。
+///
+/// * `reset=false`：首次加载，仅 `jsinit`（若引擎已初始化则复用）+ `loadjs`
+/// * `reset=true`：`%reload` 用，先 `jsclean` 重置引擎，再 `jsinit` + `loadjs`
+///
+/// 返回 `Ok(())` 仅表示脚本已送达并收到响应（响应内容由 `print_eval_result` 打印）。
+pub(crate) fn load_script_file(session: &Session, script_path: &str, reset: bool) -> Result<(), String> {
+    let sender = session
+        .get_sender()
+        .ok_or_else(|| "agent 未连接".to_string())?;
+    let script = std::fs::read_to_string(script_path)
+        .map_err(|e| format!("读取脚本文件 '{}' 失败: {}", script_path, e))?;
+
+    if reset {
+        log_info!("重载脚本: {}", script_path);
+        // jsclean_soft：完整 unhook + drain=0 + 销毁 runtime，保留基础设施和 RWX 内存。
+        // 引擎未初始化时 agent 回 Err("未初始化")，视为非致命跳过。
+        // drain 超时时 agent 返回 Err，中止 reload 避免 UAF 旧 callback。
+        session.eval_state.clear();
+        if send_command(sender, "jsclean_soft").is_ok() {
+            match session
+                .eval_state
+                .recv_timeout(std::time::Duration::from_secs(35))
+            {
+                None => return Err("等待 jsclean_soft 超时".to_string()),
+                Some(Err(ref e)) if e.contains("未初始化") => {}
+                Some(Err(e)) if e.contains("drain timeout") => {
+                    return Err(format!("软清理失败: {} — reload 中止，旧脚本继续运行", e));
+                }
+                Some(Err(e)) => log_warn!("jsclean_soft 失败: {}（继续）", e),
+                Some(Ok(_)) => {}
+            }
+        }
+    } else {
+        log_info!("加载脚本: {}", script_path);
+    }
+
+    session.eval_state.clear();
+    send_command(sender, "jsinit").map_err(|e| format!("发送 jsinit 失败: {}", e))?;
+    match session
+        .eval_state
+        .recv_timeout(std::time::Duration::from_secs(10))
+    {
+        None => return Err("等待引擎初始化超时".to_string()),
+        Some(Err(ref e)) if e.contains("已初始化") => {}
+        Some(Err(e)) => return Err(format!("引擎初始化失败: {}", e)),
+        Some(Ok(_)) => {}
+    }
+
+    session.eval_state.clear();
+    let cmd = build_loadjs_cmd(&script, Some(script_path));
+    send_command(sender, cmd).map_err(|e| format!("发送 loadjs 失败: {}", e))?;
+    print_eval_result(session, 30);
+    Ok(())
+}
 
 /// 打印 eval 响应：等待 session.eval_state 结果并格式化输出。
 pub(crate) fn print_eval_result(session: &Session, timeout_secs: u64) {

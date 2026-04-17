@@ -299,3 +299,73 @@ pub fn cleanup() {
 // 注：旧的 munmap_retained_ranges_final (快照 snap → munmap) 已废弃，由
 // hook_engine_munmap_pools_direct (C 侧直读 g_engine.pools[] 同步 munmap) 取代。
 // drain 超时路径不释放 pool/recomp/walkstack guards，泄漏到进程退出。
+
+/// **软清理**：完整 unhook + drain=0 + 销毁 runtime，保留 hook 基础设施和 RWX 内存。
+///
+/// `%reload` 使用。与 full `cleanup()` 相同的 hook 释放路径（drain=0 原子不变量保持），
+/// 但刻意保留 art_controller / pool / recomp 页 / wxshadow —— 这些内存可能仍被 ART
+/// 内部的 ArtMethod 拷贝 / class copy / OAT 缓存引用。full cleanup 的 munmap 只在
+/// agent 退出（地址永不复用）时安全；同进程 reload 必须保留。
+///
+/// 做：
+/// - Phase 1: `cut_java_hooks` + `cut_native_hooks`（per-hook wxshadow/recomp-B 反转在这里）
+/// - Phase 2: `drain_thunk_in_flight` → 0
+/// - Phase 3: `free_java_hooks` + `free_native_hooks` + `cleanup_engine`
+///
+/// 保留：art_controller routing + walkstack guards + hook pools + recomp 页 + wxshadow。
+///
+/// drain 超时：拒绝 free，返回 Err，调用方中止 reload。
+pub fn cleanup_soft() -> Result<(), String> {
+    use std::time::Instant;
+
+    if !ENGINE_INITIALIZED.load(Ordering::SeqCst) {
+        return Err("JS 引擎未初始化".to_string());
+    }
+
+    let t0 = Instant::now();
+    let mut t = t0;
+    let mut stage = |label: &str, prev: &mut Instant| {
+        let now = Instant::now();
+        let delta = now.duration_since(*prev).as_millis();
+        let total = now.duration_since(t0).as_millis();
+        log_msg(format!("[quickjs-soft] {} (+{}ms, total {}ms)\n", label, delta, total));
+        *prev = now;
+    };
+
+    stage("soft cleanup start", &mut t);
+
+    // Phase 1: 切 JS 侧入口（保留 art_controller routing / walkstack guards）
+    cut_java_hooks();
+    stage("phase1 cut_java_hooks", &mut t);
+    cut_native_hooks();
+    stage("phase1 cut_native_hooks", &mut t);
+
+    // Phase 2: drain thunk —— 必须归零才能安全 free callback JSValue
+    let drained = drain_thunk_in_flight();
+    stage("phase2 drain_thunk_in_flight", &mut t);
+
+    if !drained {
+        log_msg(format!(
+            "[quickjs-soft] drain 未归零：保留 hook 资源 (leak 到进程退出). \
+             拒绝降级 (会让醒来的线程 UAF JS callback). total {}ms\n",
+            t0.elapsed().as_millis()
+        ));
+        return Err("drain timeout，软清理已放弃".to_string());
+    }
+
+    // Phase 3: 完整 free JS hook 资源 + 销毁 runtime
+    free_java_hooks();
+    stage("phase3 free_java_hooks", &mut t);
+    free_native_hooks();
+    stage("phase3 free_native_hooks", &mut t);
+    ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
+    cleanup_engine();
+    stage("phase3 cleanup_engine", &mut t);
+
+    log_msg(format!(
+        "[quickjs-soft] soft cleanup done (total {}ms) — art_controller + pool + recomp 保留\n",
+        t0.elapsed().as_millis()
+    ));
+    Ok(())
+}
+

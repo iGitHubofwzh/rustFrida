@@ -34,7 +34,7 @@ use communication::send_qbdi_helper;
 use communication::{send_command, start_socketpair_handler};
 use injection::{inject_via_bootstrapper, watch_and_inject};
 use process::find_pid_by_name;
-use repl::{build_loadjs_cmd, print_eval_result, print_help, run_js_repl, CommandCompleter};
+use repl::{load_script_file, print_eval_result, print_help, run_js_repl, CommandCompleter};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use session::{Session, SessionManager};
@@ -291,34 +291,9 @@ fn main() {
                 std::process::exit(1);
             }
             if let Some(script_path) = &args.load_script {
-                match std::fs::read_to_string(script_path) {
-                    Ok(script) => {
-                        log_info!("加载脚本 (子进程暂停中): {}", script_path);
-                        session.eval_state.clear();
-                        if let Err(e) = send_command(sender, "jsinit") {
-                            log_error!("发送 jsinit 失败: {}", e);
-                        } else {
-                            match session
-                                .eval_state
-                                .recv_timeout(std::time::Duration::from_secs(10))
-                            {
-                                None => log_warn!("等待引擎初始化超时"),
-                                Some(Err(e)) => log_error!("引擎初始化失败: {}", e),
-                                Some(Ok(_)) => {
-                                    session.eval_state.clear();
-                                    let cmd = build_loadjs_cmd(&script, Some(script_path));
-                                    if let Err(e) = send_command(sender, cmd) {
-                                        log_error!("发送 loadjs 失败: {}", e);
-                                    } else {
-                                        print_eval_result(&session, 30);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_error!("读取脚本文件 '{}' 失败: {}", script_path, e);
-                    }
+                log_info!("子进程暂停中，准备加载脚本");
+                if let Err(e) = load_script_file(&session, script_path, false) {
+                    log_error!("{}", e);
                 }
             }
             // resume: hook 已就位，恢复子进程
@@ -331,37 +306,14 @@ fn main() {
     // 非 spawn 模式: --load-script 在 resume 后加载（进程已在运行）
     if args.spawn.is_none() {
         if let Some(script_path) = &args.load_script {
-            match std::fs::read_to_string(script_path) {
-                Ok(script) => {
-                    log_info!("加载脚本: {}", script_path);
-                    session.eval_state.clear();
-                    if let Err(e) = send_command(sender, "jsinit") {
-                        log_error!("发送 jsinit 失败: {}", e);
-                    } else {
-                        match session
-                            .eval_state
-                            .recv_timeout(std::time::Duration::from_secs(10))
-                        {
-                            None => log_warn!("等待引擎初始化超时"),
-                            Some(Err(e)) => log_error!("引擎初始化失败: {}", e),
-                            Some(Ok(_)) => {
-                                session.eval_state.clear();
-                                let cmd = build_loadjs_cmd(&script, Some(script_path));
-                                if let Err(e) = send_command(sender, cmd) {
-                                    log_error!("发送 loadjs 失败: {}", e);
-                                } else {
-                                    print_eval_result(&session, 30);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log_error!("读取脚本文件 '{}' 失败: {}", script_path, e);
-                }
+            if let Err(e) = load_script_file(&session, script_path, false) {
+                log_error!("{}", e);
             }
         }
     }
+
+    // %reload 用：记住最近一次加载的脚本路径
+    let mut last_script_path: Option<String> = args.load_script.clone();
 
     let mut rl = match Editor::new() {
         Ok(e) => e,
@@ -417,6 +369,28 @@ fn main() {
                 }
                 if line == "jsrepl" {
                     run_js_repl(&session);
+                    continue;
+                }
+                // %reload [path]: 清理 JS 引擎并重新加载脚本（不退出进程）
+                if line == "%reload" || line.starts_with("%reload ") {
+                    let arg = line["%reload".len()..].trim();
+                    let path = if arg.is_empty() {
+                        last_script_path.clone()
+                    } else {
+                        Some(arg.to_string())
+                    };
+                    match path {
+                        None => {
+                            log_warn!("用法: %reload <path>（未指定 --load-script 时必须给路径）");
+                        }
+                        Some(p) => {
+                            if let Err(e) = load_script_file(&session, &p, true) {
+                                log_error!("{}", e);
+                            } else {
+                                last_script_path = Some(p);
+                            }
+                        }
+                    }
                     continue;
                 }
                 // 校验 hfl 必须带 <module> <offset> 两个参数

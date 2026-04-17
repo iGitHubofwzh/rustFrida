@@ -372,6 +372,19 @@ fn process_cmd(command: &str) {
                 send_eval_ok("cleaned up");
             }
         }
+        // jsclean_soft: %reload 专用。完整 unhook + drain=0 + 销毁 runtime，
+        // 但保留 art_controller / pool / recomp / wxshadow（同进程 reload 复用）。
+        #[cfg(feature = "quickjs")]
+        Some("jsclean_soft") => {
+            if !quickjs_loader::is_initialized() {
+                send_eval_err("[quickjs] JS 引擎未初始化");
+            } else {
+                match quickjs_loader::cleanup_soft() {
+                    Ok(_) => send_eval_ok("soft cleaned up"),
+                    Err(e) => send_eval_err(&format!("[quickjs] {}", e)),
+                }
+            }
+        }
         Some("recomp") => {
             let addr_str = command.split_whitespace().nth(1).unwrap_or("");
             let addr_str = addr_str.strip_prefix("0x").unwrap_or(addr_str);
