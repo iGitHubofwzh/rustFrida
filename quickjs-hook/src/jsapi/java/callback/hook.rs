@@ -150,9 +150,9 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     let hook_ctx_env: JniEnv = (*ctx_ptr).x[0] as JniEnv;
 
     // Track whether handle_result was called (false if JS exception occurred)
-    let mut result_was_set = false;
+    let result_was_set = std::cell::Cell::new(false);
 
-    invoke_hook_callback_common(
+    let had_js_exception = invoke_hook_callback_common(
         ctx_usize,
         &callback_bytes,
         "java hook",
@@ -202,7 +202,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         },
         // 处理返回值：根据 return_type 将 JS 返回值写入 HookContext.x[0]
         |ctx, _js_ctx, result| {
-            result_was_set = true;
+            result_was_set.set(true);
             if return_type != b'V' {
                 let result_val = JSValue(result);
                 let ret_u64 = match return_type {
@@ -257,73 +257,71 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                 (*ctx_ptr).x[0] = ret_u64;
             }
         },
+        // JS 抛异常透明递传: 调用 js_call_original 代替直接 invoke_original_jni。
+        //
+        // 为什么不能直接 invoke_original_jni? API 36 上 JS 异常 unwind 后直接进 JNI 会触发:
+        //   - "Failed to recognize implicit suspend check ... state=Native" (SIGABRT), 或
+        //   - dispatchMessage OAT 代码内 SEGV (stale heap ptr)
+        //
+        // 实测: 同样参数经 js_call_original 入口 (属性读 + JAVA_HOOK_REGISTRY Mutex + invoke)
+        // 则 537+ 次异常 + 完整 UI nav 稳定不崩。推测 Mutex acquire/release barrier
+        // 或 QuickJS 属性读清掉了 JS 异常 unwind 留下的脏 CPU/thread state。
+        // 详见 memory: js-exception-orig-detour.md
+        |ctx, js_ctx_val| {
+            let result = js_call_original(ctx, js_ctx_val, 0, std::ptr::null_mut());
+            if return_type != b'V' {
+                (*ctx_ptr).x[0] = js_result_to_raw(ctx, JSValue(result), return_type);
+            }
+            ffi::qjs_free_value(ctx, result);
+            result_was_set.set(true);
+        },
     );
 
-    // Fallback: JS callback 未执行 (busy skip / 异常). 原地继续执行原方法,
-    // 不通过 JNI CallXxx 重新 invoke (避免 ART 把它当"第二次方法调用"引入额外 state).
-    //
-    // 策略:
-    //   1. 优先 trampoline (Layer 3 compiled instance method, quick_trampoline != 0):
-    //      - Quick ABI: x0=ArtMethod, x1=this, x2+=args
-    //      - 当前 ctx 寄存器是 JNI ABI: x0=env, x1=this, x2+=args (x1..x7 对齐 Quick)
-    //      - 只需把 x0 从 env 改成原 ArtMethod, 然后 hook_invoke_trampoline 跳
-    //      - 切到 Runnable state 避免 GC 移动 heap 对象时 quick code 崩
-    //   2. 回退 invoke_original_jni (static method / 非 compiled / env==null):
-    //      - 这些方法没 quick_trampoline, 只能走 JNI CallXxx
-    if !result_was_set {
-        // 现在 acquire_js_engine_for_callback 无条件等锁, 正常不会走到这里。
-        // 唯一到达场景: JS 抛异常 (handle_result 未被调用)。保留 fallback 作为兜底。
-        let hook_ctx = &mut *ctx_ptr;
-        let env: JniEnv = hook_ctx.x[0] as JniEnv;
-
-        // 路径 1: trampoline 原地执行
-        // 条件: instance method + 有 quick_trampoline + env 非空 (需要切 Runnable state)
-        if !is_static && quick_trampoline != 0 && !env.is_null() {
-            // Quick ABI 约定 x0 = ArtMethod*, 覆盖 JNI env
-            // x1 (this) / x2+ (args) 在 JNI 和 Quick ABI 位置相同, 不用改
-            hook_ctx.x[0] = art_method_addr;
-
-            // 切到 Runnable state 执行 trampoline (访问 Java heap 需要)
-            let ret = super::art_class::with_runnable_thread(env, || {
-                hook_ffi::hook_invoke_trampoline(ctx_ptr, quick_trampoline as *mut std::ffi::c_void)
-            });
-
-            (*ctx_ptr).x[0] = if return_type == b'V' {
-                // void 方法, 返回值由 trampoline 的 ret 给出但实际无意义, 保留原 env 值
-                env as u64
-            } else {
-                ret
-            };
-            return;
-        }
-
-        // 路径 2: 原 JNI fallback (static method / shared stub method)
-        if !env.is_null() {
-            let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
-            let jargs_ptr = if param_count > 0 {
-                jargs.as_ptr() as *const std::ffi::c_void
-            } else {
-                std::ptr::null()
-            };
-            let ret_raw = invoke_original_jni(
-                env,
-                art_method_addr,
-                class_global_ref,
-                hook_ctx.x[1],
-                return_type,
-                is_static,
-                jargs_ptr,
-            );
-            if return_type == b'V' {
-                (*ctx_ptr).x[0] = hook_ctx.x[0];
-            } else {
-                (*ctx_ptr).x[0] = ret_raw;
-            }
-        } else {
-            (*ctx_ptr).x[0] = 0;
-        }
+    // 兜底: 若 handle_result / on_js_exception 都未 set (engine busy skip 等边角)
+    let _ = had_js_exception;
+    if !result_was_set.get() {
+        (*ctx_ptr).x[0] = 0;
     }
+}
 
+/// 把 js_call_original 返回的 JSValue 还原为写 x[0] 的 u64。
+/// 覆盖 L/[ (__origJobject / __jptr / null) + F/D (bits) + 基本类型。
+unsafe fn js_result_to_raw(
+    ctx: *mut ffi::JSContext,
+    result_val: JSValue,
+    return_type: u8,
+) -> u64 {
+    match return_type {
+        b'V' => 0,
+        b'F' => result_val.to_float().map(|f| (f as f32).to_bits() as u64).unwrap_or(0),
+        b'D' => result_val.to_float().map(|f| f.to_bits()).unwrap_or(0),
+        b'L' | b'[' => {
+            if result_val.is_null() || result_val.is_undefined() {
+                return 0;
+            }
+            if result_val.is_object() {
+                // js_call_original L/[ 返回两种 shape:
+                //   {__jptr, __jclass}        — 普通 Object
+                //   {value, __origJobject}    — unboxed (String/Integer 等)
+                let origj = result_val.get_property(ctx, "__origJobject");
+                if !origj.is_undefined() && !origj.is_null() {
+                    let r = js_value_to_u64_or_zero(ctx, origj);
+                    origj.free(ctx);
+                    return r;
+                }
+                origj.free(ctx);
+                let jptr = result_val.get_property(ctx, "__jptr");
+                if !jptr.is_undefined() && !jptr.is_null() {
+                    let r = js_value_to_u64_or_zero(ctx, jptr);
+                    jptr.free(ctx);
+                    return r;
+                }
+                jptr.free(ctx);
+            }
+            js_value_to_u64_or_zero(ctx, result_val)
+        }
+        _ => js_value_to_u64_or_zero(ctx, result_val),
+    }
 }
 
 // ============================================================================
@@ -520,6 +518,8 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
             // 返回值由 ctx.orig() 设置 (通过 invoke_original_jni)
             // 如果 JS 没调 orig(), 返回值为 0/null
         },
+        // on_js_exception: Quick dispatch 这条路 (debug 模式, 未启用)
+        |_ctx, _js_ctx| {},
     );
 
     // Fallback + 默认路径: 调用原始方法 via JNI (2-ArtMethod 模型)

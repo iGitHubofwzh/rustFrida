@@ -6,9 +6,11 @@
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{
-    get_js_u64_property, invoke_hook_callback_common, js_u64_to_js_number_or_bigint, js_value_to_u64_or_zero,
+    acquire_js_engine_for_callback, get_js_u64_property, handle_js_exception,
+    invoke_hook_callback_common, js_u64_to_js_number_or_bigint, js_value_to_u64_or_zero,
     set_js_cfunction_property, set_js_u64_property,
 };
+use std::cell::RefCell;
 use std::sync::{Condvar, Mutex};
 
 use super::registry::HOOK_REGISTRY;
@@ -195,6 +197,8 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             }
             // undefined 时保持 ctx.x0 (可能是 orig() 写入的返回值或 JS 修改的值)
         },
+        // native hook 不需要 JS 异常内 fallback (外层 trampoline 兜底已够)
+        |_ctx, _js_ctx| {},
     );
 
     let orig_called = pop_native_hook_frame(ctx_ptr, trampoline);
@@ -272,4 +276,215 @@ unsafe extern "C" fn js_native_call_original(
 
     // Return value: Number (≤2^53) or BigUint64
     js_u64_to_js_number_or_bigint(ctx, result)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Attach 模式 (Frida Interceptor.attach)
+//
+// hook_attach 的 thunk 自动执行 BLR trampoline (原函数)，不需要 ctx.orig()。
+// on_enter 在调用原函数前运行，可改 x0-x7 (参数) 或 ctx.intercept_leave。
+// on_leave 在原函数返回后运行，可改 x0 (返回值)。
+//
+// Frida 语义：onEnter 和 onLeave 的 `this` 是同一个 invocation object，
+// 允许用户通过 `this.foo = 1` 跨阶段传状态。用 thread_local! 栈实现：
+// on_enter push，on_leave pop。嵌套 hook 自然按栈式工作。
+// ══════════════════════════════════════════════════════════════════════════════
+
+thread_local! {
+    // 每线程独立 invocation stack。存 dup 过的 JSValue 原始字节 (16B)。
+    // on_enter 末尾 push（仅当 has_on_leave=true），on_leave 开头 pop。
+    static INVOCATION_STACK: RefCell<Vec<[u8; 16]>> = const { RefCell::new(Vec::new()) };
+}
+
+fn invocation_push(bytes: [u8; 16]) {
+    INVOCATION_STACK.with(|s| s.borrow_mut().push(bytes));
+}
+
+fn invocation_pop() -> Option<[u8; 16]> {
+    INVOCATION_STACK.with(|s| s.borrow_mut().pop())
+}
+
+/// 构造 invocation context JS 对象: x0-x30 / sp / pc / lr / returnAddress / __hookCtxPtr
+unsafe fn build_invocation_ctx(
+    ctx: *mut ffi::JSContext,
+    hook_ctx_ptr: *mut hook_ffi::HookContext,
+) -> ffi::JSValue {
+    let js_ctx = ffi::JS_NewObject(ctx);
+    let hook_ctx = &*hook_ctx_ptr;
+    for i in 0..31 {
+        set_js_u64_property(ctx, js_ctx, &format!("x{}", i), hook_ctx.x[i]);
+    }
+    set_js_u64_property(ctx, js_ctx, "sp", hook_ctx.sp);
+    set_js_u64_property(ctx, js_ctx, "pc", hook_ctx.pc);
+    set_js_u64_property(ctx, js_ctx, "lr", hook_ctx.x[30]);
+    set_js_u64_property(ctx, js_ctx, "returnAddress", hook_ctx.x[30]);
+    set_js_u64_property(ctx, js_ctx, "__hookCtxPtr", hook_ctx_ptr as usize as u64);
+    js_ctx
+}
+
+/// 把 js_ctx 上 x0-x30 + sp 同步回 C HookContext
+unsafe fn sync_js_ctx_to_hook_ctx(
+    ctx: *mut ffi::JSContext,
+    js_ctx: ffi::JSValue,
+    hook_ctx_ptr: *mut hook_ffi::HookContext,
+) {
+    let hook_ctx = &mut *hook_ctx_ptr;
+    for i in 0..31 {
+        hook_ctx.x[i] = get_js_u64_property(ctx, js_ctx, &format!("x{}", i));
+    }
+    hook_ctx.sp = get_js_u64_property(ctx, js_ctx, "sp");
+}
+
+/// 调用 JS 全局 helper `helper_name(userFn, js_ctx)`。
+/// helper 由 interceptor_boot.js 提供（args/retval proxy 包装）。
+/// helper 不存在时降级直接调 userFn(js_ctx)。
+unsafe fn call_interceptor_helper(
+    ctx: *mut ffi::JSContext,
+    user_bytes: &[u8; 16],
+    js_ctx: ffi::JSValue,
+    helper_name: &[u8],  // 必须带末尾 \0
+    log_tag: &str,
+) {
+    let user_fn: ffi::JSValue = std::ptr::read(user_bytes.as_ptr() as *const ffi::JSValue);
+    let user_dup = ffi::qjs_dup_value(ctx, user_fn);
+    let global = ffi::JS_GetGlobalObject(ctx);
+    let helper = ffi::JS_GetPropertyStr(ctx, global, helper_name.as_ptr() as *const _);
+    let result = if ffi::JS_IsFunction(ctx, helper) != 0 {
+        let mut args = [user_dup, js_ctx];
+        ffi::JS_Call(ctx, helper, global, 2, args.as_mut_ptr())
+    } else {
+        let mut args = [js_ctx];
+        ffi::JS_Call(ctx, user_dup, global, 1, args.as_mut_ptr())
+    };
+    let _ = handle_js_exception(ctx, result, log_tag);
+    ffi::qjs_free_value(ctx, result);
+    ffi::qjs_free_value(ctx, helper);
+    ffi::qjs_free_value(ctx, global);
+    ffi::qjs_free_value(ctx, user_dup);
+}
+
+/// attach 模式 on_enter C 回调。C thunk 已保存所有寄存器到 HookContext。
+/// 语义：
+///   1. 从 registry 取 (ctx, on_enter_bytes, on_leave_bytes, has_on_enter, has_on_leave)
+///   2. 获取 JS 引擎锁后构造 invocation ctx 对象
+///   3. 若 has_on_enter: 调 __interceptorEnter(userFn, js_ctx)
+///   4. 同步 js_ctx 的 x0-x30/sp 回 C HookContext
+///   5. has_on_leave=true: push js_ctx 到 thread_local 栈供 on_leave 使用（不 free）
+///      has_on_leave=false: free js_ctx + set ctx.intercept_leave=0 走 tail-jump 快路径
+pub(crate) unsafe extern "C" fn attach_on_enter_wrapper(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    user_data: *mut std::ffi::c_void,
+) {
+    if ctx_ptr.is_null() || user_data.is_null() {
+        return;
+    }
+    let _in_flight_guard = InFlightNativeHookGuard::enter();
+
+    let target_addr = user_data as u64;
+
+    let (ctx_usize, has_on_enter, has_on_leave, on_enter_bytes) = {
+        let guard = match HOOK_REGISTRY.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let registry = match guard.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        let data = match registry.get(&target_addr) {
+            Some(d) => d,
+            None => return,
+        };
+        (data.ctx, data.has_on_enter, data.has_on_leave, data.callback_bytes)
+    };
+
+    let ctx = ctx_usize as *mut ffi::JSContext;
+    let _js_guard = match acquire_js_engine_for_callback(ctx, "interceptor.onEnter", target_addr) {
+        Some(g) => g,
+        None => return,
+    };
+
+    let js_ctx = build_invocation_ctx(ctx, ctx_ptr);
+
+    if has_on_enter {
+        call_interceptor_helper(ctx, &on_enter_bytes, js_ctx, b"__interceptorEnter\0", "interceptor.onEnter");
+    }
+
+    sync_js_ctx_to_hook_ctx(ctx, js_ctx, ctx_ptr);
+
+    if has_on_leave {
+        // 保留 js_ctx 供 on_leave 复用，不 free。push 原引用 (ref=1) 到栈。
+        let mut bytes = [0u8; 16];
+        std::ptr::copy_nonoverlapping(&js_ctx as *const _ as *const u8, bytes.as_mut_ptr(), 16);
+        invocation_push(bytes);
+    } else {
+        ffi::qjs_free_value(ctx, js_ctx);
+        // 仅当 on_leave==NULL 时 C thunk 才生成 tail-jump 分支，此处安全。
+        (*ctx_ptr).intercept_leave = 0;
+    }
+}
+
+/// attach 模式 on_leave C 回调。此时 x0 已是 trampoline 返回值。
+/// 语义：
+///   1. pop thread_local 栈拿到 this 对象（on_enter push 的）；栈空则新建（!has_on_enter 的情况）
+///   2. 刷新 x0-x30 → js_ctx（反映原函数返回后的状态）
+///   3. 调 __interceptorLeave(userFn, js_ctx)
+///   4. 同步 js_ctx.x0 回 C HookContext
+///   5. free js_ctx（ref 降到 0 释放）
+pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    user_data: *mut std::ffi::c_void,
+) {
+    if ctx_ptr.is_null() || user_data.is_null() {
+        return;
+    }
+    let _in_flight_guard = InFlightNativeHookGuard::enter();
+
+    let target_addr = user_data as u64;
+
+    let (ctx_usize, on_leave_bytes, has_on_leave) = {
+        let guard = match HOOK_REGISTRY.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let registry = match guard.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        let data = match registry.get(&target_addr) {
+            Some(d) => d,
+            None => return,
+        };
+        (data.ctx, data.on_leave_bytes, data.has_on_leave)
+    };
+
+    if !has_on_leave {
+        // 注册期间 on_leave 被移除了?理论上不该发生; 直接返回。
+        return;
+    }
+
+    let ctx = ctx_usize as *mut ffi::JSContext;
+    let _js_guard = match acquire_js_engine_for_callback(ctx, "interceptor.onLeave", target_addr) {
+        Some(g) => g,
+        None => return,
+    };
+
+    // pop on_enter 留下的 this 对象；若 !has_on_enter 或 stack 意外为空，新建一个
+    let js_ctx = match invocation_pop() {
+        Some(bytes) => std::ptr::read(bytes.as_ptr() as *const ffi::JSValue),
+        None => build_invocation_ctx(ctx, ctx_ptr),
+    };
+
+    // 刷新 x0-x30 到 js_ctx（trampoline 刚返回，x0 已是新的返回值）
+    let hook_ctx = &*ctx_ptr;
+    for i in 0..31 {
+        set_js_u64_property(ctx, js_ctx, &format!("x{}", i), hook_ctx.x[i]);
+    }
+
+    call_interceptor_helper(ctx, &on_leave_bytes, js_ctx, b"__interceptorLeave\0", "interceptor.onLeave");
+
+    // 同步可能被 onLeave 改过的 x0
+    sync_js_ctx_to_hook_ctx(ctx, js_ctx, ctx_ptr);
+
+    ffi::qjs_free_value(ctx, js_ctx);
 }

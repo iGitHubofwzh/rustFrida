@@ -212,6 +212,11 @@ unsafe fn autobox_primitive_to_jobject(
 /// Shared by `js_call_original` (JS callback) and fallback path (JS engine busy).
 /// Returns the raw u64 return value for writing to HookContext.x[0].
 /// For void methods, returns 0.
+/// app 原方法抛的 Java 异常 **不 clear, 不 take** — 保留 pending 在 JNIEnv,
+/// 让它沿标准 JNI 路径自然传播到 Java 调用方 (Frida 行为)。
+///
+/// 约束: JS 回调里如果 orig() 后再做 JNI 调用, CheckJNI 见 pending 会 abort;
+/// 用户需自己处理 (try/catch 或避免后续 JNI)。
 unsafe fn invoke_original_jni(
     env: JniEnv,
     art_method_addr: u64,
@@ -260,7 +265,6 @@ unsafe fn invoke_original_jni_inner(
                 is_static,
                 ()
             );
-            jni_check_exc(env);
             0
         }
         b'Z' => {
@@ -275,7 +279,6 @@ unsafe fn invoke_original_jni_inner(
                 is_static,
                 u8
             );
-            jni_check_exc(env);
             ret as u64
         }
         b'I' | b'B' | b'C' | b'S' => {
@@ -290,7 +293,6 @@ unsafe fn invoke_original_jni_inner(
                 is_static,
                 i32
             );
-            jni_check_exc(env);
             ret as u64
         }
         b'J' => {
@@ -305,7 +307,6 @@ unsafe fn invoke_original_jni_inner(
                 is_static,
                 i64
             );
-            jni_check_exc(env);
             ret as u64
         }
         b'F' => {
@@ -350,7 +351,6 @@ unsafe fn invoke_original_jni_inner(
                 is_static,
                 *mut std::ffi::c_void
             );
-            jni_check_exc(env);
             ret as u64
         }
         _ => 0,
@@ -508,6 +508,9 @@ unsafe extern "C" fn js_call_original(
         is_static,
         jargs_ptr,
     );
+
+    // app 抛的 Java 异常保留在 JNIEnv pending — 返回到 Java 后自然传播。
+    // JS 层如果要感知异常, 需自己调 env 的 ExceptionCheck (未来可封装)。
 
     // Convert raw return value to JS value
     match return_type {

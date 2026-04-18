@@ -329,6 +329,11 @@ pub(crate) unsafe fn dup_callback_to_bytes(ctx: *mut ffi::JSContext, callback: f
 /// - `build_context`: 闭包，构建传给 JS 回调的上下文对象（返回 JSValue）
 /// - `handle_result`: 闭包，处理 JS 回调返回值（仅无异常时调用）；
 ///   参数为 (ctx, js_ctx_obj, call_result)，可同时访问上下文对象和调用结果
+/// - `on_js_exception`: 闭包，JS 抛异常时在 **JS_ENGINE 锁仍持有、QuickJS stack_top
+///   仍有效** 的上下文里调用。用于需要"与 ctx.orig() 同等 ART 可见状态"的 fallback。
+///   传 `|| {}` 跳过。
+///
+/// 返回值: `true` 表示 JS 回调抛异常（handle_result 未被调用），`false` 表示正常执行。
 pub(crate) unsafe fn invoke_hook_callback_common(
     ctx_raw: usize,
     callback_bytes: &[u8; 16],
@@ -336,13 +341,14 @@ pub(crate) unsafe fn invoke_hook_callback_common(
     target_id: u64,
     build_context: impl FnOnce(*mut ffi::JSContext) -> ffi::JSValue,
     handle_result: impl FnOnce(*mut ffi::JSContext, ffi::JSValue, ffi::JSValue),
-) {
+    on_js_exception: impl FnOnce(*mut ffi::JSContext, ffi::JSValue),
+) -> bool {
     let ctx = ctx_raw as *mut ffi::JSContext;
 
     // 获取 JS 引擎锁（try_lock 避免死锁）
     let _js_guard = match acquire_js_engine_for_callback(ctx, context_name, target_id) {
         Some(g) => g,
-        None => return,
+        None => return false,
     };
 
     // 从 bytes 提取 JS callback value，dup 增加引用计数。
@@ -357,14 +363,19 @@ pub(crate) unsafe fn invoke_hook_callback_common(
     let global = ffi::JS_GetGlobalObject(ctx);
     let result = ffi::JS_Call(ctx, callback_dup, global, 1, &js_ctx as *const _ as *mut _);
 
-    // 异常检查 — 无异常时才处理返回值
-    if !handle_js_exception(ctx, result, context_name) {
+    // 异常检查 — 无异常时才处理返回值；有异常则在锁内调 fallback
+    let had_exception = handle_js_exception(ctx, result, context_name);
+    if had_exception {
+        on_js_exception(ctx, js_ctx);
+    } else {
         handle_result(ctx, js_ctx, result);
     }
 
-    // 清理 JS 值
+    // 清理 JS 值（锁仍持有 + stack_top 仍有效）
     ffi::qjs_free_value(ctx, js_ctx);
     ffi::qjs_free_value(ctx, result);
     ffi::qjs_free_value(ctx, global);
     ffi::qjs_free_value(ctx, callback_dup);
+
+    had_exception
 }
