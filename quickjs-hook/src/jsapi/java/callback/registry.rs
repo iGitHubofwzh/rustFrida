@@ -55,56 +55,65 @@ unsafe impl Sync for JavaHookData {}
 /// Global Java hook registry keyed by art_method address
 pub(super) static JAVA_HOOK_REGISTRY: Mutex<Option<HashMap<u64, JavaHookData>>> = Mutex::new(None);
 
-/// Thunk 在途计数的真实存储在 C 侧 `g_thunk_in_flight`，由 art_router prologue/
-/// epilogue 的 LDADDAL 汇编指令原子增减。Rust 侧只做读取和轮询。
+/// Java hook 在途计数 —— 只在"JS callback 实际执行中"时 ≠ 0。
 ///
-/// 原来的 `IN_FLIGHT_JAVA_HOOK_CALLBACKS` 是在 JS callback dispatch 首尾做 Rust 侧
-/// Mutex inc/dec——覆盖范围是"JS callback 执行期间"，不包含 thunk prologue/scan/
-/// restore/BR 等汇编段。改为 thunk 汇编自身计数后，drain==0 意味着"没有任何线程
-/// 的 PC 还在 thunk 内，也没有任何栈帧保存了 thunk 内的返回地址"（用户要求的语义）。
+/// 计数点 (Rust java_hook_callback 进出):
+///   enter → IN_FLIGHT += 1   (JSEngine 获取前)
+///   drop  → IN_FLIGHT -= 1   (JSEngine 返回后)
 ///
-/// 历史占位: 汇编侧 LDADDAL 直接管理 g_thunk_in_flight, Rust 侧此 guard 为空壳,
-/// 保留是为了避免一次性改动所有 callback 调用点。enter/drop 均为 NO-OP。
+/// 与旧方案 (汇编 thunk 全局 g_thunk_in_flight) 的区别：
+/// - 旧: art_router scan 进入就计, found/not_found 一视同仁, attach 包裹原函数 →
+///        任何 Java 阻塞都把 counter 钉死不归零
+/// - 新: 只计 "正在执行 JS callback 的线程", 只要 JS 回调链退出就减. 原函数
+///        (DoCall 走 not_found 路径) 阻塞不影响计数
+///
+/// drain=0 语义: "没有任何 JS callback 在执行" → 安全 free callback JSValue /
+/// JNI ref / replacement ArtMethod. 栈帧残留于 attach thunk BLR 之后 (callback 未
+/// 触发, 线程在原函数内阻塞) 对软清理无影响 (不 munmap pool, 线程后续自然返回).
+static IN_FLIGHT_JAVA_HOOK_CALLBACKS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static IN_FLIGHT_JAVA_HOOK_CALLBACKS_CV: std::sync::Condvar = std::sync::Condvar::new();
+
 pub(super) struct InFlightJavaHookGuard;
 
 impl InFlightJavaHookGuard {
     pub(super) fn enter() -> Self {
+        let mut c = IN_FLIGHT_JAVA_HOOK_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+        *c += 1;
         Self
     }
 }
 
 impl Drop for InFlightJavaHookGuard {
-    fn drop(&mut self) {}
-}
-
-/// 读 C 全局 `g_thunk_in_flight`。
-pub(super) fn in_flight_java_hook_callbacks() -> usize {
-    unsafe {
-        std::ptr::read_volatile(&crate::ffi::hook::g_thunk_in_flight) as usize
+    fn drop(&mut self) {
+        let mut c = IN_FLIGHT_JAVA_HOOK_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            IN_FLIGHT_JAVA_HOOK_CALLBACKS_CV.notify_all();
+        }
     }
 }
 
-/// 轮询 g_thunk_in_flight 至 0。粒度 20ms，真实归零后额外再等 BR_SETTLE_MS
-/// 让 LDADDAL(dec) 之后的 "ldr x16, target; br x16" 两条指令彻底离开 thunk。
+pub(super) fn in_flight_java_hook_callbacks() -> usize {
+    *IN_FLIGHT_JAVA_HOOK_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 条件变量等 IN_FLIGHT_JAVA_HOOK_CALLBACKS 归零 (callback drop 时 notify_all)
 pub(super) fn wait_for_in_flight_java_hook_callbacks(timeout: std::time::Duration) -> bool {
-    const POLL_MS: u64 = 20;
-    const BR_SETTLE_MS: u64 = 50; // 等 dec 之后 ldr+br 窗口真正执行完
     let start = std::time::Instant::now();
-    loop {
-        let cnt = in_flight_java_hook_callbacks();
-        if cnt == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(BR_SETTLE_MS));
-            // 再次确认（万一 settle 期间又有线程混进来：此时 hooks 已 unpatch，
-            // 理论上不会，但稳妥起见再读一次）
-            if in_flight_java_hook_callbacks() == 0 {
-                return true;
-            }
-        }
-        if start.elapsed() >= timeout {
+    let mut c = IN_FLIGHT_JAVA_HOOK_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+    while *c != 0 {
+        let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+            return false;
+        };
+        let (guard, res) = IN_FLIGHT_JAVA_HOOK_CALLBACKS_CV
+            .wait_timeout(c, remaining)
+            .unwrap_or_else(|e| e.into_inner());
+        c = guard;
+        if res.timed_out() && *c != 0 {
             return false;
         }
-        std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
     }
+    true
 }
 
 /// Parse JNI signature to extract the return type character.

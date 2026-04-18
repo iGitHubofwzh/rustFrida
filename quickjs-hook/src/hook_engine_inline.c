@@ -7,6 +7,7 @@
  */
 
 #include "hook_engine_internal.h"
+#include <stdbool.h>
 
 /* --- Simple replacement hook (hook_install) --- */
 
@@ -47,9 +48,15 @@ void* hook_install(void* target, void* replacement, int stealth) {
 /* --- Shared thunk emit helpers --- */
 
 void emit_save_hook_context(Arm64Writer* w, uint64_t target_pc, uint64_t trampoline_ptr) {
-    /* 所有 inline hook thunk（attach / replace）在入口即 inc thunk_in_flight。
-     * 配对的 dec 在 emit_replace_epilogue 和 generate_attach_thunk 各自 RET 前。 */
-    emit_thunk_inflight_inc(w);
+    /* Thunk-level 在途计数已废弃: 原来 emit_thunk_inflight_inc 在此 inc, epilogue dec,
+     * 语义是"所有线程 PC 脱离 thunk"。问题: attach thunk 包裹原函数调用 (BLR),
+     * 任何 Java 阻塞方法 (Looper.pollOnce / Object.wait / IO) 会把 DoCall 卡在
+     * BLR trampoline 里, counter 永不归零 → drain 超时.
+     *
+     * 新语义: 只在 Rust java_hook_callback / native hook callback 进出点 inc/dec.
+     * drain==0 等价于"无 JS callback 正在执行", 足以安全 free JS 资源 (callback JSValue
+     * / replacement ArtMethod / JNI ref). 栈帧滞留于 attach thunk 的 BLR 之后不影响软清理
+     * (不 munmap pool, 线程后续自然回落)。full cleanup 依赖时间衰减 + drain timeout leak 路径. */
 
     /* HookContext: x0-x30 (31*8=248) + sp (8) + pc (8) + nzcv (8) + trampoline (8) + d[8] (64) = 344 bytes
      * Round up to 16-byte alignment: 352 bytes */
@@ -88,6 +95,11 @@ void emit_save_hook_context(Arm64Writer* w, uint64_t target_pc, uint64_t trampol
     for (int i = 0; i < 8; i += 2) {
         arm64_writer_put_fp_stp_offset(w, i, i + 1, ARM64_REG_SP, 280 + i * 8);
     }
+
+    /* 初始化 intercept_leave = 1 (默认 wrap). on_enter 可写 0 切换 tail-jump.
+     * offset 344 = sizeof(HookContext_reg/fp) 末尾, 仍在 352 字节栈框内. */
+    arm64_writer_put_mov_reg_imm(w, ARM64_REG_X16, 1);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_SP, 344);
 }
 
 void emit_callback_call(Arm64Writer* w, HookCallback callback, void* user_data) {
@@ -130,8 +142,7 @@ void emit_replace_epilogue(Arm64Writer* w) {
     /* Deallocate stack (352 bytes) */
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 352);
 
-    /* dec thunk_in_flight + ret */
-    emit_thunk_inflight_dec(w);
+    /* thunk-level dec 已废弃 (见 emit_save_hook_context 注释) */
     arm64_writer_put_ret(w);
 }
 
@@ -188,12 +199,25 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     /* Restore x0-x15 from context (callback may have modified arguments) */
     emit_restore_caller_regs(&w);
 
-    /* Call original function via trampoline.
-     * Load the trampoline address into x16 first (the only window where x16 is
-     * unavailable as general scratch), then restore x17-x18 from context, then
-     * execute BLR x16 so the original function runs with all registers intact. */
+    /* x16 = trampoline (scratch). x17 = intercept_leave flag (scratch, 尚未恢复真值).
+     * 根据 flag 分两路 (仅当 on_leave==NULL 时允许 tail-jump, on_leave 注册时必须 wrap):
+     *   flag != 0 (默认) → wrap: BLR 原函数, 返回后走 on_leave + 出 thunk RET
+     *   flag == 0        → tail-jump: 恢复 x30/NZCV/x17/x18, ADD SP, BR trampoline, 不再回 thunk
+     *
+     * tail-jump 路径省掉 thunk 栈帧在 BLR 期间的驻留, 原函数阻塞时 PC 已脱离 thunk,
+     * full cleanup munmap pool 安全 (对标 "miss 不留栈帧" 的性能+安全优化). */
     arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)entry->trampoline);
-    /* Restore x17-x18 now that x16 holds the trampoline address */
+
+    uint64_t lbl_tail = 0;
+    bool support_tail_jump = (on_leave == NULL);
+    if (support_tail_jump) {
+        arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 344); /* flag scratch */
+        lbl_tail = arm64_writer_new_label_id(&w);
+        arm64_writer_put_cbz_reg_label(&w, ARM64_REG_X17, lbl_tail);
+    }
+
+    /* --- wrap path (intercept leave) --- */
+    /* 恢复真实 x17,x18 */
     arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_X18,
                                              ARM64_REG_SP, 136, ARM64_INDEX_SIGNED_OFFSET);
     arm64_writer_put_blr_reg(&w, ARM64_REG_X16);
@@ -212,18 +236,34 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     /* Restore x30 (LR) */
     arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
 
-    /* Restore NZCV condition flags from context.nzcv ([SP+264]).
-     * X17 is a caller-saved scratch register per ABI; using it here to ferry
-     * the NZCV value to MSR does not violate any calling convention. */
-    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 264); /* nzcv offset */
-    arm64_writer_put_msr_reg(&w, 0xDA10, ARM64_REG_X17); /* MSR NZCV, X17 */
+    /* Restore NZCV using x17 as scratch (x17 即将 RET 返回, 不需保留真值) */
+    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 264);
+    arm64_writer_put_msr_reg(&w, 0xDA10, ARM64_REG_X17);
 
     /* Deallocate stack */
     arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
 
-    /* dec + ret */
-    emit_thunk_inflight_dec(&w);
     arm64_writer_put_ret(&w);
+
+    /* --- tail-jump path (no-intercept-leave) --- */
+    if (support_tail_jump) {
+        arm64_writer_put_label(&w, lbl_tail);
+
+        /* 恢复 caller's LR (x30), 让原函数 RET 直接回到 caller */
+        arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X30, ARM64_REG_SP, 240);
+
+        /* Restore NZCV using x17 as scratch (x17 稍后从 ctx 重载真值) */
+        arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_SP, 264);
+        arm64_writer_put_msr_reg(&w, 0xDA10, ARM64_REG_X17);
+
+        /* 恢复真实 x17,x18 (覆盖 NZCV scratch) */
+        arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X17, ARM64_REG_X18,
+                                                 ARM64_REG_SP, 136, ARM64_INDEX_SIGNED_OFFSET);
+
+        /* Deallocate stack + tail-jump */
+        arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
+        arm64_writer_put_br_reg(&w, ARM64_REG_X16);
+    }
 
     /* Flush any pending labels */
     arm64_writer_flush(&w);

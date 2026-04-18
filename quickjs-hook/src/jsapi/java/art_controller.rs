@@ -501,13 +501,14 @@ pub(super) fn ensure_art_controller_initialized(
     }
 
     // --- Layer 2: DoCall hook (解释器路径) ---
-    // **实验性跳过**: DoCall 触发率极高 (~每 interpreter 方法调度 1 次, 实测 98 万次),
-    // 命中率极低 (实测 0.05%, 472/98 万). 对 compiled-only hook 场景纯冗余, 且
-    // 任何 Java 阻塞方法 (synchronized/wait/IO) 都会把 DoCall thunk 卡在 trampoline 里
-    // → thunk_in_flight counter 无法归 0, cleanup drain 超时.
+    // 覆盖 interpreter-only 调用链 (纯 interpreter caller 调 interpreter callee,
+    // 不经任何 stub → Layer 1/3 漏掉). 命中率实测 0.05%, 但 deopt 后全量 interpreter
+    // 模式下这条路径变主力.
     //
-    // 保留代码便于未来对 non-compiled / interpreter-only 方法需要时再启用.
-    let skip_do_call = true;
+    // 历史问题: DoCall 通过 hook_attach 包裹原函数, 任何 Java 阻塞 (wait/IO) 会
+    // 把 thunk 栈帧钉在 BLR 之后, 全局 g_thunk_in_flight 永不归零. 已通过把
+    // 计数点改到 Rust java_hook_callback 解决 (阻塞在原 DoCall 不影响新计数).
+    let skip_do_call = false;
     if !skip_do_call {
         for (i, &addr) in bridge.do_call_addrs.iter().enumerate() {
             if addr == 0 {
@@ -732,16 +733,20 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
     let ctx = &mut *ctx_ptr;
     let method = ctx.x[0];
     DO_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // 默认: miss → tail-jump (原函数跑完不回 thunk, 无栈帧残留)
+    ctx.intercept_leave = 0;
+
     if let Some(replacement) = get_replacement_method(method) {
         DO_CALL_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
         // 递归防护: TLS bypass (callOriginal) + managed stack check
         ensure_bypass_key();
         let bypass = libc::pthread_getspecific(BYPASS_KEY) as u64;
         if bypass == method {
-            return; // callOriginal bypass
+            return; // callOriginal bypass — 仍走 tail-jump (intercept_leave=0)
         }
         if !should_replace_for_stack(replacement) {
-            return; // managed stack 递归
+            return; // managed stack 递归 — 走 tail-jump
         }
         // 同步 declaring_class_: replacement (malloc'd) 不被 GC 追踪，
         // GC 移动 declaring class 后 replacement 的 declaring_class_ 可能 stale。
@@ -749,7 +754,11 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
         let dc = std::ptr::read_volatile(method as *const u32);
         std::ptr::write_volatile(replacement as *mut u32, dc);
         ctx.x[0] = replacement;
+        // hit → 需要 wrap, 这样 thunk counter / java_hook_callback 能覆盖
+        // replacement 整个执行期, drain 才能保证 "所有 replacement 退出".
+        ctx.intercept_leave = 1;
     }
+    // else: miss, intercept_leave 保持 0 → tail-jump, 不回 thunk
 }
 
 /// 递归防护: 检查当前线程的 ManagedStack 判断是否应该进行替换。

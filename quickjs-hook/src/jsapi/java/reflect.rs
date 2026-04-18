@@ -1300,10 +1300,19 @@ pub(crate) unsafe fn get_class_name_unchecked(env_ptr: u64, cls_ptr: u64) -> Opt
     Some(name)
 }
 
-/// Find a Java class by name. Tries JNI FindClass first (works for system/framework classes),
-/// then falls back to ClassLoader.loadClass() for app classes.
+/// Find a Java class by name.
 /// `class_name` can use either `.` or `/` notation.
 /// Returns a JNI local ref to the jclass, or null on failure.
+///
+/// 策略 (与 hook callback 上下文无关, 统一路径):
+///   1. cache 命中 → 直接返回
+///   2. ClassLoader 就绪 → loadClass (首选, 不触发 WalkStack)
+///   3. fallback → JNI FindClass
+///
+/// 注: 历史上 hook callback 里 block 过 FindClass (GetCallingClass→WalkStack 怕踩 hook 帧),
+/// 但 walkstack guards (hook_replace GetOatQuickMethodHeader + 内联 OAT patch +
+/// PrettyMethod + SIGSEGV handler) 已到位, WalkStack 碰 hook 帧现在是安全的,
+/// 无需 block/绕行.
 pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std::ffi::c_void {
     // Clear any stale exception before calling FindClass.
     // ART's FindClass asserts no pending exception — calling it with one → SIGABRT.
@@ -1314,10 +1323,6 @@ pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std:
         return cached;
     }
 
-    // 优先使用 ClassLoader.loadClass（不触发 WalkStack）。
-    // FindClass 内部调用 GetCallingClass → WalkStack，在 hook 回调中会因为
-    // 栈帧上有被 hook 的方法（entry_point 已改变）导致 OAT header 查找失败 → SIGSEGV (API 36)。
-    // ClassLoader.loadClass 通过 CallObjectMethodA 调用，不做 stack walk，安全。
     let has_classloader = {
         let ovr_cl = CL_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
         let ovr_mid = LC_MID_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
@@ -1329,26 +1334,15 @@ pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std:
     };
 
     if has_classloader {
-        // ClassLoader 已就绪 → 优先使用 loadClass 避免 WalkStack
         let result = find_class_via_classloader(env, class_name);
-        // 一旦 ClassLoader 已可用，就不要再 fallback 到 JNI FindClass。
-        // 在 hook 回调/异常回溯路径里，FindClass 会触发 GetCallingClass →
-        // WalkStack/GetDexPc，仍可能因为被 hook 的编译帧而 abort。
         if !result.is_null() {
             cache_class_global_ref(env, class_name, result);
+            return result;
         }
-        return result;
+        // loadClass 失败 (ClassNotFoundException 等) → 继续 fallback 到 JNI FindClass
     }
 
-    if crate::jsapi::java::callback::in_java_hook_callback() {
-        crate::jsapi::console::output_verbose(&format!(
-            "[java] find_class_safe: skip JNI FindClass fallback inside hook callback: {}",
-            class_name
-        ));
-        return std::ptr::null_mut();
-    }
-
-    // Fallback: ClassLoader 未初始化（bootstrap 阶段）或 loadClass 失败 → 使用 JNI FindClass
+    // JNI FindClass: ClassLoader 未就绪时, 或 loadClass 失败后兜底
     let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
     let jni_name = class_name.replace('.', "/");
     let c_name = match CString::new(jni_name) {

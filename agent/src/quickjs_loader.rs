@@ -267,15 +267,11 @@ pub fn cleanup() {
 
     // ============================================================
     // Phase 4: 同步释放 pool + recomp (drain 已归零, 确认无 in-flight)
-    //
-    // drain=true 路径走快道：直接 Rust/C 同步 munmap。Janitor 存在但不会被
-    // 触发 (counter=0, 无 thunk 进入)。若未来 agent 再次 init, pool 从头分配。
     // ============================================================
     cleanup_wxshadow_patches();
     stage("phase4 cleanup_wxshadow_patches", &mut t);
     crate::recompiler::release_all();
     stage("phase4 release_all_recomp", &mut t);
-    // 先同步 munmap recomp 页 (Rust 侧管理)
     let (recomp_ok, recomp_fail, recomp_bytes) =
         unsafe { crate::recompiler::munmap_retained_ranges() };
     if recomp_ok + recomp_fail > 0 {
@@ -284,7 +280,6 @@ pub fn cleanup() {
             recomp_ok, recomp_fail, recomp_bytes
         ));
     }
-    // 再同步 munmap hook pool (C 侧 g_engine.pools[])
     unsafe {
         quickjs_hook::ffi::hook::hook_engine_munmap_pools_direct();
     }

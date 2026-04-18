@@ -164,8 +164,8 @@ void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0) {
 #define ROUTER_SAVED_LR_OFF  (ROUTER_FRAME_GPR_OFF + 128 + 8)  /* 152 */
 
 static void emit_art_router_prologue(Arm64Writer* w) {
-    /* 第一步：inc thunk_in_flight (使用 x16/x17 作 scratch, 此时它们尚未被使用) */
-    emit_thunk_inflight_inc(w);
+    /* thunk-level 计数废弃, 见 hook_engine_inline.c emit_save_hook_context 注释.
+     * 计数改为只在 Rust java_hook_callback 进出点 inc/dec. */
     /* 分配整个帧 */
     arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
     /* FPR: d0-d7 at SP+160 */
@@ -229,8 +229,7 @@ static void emit_art_router_restore_all(Arm64Writer* w) {
     }
     /* 释放帧 */
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
-    /* 离开 thunk: dec thunk_in_flight。x16/x17 scratch，caller 即将 ldr x16, target */
-    emit_thunk_inflight_dec(w);
+    /* thunk-level dec 废弃 (见 prologue 注释) */
 }
 
 /* Debug: store X0 to g_art_router_last_x0, increment g_art_router_miss_count */

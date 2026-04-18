@@ -29,13 +29,15 @@ extern "C" {
 
 /* Hook context - contains all ARM64 registers */
 typedef struct {
-    uint64_t x[31];     /* x0-x30: 0-247 */
-    uint64_t sp;        /* Stack pointer: 248 */
-    uint64_t pc;        /* Program counter (original): 256 */
-    uint64_t nzcv;      /* Condition flags: 264 */
-    void* trampoline;   /* Trampoline for callOriginal (NULL if N/A): 272 */
-    uint64_t d[8];      /* d0-d7 FP registers: 280-343 */
-} HookContext;           /* 344 bytes, fits in 352-byte stack alloc (16-byte aligned) */
+    uint64_t x[31];         /* x0-x30: 0-247 */
+    uint64_t sp;            /* Stack pointer: 248 */
+    uint64_t pc;            /* Program counter (original): 256 */
+    uint64_t nzcv;          /* Condition flags: 264 */
+    void* trampoline;       /* Trampoline for callOriginal (NULL if N/A): 272 */
+    uint64_t d[8];          /* d0-d7 FP registers: 280-343 */
+    uint64_t intercept_leave; /* 344: attach 模式下 on_enter 返回前可改写. 1=wrap (现有语义),
+                               * 0=tail-jump 原函数不回 thunk (miss 快路径, 无栈帧残留). */
+} HookContext;              /* 352 bytes, 16-byte aligned */
 
 /* Callback function types */
 typedef void (*HookCallback)(HookContext* ctx, void* user_data);
