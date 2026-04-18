@@ -61,9 +61,10 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
     Some(JsEngineCallbackGuard::Locked { _guard: g })
 }
 
-/// Check for JS exception, extract message, and output error.
+/// Check for JS exception, extract message + stack, and output error.
 ///
 /// Returns true if an exception was found (caller should do cleanup and return).
+/// 输出格式: `[{ctx} error] {message}\n{stack}` — stack 含 QuickJS 行号/函数名, 便于定位。
 /// Handles secondary exceptions from toString gracefully.
 pub(crate) unsafe fn handle_js_exception(ctx: *mut ffi::JSContext, result: ffi::JSValue, context_name: &str) -> bool {
     if ffi::qjs_is_exception(result) == 0 {
@@ -71,6 +72,8 @@ pub(crate) unsafe fn handle_js_exception(ctx: *mut ffi::JSContext, result: ffi::
     }
     let exc = ffi::JS_GetException(ctx);
     let exc_val = JSValue(exc);
+
+    // message: Error.prototype.message 或 fallback 到 exception 本身 toString
     let msg_prop = exc_val.get_property(ctx, "message");
     let msg = if let Some(s) = msg_prop.to_string(ctx) {
         msg_prop.free(ctx);
@@ -80,7 +83,7 @@ pub(crate) unsafe fn handle_js_exception(ctx: *mut ffi::JSContext, result: ffi::
         let fallback = exc_val
             .to_string(ctx)
             .unwrap_or_else(|| "[unknown exception]".to_string());
-        // Consume any secondary exception from toString
+        // 吞掉 toString 可能抛出的二级异常
         let secondary = ffi::JS_GetException(ctx);
         let secondary_val = JSValue(secondary);
         if !secondary_val.is_null() && !secondary_val.is_undefined() {
@@ -88,7 +91,16 @@ pub(crate) unsafe fn handle_js_exception(ctx: *mut ffi::JSContext, result: ffi::
         }
         fallback
     };
-    output_message(&format!("[{} error] {}", context_name, msg));
+
+    // stack: QuickJS 在 Error 对象上自动生成, 含 "<anonymous>@<file>:<line>" 每一帧
+    let stack_prop = exc_val.get_property(ctx, "stack");
+    let stack = stack_prop.to_string(ctx).filter(|s| !s.is_empty());
+    stack_prop.free(ctx);
+
+    match stack {
+        Some(s) => output_message(&format!("[{} error] {}\n{}", context_name, msg, s.trim_end())),
+        None => output_message(&format!("[{} error] {}", context_name, msg)),
+    }
     exc_val.free(ctx);
     true
 }
