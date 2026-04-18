@@ -60,11 +60,24 @@ impl StealthMode {
     }
 }
 
+/// Hook 安装种类: Replace 单阶段（hook_replace） or Attach 双阶段（hook_attach）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookKind {
+    /// hook_replace: 完全替换，thunk 只在进入时调 on_enter；callOriginal 靠 ctx.orig() 显式触发
+    Replace,
+    /// hook_attach: Frida-style，thunk 自动 BLR 原函数；on_enter 观察/改参数，on_leave 观察/改返回值
+    Attach,
+}
+
 /// Stored hook callback data - stores raw bytes to avoid Send/Sync issues
 pub(crate) struct HookData {
     pub(crate) ctx: usize,               // Store as usize to avoid Send/Sync issues
-    pub(crate) callback_bytes: [u8; 16], // JSValue is 16 bytes (u64 + i64)
+    pub(crate) callback_bytes: [u8; 16], // on_enter / replace callback (JSValue 16 字节)
+    pub(crate) on_leave_bytes: [u8; 16], // on_leave (attach 模式) — has_on_leave=false 时全 0
+    pub(crate) has_on_enter: bool,       // attach 模式下 onEnter 可缺省
+    pub(crate) has_on_leave: bool,       // attach 模式下 onLeave 可缺省
     pub(crate) trampoline: u64,          // Trampoline address for callOriginal (replace mode)
+    pub(crate) kind: HookKind,           // Replace or Attach
     pub(crate) mode: StealthMode,        // hook 模式（unhook 时需要）
     pub(crate) recomp_addr: u64,         // Recomp 模式下的重编译地址
 }

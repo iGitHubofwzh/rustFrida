@@ -12,7 +12,10 @@ use crate::jsapi::callback_util::set_js_u64_property;
 use crate::jsapi::util::add_cfunction_to_object;
 
 use callback::{in_flight_native_hook_callbacks, wait_for_in_flight_native_hook_callbacks};
-use functions::{js_call_native, js_diag_alloc_near, js_hook, js_native_call, js_recomp_hook, js_unhook};
+use functions::{
+    js_call_native, js_diag_alloc_near, js_hook, js_interceptor_attach, js_interceptor_detach_all,
+    js_interceptor_flush, js_interceptor_replace, js_native_call, js_recomp_hook, js_unhook,
+};
 #[cfg(feature = "qbdi")]
 pub use qbdi::preload_qbdi_helper;
 #[cfg(feature = "qbdi")]
@@ -40,6 +43,14 @@ pub fn register_hook_api(ctx: &JSContext) {
         set_js_u64_property(ctx.as_ptr(), hook_obj, "WXSHADOW", STEALTH_WXSHADOW as u64);
         set_js_u64_property(ctx.as_ptr(), hook_obj, "RECOMP", STEALTH_RECOMP as u64);
         global.set_property(ctx.as_ptr(), "Hook", crate::value::JSValue(hook_obj));
+
+        // Frida-compatible Interceptor: attach (双阶段) / replace (单阶段) / detachAll / flush
+        let interceptor = ffi::JS_NewObject(ctx.as_ptr());
+        add_cfunction_to_object(ctx.as_ptr(), interceptor, "attach", js_interceptor_attach, 2);
+        add_cfunction_to_object(ctx.as_ptr(), interceptor, "replace", js_interceptor_replace, 2);
+        add_cfunction_to_object(ctx.as_ptr(), interceptor, "detachAll", js_interceptor_detach_all, 0);
+        add_cfunction_to_object(ctx.as_ptr(), interceptor, "flush", js_interceptor_flush, 0);
+        global.set_property(ctx.as_ptr(), "Interceptor", crate::value::JSValue(interceptor));
     }
 
     #[cfg(feature = "qbdi")]
@@ -57,6 +68,13 @@ pub fn register_hook_api(ctx: &JSContext) {
         Ok(val) => val.free(ctx.as_ptr()),
         Err(e) => crate::jsapi::console::output_message(&format!("[hook_api] native_boot error: {}", e)),
     }
+
+    // Load Interceptor helpers (args/retval Proxy wrappers for Frida-compatible onEnter/onLeave)
+    let interceptor_boot = include_str!("interceptor_boot.js");
+    match ctx.eval(interceptor_boot, "<interceptor_boot>") {
+        Ok(val) => val.free(ctx.as_ptr()),
+        Err(e) => crate::jsapi::console::output_message(&format!("[hook_api] interceptor_boot error: {}", e)),
+    }
 }
 
 /// 移除单个 native hook: hook_remove + revert_slot_patch (stealth2)。
@@ -73,11 +91,17 @@ pub(crate) unsafe fn remove_single_hook(addr: u64, data: &registry::HookData) {
     }
 }
 
-/// 释放单个 hook 的 JS callback 引用。
+/// 释放单个 hook 的 JS callback 引用（on_enter/replace + attach 的 on_leave）。
 pub(crate) unsafe fn free_hook_callback(data: &registry::HookData) {
     let ctx = data.ctx as *mut ffi::JSContext;
-    let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-    ffi::qjs_free_value(ctx, callback);
+    if data.has_on_enter {
+        let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
+        ffi::qjs_free_value(ctx, callback);
+    }
+    if data.has_on_leave {
+        let on_leave: ffi::JSValue = std::ptr::read(data.on_leave_bytes.as_ptr() as *const ffi::JSValue);
+        ffi::qjs_free_value(ctx, on_leave);
+    }
 }
 
 /// Phase 1 - 切断 native hook 入口 (hook() JS API 装的所有 hook，不释放 callback)。

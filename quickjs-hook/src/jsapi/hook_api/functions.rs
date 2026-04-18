@@ -3,14 +3,17 @@
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{
-    dup_callback_to_bytes, ensure_function_arg, extract_pointer_address, js_i64_to_js_number_or_bigint,
-    js_value_to_u64_or_zero, throw_internal_error,
+    dup_callback_to_bytes, ensure_function_arg, extract_pointer_address, get_js_u64_property,
+    js_i64_to_js_number_or_bigint, js_value_to_u64_or_zero, set_js_cfunction_property,
+    set_js_u64_property, throw_internal_error,
 };
 use crate::jsapi::util::is_addr_accessible;
 use crate::value::JSValue;
 
-use super::callback::hook_callback_wrapper;
-use super::registry::{hook_error_message, init_registry, HookData, StealthMode, HOOK_OK, HOOK_REGISTRY};
+use super::callback::{attach_on_enter_wrapper, attach_on_leave_wrapper, hook_callback_wrapper};
+use super::registry::{
+    hook_error_message, init_registry, HookData, HookKind, StealthMode, HOOK_OK, HOOK_REGISTRY,
+};
 use crate::jsapi::callback_util::with_registry_mut;
 
 /// hook(ptr, callback, mode?) - Install a hook at the given address
@@ -148,7 +151,11 @@ unsafe fn install_hook(
             HookData {
                 ctx: ctx as usize,
                 callback_bytes,
+                on_leave_bytes: [0u8; 16],
+                has_on_enter: true,
+                has_on_leave: false,
                 trampoline: trampoline as u64,
+                kind: HookKind::Replace,
                 mode,
                 recomp_addr,
             },
@@ -507,4 +514,254 @@ pub(crate) unsafe extern "C" fn js_diag_alloc_near(
 
     hook_ffi::hook_diag_alloc_near(addr as *mut std::ffi::c_void);
     JSValue::undefined().raw()
+}
+
+// ═════════════════════════════ Interceptor (Frida) ════════════════════════════
+
+fn parse_stealth_mode(ctx: *mut ffi::JSContext, v: JSValue) -> StealthMode {
+    match v.to_i64(ctx) {
+        Some(n) => StealthMode::from_js_arg(n),
+        None if v.to_bool() == Some(true) => StealthMode::WxShadow,
+        None => StealthMode::Normal,
+    }
+}
+
+fn hook_error_str(code: i32) -> String {
+    let bytes = hook_error_message(code);
+    std::ffi::CStr::from_bytes_with_nul(bytes)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "hook engine error".to_string())
+}
+
+/// Interceptor.attach(target, callbacks, mode?)
+/// callbacks: `{ onEnter?(args) { ... }, onLeave?(retval) { ... } }`
+///   - `this` 在 onEnter/onLeave 之间共享，用户可挂自定义字段跨阶段传状态
+///   - args 是 NativePointer 代理，args[0..7] = x0..x7，支持写回
+///   - retval.replace(v) 改返回值，retval.toInt32() 等
+/// 返回 listener `{ detach(): 分离此 hook }`
+pub(crate) unsafe extern "C" fn js_interceptor_attach(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Interceptor.attach requires target and callbacks\0".as_ptr() as *const _,
+        );
+    }
+
+    let ptr_arg = JSValue(*argv);
+    let callbacks_arg = JSValue(*argv.add(1));
+    let mode = if argc >= 3 {
+        parse_stealth_mode(ctx, JSValue(*argv.add(2)))
+    } else {
+        StealthMode::Normal
+    };
+
+    let addr = match extract_pointer_address(ctx, ptr_arg, "Interceptor.attach") {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+
+    if !callbacks_arg.is_object() {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Interceptor.attach callbacks must be an object { onEnter?, onLeave? }\0".as_ptr() as *const _,
+        );
+    }
+
+    let on_enter_val = callbacks_arg.get_property(ctx, "onEnter");
+    let on_leave_val = callbacks_arg.get_property(ctx, "onLeave");
+    let has_on_enter = on_enter_val.is_function(ctx);
+    let has_on_leave = on_leave_val.is_function(ctx);
+
+    if !has_on_enter && !has_on_leave {
+        on_enter_val.free(ctx);
+        on_leave_val.free(ctx);
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Interceptor.attach: callbacks must provide onEnter or onLeave\0".as_ptr() as *const _,
+        );
+    }
+
+    init_registry();
+
+    // 同地址重复 attach: 先拆老 hook + 等 in-flight + 释放老 callback
+    if let Some(old_data) = with_registry_mut(&HOOK_REGISTRY, |r| r.remove(&addr)).flatten() {
+        super::remove_single_hook(addr, &old_data);
+        if super::callback::wait_for_in_flight_native_hook_callbacks(
+            std::time::Duration::from_millis(20),
+        ) {
+            super::free_hook_callback(&old_data);
+        }
+    }
+
+    // Recomp 模式：先重编译页 + 分配 slot
+    let (hook_addr, recomp_addr) = match mode {
+        StealthMode::Recomp => {
+            if let Err(e) = crate::recomp::ensure_and_translate(addr as usize) {
+                on_enter_val.free(ctx);
+                on_leave_val.free(ctx);
+                return throw_internal_error(ctx, &format!("Interceptor.attach(recomp): {}", e));
+            }
+            match crate::recomp::alloc_trampoline_slot(addr as usize) {
+                Ok(slot) => (slot as u64, slot as u64),
+                Err(e) => {
+                    on_enter_val.free(ctx);
+                    on_leave_val.free(ctx);
+                    return throw_internal_error(
+                        ctx,
+                        &format!("Interceptor.attach(recomp slot): {}", e),
+                    );
+                }
+            }
+        }
+        _ => (addr, 0),
+    };
+
+    let on_enter_bytes = if has_on_enter {
+        dup_callback_to_bytes(ctx, on_enter_val.raw())
+    } else {
+        [0u8; 16]
+    };
+    let on_leave_bytes = if has_on_leave {
+        dup_callback_to_bytes(ctx, on_leave_val.raw())
+    } else {
+        [0u8; 16]
+    };
+    on_enter_val.free(ctx);
+    on_leave_val.free(ctx);
+
+    let stealth_flag = match mode {
+        StealthMode::WxShadow => 1,
+        StealthMode::Recomp => 2,
+        _ => 0,
+    };
+
+    // 即使 user 只给了 onLeave，也要装 on_enter wrapper —— 它负责给 onLeave 准备 `this`。
+    let c_on_enter: hook_ffi::HookCallback = Some(attach_on_enter_wrapper);
+    let c_on_leave: hook_ffi::HookCallback = if has_on_leave {
+        Some(attach_on_leave_wrapper)
+    } else {
+        None
+    };
+
+    let result = hook_ffi::hook_attach(
+        hook_addr as *mut std::ffi::c_void,
+        c_on_enter,
+        c_on_leave,
+        addr as *mut std::ffi::c_void,
+        stealth_flag,
+    );
+
+    if result != HOOK_OK {
+        if has_on_enter {
+            let v: ffi::JSValue = std::ptr::read(on_enter_bytes.as_ptr() as *const ffi::JSValue);
+            ffi::qjs_free_value(ctx, v);
+        }
+        if has_on_leave {
+            let v: ffi::JSValue = std::ptr::read(on_leave_bytes.as_ptr() as *const ffi::JSValue);
+            ffi::qjs_free_value(ctx, v);
+        }
+        return throw_internal_error(ctx, &format!("hook_attach: {}", hook_error_str(result)));
+    }
+
+    // Recomp: 需要修正 slot trampoline（hook_attach 已生成 thunk 并 patch 了 slot 的 4 字节）
+    if mode == StealthMode::Recomp {
+        let trampoline = hook_ffi::hook_get_trampoline(hook_addr as *mut std::ffi::c_void);
+        if !trampoline.is_null() {
+            let _ = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, addr as usize);
+        }
+        let _ = crate::recomp::commit_slot_patch(addr as usize);
+    }
+
+    with_registry_mut(&HOOK_REGISTRY, |registry| {
+        registry.insert(
+            addr,
+            HookData {
+                ctx: ctx as usize,
+                callback_bytes: on_enter_bytes,
+                on_leave_bytes,
+                has_on_enter,
+                has_on_leave,
+                trampoline: 0,
+                kind: HookKind::Attach,
+                mode,
+                recomp_addr,
+            },
+        );
+    });
+
+    // 返回 listener { __addr, detach() }
+    let listener = ffi::JS_NewObject(ctx);
+    set_js_u64_property(ctx, listener, "__addr", addr);
+    set_js_cfunction_property(ctx, listener, "detach", js_listener_detach, 0);
+    listener
+}
+
+/// Interceptor.replace(target, replacement, mode?) — 等价现有 hook()（replace 模式）
+pub(crate) unsafe extern "C" fn js_interceptor_replace(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Interceptor.replace requires target and replacement\0".as_ptr() as *const _,
+        );
+    }
+    let ptr_arg = JSValue(*argv);
+    let replacement_arg = JSValue(*argv.add(1));
+    let mode = if argc >= 3 {
+        parse_stealth_mode(ctx, JSValue(*argv.add(2)))
+    } else {
+        StealthMode::Normal
+    };
+    install_hook(ctx, ptr_arg, replacement_arg, mode)
+}
+
+/// Interceptor.detachAll() — 拆除所有 hook（replace + attach 一起）
+pub(crate) unsafe extern "C" fn js_interceptor_detach_all(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    super::cleanup_hooks();
+    JSValue::undefined().raw()
+}
+
+/// Interceptor.flush() — 我们每次装 hook 都即时生效，无需 batch flush。保留空实现兼容脚本。
+pub(crate) unsafe extern "C" fn js_interceptor_flush(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    JSValue::undefined().raw()
+}
+
+/// listener.detach() — 拆除 Interceptor.attach 返回的单个 listener
+unsafe extern "C" fn js_listener_detach(
+    ctx: *mut ffi::JSContext,
+    this_val: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let addr = get_js_u64_property(ctx, this_val, "__addr");
+    if addr == 0 {
+        return JSValue::bool(false).raw();
+    }
+    let data = with_registry_mut(&HOOK_REGISTRY, |r| r.remove(&addr)).flatten();
+    if let Some(data) = data {
+        super::remove_single_hook(addr, &data);
+        super::free_hook_callback(&data);
+        JSValue::bool(true).raw()
+    } else {
+        JSValue::bool(false).raw()
+    }
 }
