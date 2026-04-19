@@ -132,6 +132,21 @@ pub(super) unsafe fn marshal_js_to_jvalue(
                 }
                 return 0;
             }
+            // JS array → Java Object[] (每个元素按 Ljava/lang/Object; 再 marshal);
+            // 只在目标是 Object/Serializable/Comparable 等通用 L 类型时触发, 避免遮蔽
+            // 其它 L 类型 (例 Ljava/util/Map; 用户手动 __jptr 传递)。
+            if ffi::JS_IsArray(ctx, val.raw()) != 0 {
+                let is_generic_object = matches!(
+                    sig,
+                    "Ljava/lang/Object;" | "Ljava/io/Serializable;" | "Ljava/lang/Comparable;"
+                );
+                if is_generic_object {
+                    return js_array_to_java_primitive_array(
+                        ctx, env, val, "[Ljava/lang/Object;",
+                    )
+                    .unwrap_or(0);
+                }
+            }
             // JS object → try __jptr property (Proxy-wrapped or {__jptr, __jclass})
             if val.is_object() {
                 let jptr_val = val.get_property(ctx, "__jptr");
@@ -239,22 +254,29 @@ unsafe fn js_array_to_java_primitive_array(
             JNI_NEW_DOUBLE_ARRAY, JNI_SET_DOUBLE_ARRAY_REGION, SetDoubleArrayRegionFn, f64,
             |_ctx: *mut ffi::JSContext, v: JSValue| v.to_float().unwrap_or(0.0)
         ),
-        b'L' => {
-            // 对象数组: 目前支持 [Ljava/lang/String; — 其它走 [Object 通用路径。
-            // 取 sig 的内层 Class (去掉前导 '[', 末尾 ';') 作为 NewObjectArray 的元素 class。
-            let inner_sig = &sig[1..]; // e.g. "Ljava/lang/String;"
-            if !inner_sig.starts_with('L') || !inner_sig.ends_with(';') {
-                return None;
-            }
-            let inner_class_name = &inner_sig[1..inner_sig.len() - 1]; // "java/lang/String"
-            let cls = super::reflect::find_class_safe(env, inner_class_name);
+        b'L' | b'[' => {
+            // 对象数组 `[Ljava/...;` 或嵌套数组 `[[X`。
+            // 对象数组: 元素类名取 inner_sig 的 `L...;` 去壳 (例: "java/lang/String")
+            // 嵌套数组: 元素类名本身就是 inner_sig (例: "[I" / "[[B" / "[Ljava/lang/String;")
+            // FindClass 对 array-of-primitive / nested-array 形式都接受 JNI 签名字符串。
+            let inner_sig = &sig[1..];
+            let elem_class_name: String = if elem_type == b'L' {
+                if !inner_sig.starts_with('L') || !inner_sig.ends_with(';') {
+                    return None;
+                }
+                inner_sig[1..inner_sig.len() - 1].to_string()
+            } else {
+                // nested array — FindClass 吃 "[I" / "[[Ljava/lang/String;" 原样
+                inner_sig.to_string()
+            };
+            let cls = super::reflect::find_class_safe(env, &elem_class_name);
             if cls.is_null() {
                 return None;
             }
             let new_obj_arr: NewObjectArrayFn = jni_fn!(env, NewObjectArrayFn, JNI_NEW_OBJECT_ARRAY);
             let jarr = new_obj_arr(env, len, cls, std::ptr::null_mut());
+            let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
             if jarr.is_null() {
-                let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
                 delete(env, cls);
                 return None;
             }
@@ -263,16 +285,16 @@ unsafe fn js_array_to_java_primitive_array(
             for i in 0..len {
                 let elem_raw = ffi::JS_GetPropertyUint32(ctx, arr.raw(), i as u32);
                 let elem = JSValue(elem_raw);
-                // 逐个 marshal, 复用 marshal_js_to_jvalue L 分支支持 string/__jptr 透传
+                // 递归 marshal: 内层若是 "[X" 会再进 js_array_to_java_primitive_array,
+                // 内层若是 "Ljava/.../X;" 走 L 分支 (string/autobox/__jptr)
                 let elem_jval = marshal_js_to_jvalue(ctx, env, elem, Some(inner_sig));
                 elem.free(ctx);
                 set_elem(env, jarr, i, elem_jval as *mut std::ffi::c_void);
             }
-            let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
             delete(env, cls);
             Some(jarr as u64)
         }
-        _ => None,  // `[[...` 嵌套数组 — 不处理
+        _ => None,
     }
 }
 

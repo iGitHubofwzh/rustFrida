@@ -170,20 +170,41 @@
         if (t0 === '[') {
             if (Array.isArray(jsVal)) {
                 var elem = jniType.charAt(1);
-                // String[] / Object[] — JS array of strings 优先匹配
-                if (elem === 'L') {
-                    if (jniType === "[Ljava/lang/String;") {
-                        if (jsVal.length === 0) return 8;
-                        for (var k = 0; k < jsVal.length; k++) {
-                            if (typeof jsVal[k] !== "string") return -1;
-                        }
-                        return 10;
+                // 嵌套数组: 每个 JS 元素递归按内层 sig 评分, 取最小
+                if (elem === '[') {
+                    if (jsVal.length === 0) return 6;
+                    var innerSig = jniType.slice(1);
+                    var minScore = 10;
+                    for (var k = 0; k < jsVal.length; k++) {
+                        var s = _scoreJsParam(jsVal[k], innerSig);
+                        if (s < 0) return -1;
+                        if (s < minScore) minScore = s;
                     }
-                    if (jniType === "[Ljava/lang/Object;") return 5;
-                    return -1;
+                    return minScore;
                 }
-                // 嵌套数组 [[X 暂不支持, 让出
-                if (elem === '[') return -1;
+                // 引用类型数组 [Ljava/xxx;
+                if (elem === 'L') {
+                    var innerSig = jniType.slice(1);
+                    // String[]: JS array of strings 完美匹配
+                    if (innerSig === "Ljava/lang/String;") {
+                        if (jsVal.length === 0) return 8;
+                        var allStr = true;
+                        for (var k = 0; k < jsVal.length; k++) {
+                            if (typeof jsVal[k] !== "string") { allStr = false; break; }
+                        }
+                        if (allStr) return 10;
+                    }
+                    // 通用 [Lxxx;: 每个元素递归按内层 L 评分
+                    if (jsVal.length === 0) return 6;
+                    var minScore = 10;
+                    for (var k = 0; k < jsVal.length; k++) {
+                        var s = _scoreJsParam(jsVal[k], innerSig);
+                        if (s < 0) return -1;
+                        if (s < minScore) minScore = s;
+                    }
+                    // 对象数组总体比原始数组分数略低 (让 primitive 数组优先命中)
+                    return Math.max(minScore - 1, 4);
+                }
                 // 原始类型数组: 按元素实际范围选最精确的类型
                 return _scoreArrayElements(jsVal, elem);
             }
