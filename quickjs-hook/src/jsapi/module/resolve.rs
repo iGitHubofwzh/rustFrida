@@ -146,6 +146,28 @@ pub(crate) unsafe fn module_dlsym(module_name: &str, symbol: &str) -> *mut std::
     std::ptr::null_mut()
 }
 
+/// Load a shared object from disk via unrestricted linker API (no NOLOAD, fresh load).
+/// 走 linker64 的 __loader_dlopen, 绕过 namespace 限制; trusted_caller 用 linker 内部地址
+/// 避开 hide_soinfo 摘链后 caller 解析失败的问题。
+pub(crate) unsafe fn module_dlopen_load(
+    path: &str,
+    flags: i32,
+) -> *mut std::ffi::c_void {
+    let c_path = match CString::new(path) {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
+    if let Some(api) = api {
+        return (api.dlopen)(
+            c_path.as_ptr() as *const i8,
+            flags,
+            api.trusted_caller,
+        );
+    }
+    std::ptr::null_mut()
+}
+
 /// Load a shared object from an existing memfd using the linker's trusted-caller API.
 pub(crate) unsafe fn memfd_dlopen(name: &str, fd: i32) -> *mut std::ffi::c_void {
     let c_name = match CString::new(name) {

@@ -393,6 +393,68 @@ unsafe extern "C" fn js_module_enumerate_ranges(
     arr
 }
 
+/// Module.load(path, flags?) → {name, base, size, path} | throws
+///
+/// Frida 兼容: 加载指定路径的 SO。成功返回 module info 对象; 失败抛异常。
+/// flags 可选, 默认 RTLD_NOW (2)。
+unsafe extern "C" fn js_module_load(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Module.load(path, flags?) requires at least 1 argument\0".as_ptr() as *const _,
+        );
+    }
+    let path = match require_string_arg(ctx, JSValue(*argv), "path") {
+        Ok(s) => s,
+        Err(exc) => return exc,
+    };
+    let flags = if argc >= 2 {
+        JSValue(*argv.add(1)).to_i64(ctx).unwrap_or(libc::RTLD_NOW as i64) as i32
+    } else {
+        libc::RTLD_NOW
+    };
+
+    let handle = module_dlopen_load(&path, flags);
+    if handle.is_null() {
+        let err_ptr = libc::dlerror();
+        let err_msg = if err_ptr.is_null() {
+            format!("Module.load: dlopen('{}') returned null", path)
+        } else {
+            let e = std::ffi::CStr::from_ptr(err_ptr).to_string_lossy().into_owned();
+            format!("Module.load: dlopen('{}') failed: {}", path, e)
+        };
+        return crate::jsapi::callback_util::throw_internal_error(ctx, err_msg);
+    }
+
+    // 从 /proc/self/maps 找刚加载的模块 (path 精确匹配优先, 再 basename)
+    let basename: String = path.rsplit('/').next().unwrap_or(&path).to_string();
+    let modules = enumerate_modules_from_maps();
+    for m in &modules {
+        if m.path == path {
+            return module_info_to_js(ctx, m);
+        }
+    }
+    for m in &modules {
+        if m.name == basename || m.path.ends_with(&path) {
+            return module_info_to_js(ctx, m);
+        }
+    }
+
+    // 没在 maps 里找到 (memfd / 被 hide_soinfo 摘除): 最小 info, handle 作 base
+    let obj = ffi::JS_NewObject(ctx);
+    let obj_val = JSValue(obj);
+    obj_val.set_property(ctx, "name", JSValue::string(ctx, &basename));
+    obj_val.set_property(ctx, "path", JSValue::string(ctx, &path));
+    obj_val.set_property(ctx, "base", create_native_pointer(ctx, handle as u64));
+    obj_val.set_property(ctx, "size", JSValue(ffi::qjs_new_int64(ctx, 0)));
+    obj
+}
+
 /// Register Module JS API
 pub fn register_module_api(ctx: &JSContext) {
     let global = ctx.global_object();
@@ -456,6 +518,13 @@ pub fn register_module_api(ctx: &JSContext) {
             "enumerateRanges",
             js_module_enumerate_ranges,
             2,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            module_obj,
+            "load",
+            js_module_load,
+            1,
         );
 
         global.set_property(ctx.as_ptr(), "Module", JSValue(module_obj));
