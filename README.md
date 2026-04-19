@@ -460,6 +460,16 @@ console.log(s.$className);         // 类名
 
 var Process = Java.use("android.os.Process");
 console.log(Process.myPid());      // 调静态方法
+
+// $new 重载（Frida 兼容 .overload(...)）
+var bytes = [65, 66, 67];
+var s2 = JString.$new.overload("[B")(bytes);   // String(byte[])
+var s3 = JString.$new.overload("java.lang.String")("copy");  // String(String)
+
+// 方法重载
+var Arr = Java.use("java.util.Arrays");
+Arr.toString.overload("[I")([1, 2, 3]);   // 锁定 int[] 版本
+Arr.asList.overload("[Ljava.lang.Object;")([1, "mix", obj]);
 ```
 
 ### 字段访问（Frida 兼容 .value 模式）
@@ -575,7 +585,8 @@ Hook 回调的 `arguments`、`$orig()` / `Class.method()` 返回值、字段 `.v
 | `java.lang.String` | `Ljava/lang/String;` | `string` | 走 `GetStringUTFChars` |
 | `null` | — | `null` | |
 | Java 原始类型数组 `T[]`（T 为 Z/B/C/S/I/J/F/D）| `[T` | `Array` of 对应 JS 值 | 一次 `GetXxxArrayRegion` 批量拷贝，无装箱 |
-| Java 对象数组 `T[]` | `[LT;` / `[[...` | `Array` of wrapper / 递归 marshal | 嵌套深度上限 16 |
+| Java 对象数组 `T[]` | `[LT;` | `Array` of wrapper（或 `string` 若 T=`String`）| 逐个 `GetObjectArrayElement` |
+| Java 嵌套数组 `[[...` | `[[X` | `Array` of Array（递归 marshal）| 深度不限 |
 
 **保留为 Java wrapper `{__jptr, __jclass}`（不自动转换，需手动处理）：**
 
@@ -610,16 +621,47 @@ Hook 回调的 `arguments`、`$orig()` / `Class.method()` 返回值、字段 `.v
 | `Ljava/lang/String;` 或任意 `L...;` 场景下的 JS string | → `NewStringUTF` |
 | 任意 `L...;`（已是 Java 对象）| `{__jptr}` wrapper / `Proxy` → 提取原始 jobject 指针 |
 | 装箱类型 `Ljava/lang/Integer;` 等 | JS number/boolean/bigint 走 **autobox**（JNI `Xxx.valueOf()`）|
+| `[B` / `[Z` / `[C` / `[S` / `[I` / `[J` / `[F` / `[D` | JS `Array` → `NewXxxArray + SetXxxArrayRegion` 批量填 |
+| `[Ljava/lang/String;` | JS `Array` of string → 逐个 `NewStringUTF + SetObjectArrayElement` |
+| `[Lxxx;` 任意引用数组 | 每个元素按 `Lxxx;` 递归 marshal（string / Proxy `__jptr` / autobox）|
+| `[[X` / `[[Lxxx;` 嵌套数组 | 递归进入 `[X` 分支创建内层 Java 数组 |
+| `Ljava/lang/Object;` / `Ljava/io/Serializable;` + JS Array | 自动降级 `Object[]`（元素按 `Ljava/lang/Object;` 再 marshal）|
 | 任意类型 | `null` / `undefined` → JNI null (0) |
 
 **autobox 规则**：目标签名精确匹配时按目标类型装箱（`Ljava/lang/Long;` → `Long.valueOf(J)`）；无精确签名时按 JS 值推断 —— 整数 fit i32 → `Integer`，否则 → `Double`；boolean → `Boolean`。
 
+**多 overload 自动消歧（数组按元素范围打分）**：
+
+```js
+void foo(byte[] b)
+void foo(int[] i)
+void foo(long[] l)
+```
+
+| JS 输入 | `[B` 分 | `[S` 分 | `[I` 分 | `[J` 分 | 选中 |
+| --- | --- | --- | --- | --- | --- |
+| `[1, 2, 3]`（都在 byte 范围）| **10** | 9 | 8 | 7 | `byte[]` |
+| `[1, 200, 3]`（溢出 byte，在 short）| -1 | **9** | 8 | 7 | `short[]` |
+| `[1, 100000]`（溢出 short，在 int）| -1 | -1 | **8** | 7 | `int[]` |
+| `[5000000000]`（溢出 int）| -1 | -1 | -1 | **7** | `long[]` |
+| `[1n, 2n]`（全 BigInt）| -1 | -1 | -1 | **10** | `long[]` |
+| `[true, false]` | -1 | -1 | -1 | -1 | `boolean[]` |
+| `[1.5, 2.5]` | -1 | -1 | -1 | -1 | `float[]` / `double[]` |
+
+手动覆写用 `.overload(sig)`：
+
+```js
+obj.foo.overload("[I")([1, 2, 3]);    // 强制 int[]（否则自动选 byte[]）
+obj.foo.overload("[B")([1, 200, 3]);  // 强制 byte[]，200 按位截断为 -56
+```
+
 **常见陷阱：**
 
-- 传普通 JS object（非 wrapper、无 `__jptr`）给 `L...;` 参数会 marshal 成 0 → Java 侧 NPE。
+- 传普通 JS object（非 wrapper、无 `__jptr`）给非数组 `L...;` 参数会 marshal 成 0 → Java 侧 NPE。
 - 传 `undefined` 等同 `null`，别依赖默认行为——显式写 `null`。
 - `Map.put(Object, Object)` 传 `number` 会被 autobox 成 `Integer` / `Double`，取出来**仍是 wrapper**，要 `.intValue()` 才能拿回 JS number。
 - JS string 会为**所有** `L...;` 目标类型创建 `java.lang.String`（即使签名是 `Ljava/lang/Object;`），不会抛类型错误。
+- 强制 `.overload("[B")` 传入越界元素（如 200）按 `as i8` **按位截断**，不报错（和 Frida 一致）。
 
 ### API 速查
 
