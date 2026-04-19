@@ -882,7 +882,7 @@
                 }
                 if (prop === "$new") {
                     if (!cache._new) {
-                        cache._new = function() {
+                        var callable = function() {
                             var args = _argsFrom(arguments);
                             var sig = typeof args[0] === "string" && args[0].charAt(0) === '('
                                 ? args.shift()
@@ -891,6 +891,35 @@
                                 _newObject.apply(Java, [cls, sig].concat(args))
                             );
                         };
+                        // Frida 兼容 .overload(typeName, ...) — 锁定构造函数签名
+                        callable.overload = function() {
+                            var sig;
+                            if (arguments.length === 1
+                                && typeof arguments[0] === "string"
+                                && arguments[0].charAt(0) === '(') {
+                                sig = arguments[0];
+                            } else {
+                                var paramSig = "(";
+                                for (var i = 0; i < arguments.length; i++) {
+                                    paramSig += _jniType(arguments[i]);
+                                }
+                                paramSig += ")";
+                                var ms = _methods(cls);
+                                var found = _findOverload(ms, "<init>", paramSig);
+                                if (!found) {
+                                    throw new Error("No matching constructor: "
+                                        + cls + paramSig);
+                                }
+                                sig = found;
+                            }
+                            return function() {
+                                var args = _argsFrom(arguments);
+                                return _wrapJavaReturn(
+                                    _newObject.apply(Java, [cls, sig].concat(args))
+                                );
+                            };
+                        };
+                        cache._new = callable;
                     }
                     return cache._new;
                 }

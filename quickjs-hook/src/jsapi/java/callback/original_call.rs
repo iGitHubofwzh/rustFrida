@@ -97,7 +97,24 @@ pub(super) unsafe fn marshal_js_to_jvalue(
                 0
             }
         }
-        b'L' | b'[' => {
+        b'[' => {
+            // 数组类型: JS array → Java primitive array (via NewXxxArray + SetXxxArrayRegion)
+            // Fallback: JS object with __jptr (已存在的 Java 数组) → 透传
+            if ffi::JS_IsArray(ctx, val.raw()) != 0 {
+                return js_array_to_java_primitive_array(ctx, env, val, sig).unwrap_or(0);
+            }
+            if val.is_object() {
+                let jptr_val = val.get_property(ctx, "__jptr");
+                if !jptr_val.is_undefined() && !jptr_val.is_null() {
+                    let result = js_value_to_u64_or_zero(ctx, jptr_val);
+                    jptr_val.free(ctx);
+                    return result;
+                }
+                jptr_val.free(ctx);
+            }
+            0
+        }
+        b'L' => {
             // JS string → NewStringUTF for ANY Object type (not just Ljava/lang/String;).
             // ctx.orig() 返回 String 时 marshal_jni_arg_to_js 会 unbox 为 JS string，
             // 但 return_type_sig 可能是 Ljava/lang/Object; (如 HashMap.put)。
@@ -133,6 +150,96 @@ pub(super) unsafe fn marshal_js_to_jvalue(
             0
         }
         _ => js_value_to_u64_or_zero(ctx, val),
+    }
+}
+
+/// 读 JS 数组长度 (通过 length property).
+unsafe fn js_array_len(ctx: *mut ffi::JSContext, arr: JSValue) -> i32 {
+    let len_atom = ffi::JS_NewAtom(ctx, b"length\0".as_ptr() as *const _);
+    let len_val_raw = ffi::qjs_get_property(ctx, arr.raw(), len_atom);
+    ffi::JS_FreeAtom(ctx, len_atom);
+    let len_val = JSValue(len_val_raw);
+    let len = len_val.to_i64(ctx).unwrap_or(0);
+    len_val.free(ctx);
+    if len < 0 || len > i32::MAX as i64 { 0 } else { len as i32 }
+}
+
+/// JS array → Java 原始类型数组 (`[B`/`[Z`/`[C`/`[S`/`[I`/`[J`/`[F`/`[D`)。
+/// 非原始类型数组 (如 `[Ljava/lang/String;`) 不处理, 返回 None。
+///
+/// 流程: NewXxxArray(len) → Rust Vec 填值 → SetXxxArrayRegion → 返回 jobject。
+unsafe fn js_array_to_java_primitive_array(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    arr: JSValue,
+    sig: &str,
+) -> Option<u64> {
+    let elem_type = sig.as_bytes().get(1).copied()?;
+    let len = js_array_len(ctx, arr);
+
+    macro_rules! build_array {
+        ($new_idx:ident, $set_idx:ident, $set_fn:ident, $elem:ty, $convert:expr) => {{
+            let new_fn: NewPrimitiveArrayFn = jni_fn!(env, NewPrimitiveArrayFn, $new_idx);
+            let jarr = new_fn(env, len);
+            if jarr.is_null() {
+                return None;
+            }
+            let mut buf: Vec<$elem> = Vec::with_capacity(len as usize);
+            for i in 0..len {
+                let elem_raw = ffi::JS_GetPropertyUint32(ctx, arr.raw(), i as u32);
+                let elem = JSValue(elem_raw);
+                buf.push($convert(ctx, elem));
+                elem.free(ctx);
+            }
+            let set_fn: $set_fn = jni_fn!(env, $set_fn, $set_idx);
+            set_fn(env, jarr, 0, len, buf.as_ptr());
+            Some(jarr as u64)
+        }};
+    }
+
+    match elem_type {
+        b'Z' => build_array!(
+            JNI_NEW_BOOLEAN_ARRAY, JNI_SET_BOOLEAN_ARRAY_REGION, SetBooleanArrayRegionFn, u8,
+            |_ctx: *mut ffi::JSContext, v: JSValue| {
+                if let Some(b) = v.to_bool() { b as u8 }
+                else { v.to_i64(_ctx).map(|n| (n != 0) as u8).unwrap_or(0) }
+            }
+        ),
+        b'B' => build_array!(
+            JNI_NEW_BYTE_ARRAY, JNI_SET_BYTE_ARRAY_REGION, SetByteArrayRegionFn, i8,
+            |ctx: *mut ffi::JSContext, v: JSValue| v.to_i64(ctx).unwrap_or(0) as i8
+        ),
+        b'C' => build_array!(
+            JNI_NEW_CHAR_ARRAY, JNI_SET_CHAR_ARRAY_REGION, SetCharArrayRegionFn, u16,
+            |ctx: *mut ffi::JSContext, v: JSValue| {
+                if let Some(s) = v.to_string(ctx) {
+                    s.chars().next().map(|c| c as u16).unwrap_or(0)
+                } else {
+                    v.to_i64(ctx).unwrap_or(0) as u16
+                }
+            }
+        ),
+        b'S' => build_array!(
+            JNI_NEW_SHORT_ARRAY, JNI_SET_SHORT_ARRAY_REGION, SetShortArrayRegionFn, i16,
+            |ctx: *mut ffi::JSContext, v: JSValue| v.to_i64(ctx).unwrap_or(0) as i16
+        ),
+        b'I' => build_array!(
+            JNI_NEW_INT_ARRAY, JNI_SET_INT_ARRAY_REGION, SetIntArrayRegionFn, i32,
+            |ctx: *mut ffi::JSContext, v: JSValue| v.to_i64(ctx).unwrap_or(0) as i32
+        ),
+        b'J' => build_array!(
+            JNI_NEW_LONG_ARRAY, JNI_SET_LONG_ARRAY_REGION, SetLongArrayRegionFn, i64,
+            |ctx: *mut ffi::JSContext, v: JSValue| v.to_i64(ctx).unwrap_or(0)
+        ),
+        b'F' => build_array!(
+            JNI_NEW_FLOAT_ARRAY, JNI_SET_FLOAT_ARRAY_REGION, SetFloatArrayRegionFn, f32,
+            |_ctx: *mut ffi::JSContext, v: JSValue| v.to_float().unwrap_or(0.0) as f32
+        ),
+        b'D' => build_array!(
+            JNI_NEW_DOUBLE_ARRAY, JNI_SET_DOUBLE_ARRAY_REGION, SetDoubleArrayRegionFn, f64,
+            |_ctx: *mut ffi::JSContext, v: JSValue| v.to_float().unwrap_or(0.0)
+        ),
+        _ => None,  // `[Ljava/...;` 或 `[[...` 嵌套数组 — 不处理
     }
 }
 

@@ -105,6 +105,18 @@ pub(super) type IsInstanceOfFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_v
 pub(super) type GetFieldIdFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const c_char, *const c_char) -> *mut std::ffi::c_void;
 pub(super) type NewStringUtfFn = unsafe extern "C" fn(JniEnv, *const c_char) -> *mut std::ffi::c_void;
+
+// NewXxxArray: env + length → array jobject
+pub(super) type NewPrimitiveArrayFn = unsafe extern "C" fn(JniEnv, i32) -> *mut std::ffi::c_void;
+// SetXxxArrayRegion: env + array + start + len + buf (parametric buf type)
+pub(super) type SetBooleanArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *const u8);
+pub(super) type SetByteArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *const i8);
+pub(super) type SetCharArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *const u16);
+pub(super) type SetShortArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *const i16);
+pub(super) type SetIntArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *const i32);
+pub(super) type SetLongArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *const i64);
+pub(super) type SetFloatArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *const f32);
+pub(super) type SetDoubleArrayRegionFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *const f64);
 pub(super) type GetStringUtfCharsFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut u8) -> *const c_char;
 pub(super) type ReleaseStringUtfCharsFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const c_char);
 pub(super) type PushLocalFrameFn = unsafe extern "C" fn(JniEnv, i32) -> i32;
@@ -705,6 +717,26 @@ pub(super) const JNI_GET_FLOAT_ARRAY_REGION: usize = 205;
 pub(super) const JNI_GET_DOUBLE_ARRAY_REGION: usize = 206;
 pub(super) const JNI_EXCEPTION_CHECK: usize = 228;
 pub(super) const JNI_NEW_OBJECT_A: usize = 30;
+
+// NewXxxArray indices — create Java primitive arrays from native
+pub(super) const JNI_NEW_BOOLEAN_ARRAY: usize = 175;
+pub(super) const JNI_NEW_BYTE_ARRAY: usize = 176;
+pub(super) const JNI_NEW_CHAR_ARRAY: usize = 177;
+pub(super) const JNI_NEW_SHORT_ARRAY: usize = 178;
+pub(super) const JNI_NEW_INT_ARRAY: usize = 179;
+pub(super) const JNI_NEW_LONG_ARRAY: usize = 180;
+pub(super) const JNI_NEW_FLOAT_ARRAY: usize = 181;
+pub(super) const JNI_NEW_DOUBLE_ARRAY: usize = 182;
+
+// SetXxxArrayRegion indices — bulk-copy native buffer into Java primitive array
+pub(super) const JNI_SET_BOOLEAN_ARRAY_REGION: usize = 207;
+pub(super) const JNI_SET_BYTE_ARRAY_REGION: usize = 208;
+pub(super) const JNI_SET_CHAR_ARRAY_REGION: usize = 209;
+pub(super) const JNI_SET_SHORT_ARRAY_REGION: usize = 210;
+pub(super) const JNI_SET_INT_ARRAY_REGION: usize = 211;
+pub(super) const JNI_SET_LONG_ARRAY_REGION: usize = 212;
+pub(super) const JNI_SET_FLOAT_ARRAY_REGION: usize = 213;
+pub(super) const JNI_SET_DOUBLE_ARRAY_REGION: usize = 214;
 
 pub(super) const JNI_CALL_STATIC_OBJECT_METHOD_A: usize = 116;
 pub(super) const JNI_NEW_STRING_UTF: usize = 167;
