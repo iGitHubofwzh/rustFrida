@@ -231,18 +231,10 @@ pub fn cleanup() {
     //   → OAT bypass 可以安全卸载
     //   → pool 可以安全 munmap
     // ============================================================
-    let drained = drain_thunk_in_flight();
+    // drain_thunk_in_flight 现在无限等待直到归零 (never returns false),
+    // 保证 Phase 3/4 安全执行, 不再走 leak 分支。若线程真卡死, 外层会一直等。
+    let _drained = drain_thunk_in_flight();
     stage("phase2 drain_thunk_in_flight", &mut t);
-
-    if !drained {
-        log_msg(format!(
-            "[quickjs] drain 未归零：保留 OAT bypass + pool + 所有资源 (原子不变量). \
-             Agent 退出后 hunter 继续带着 bypass 跑, WalkStack 见到残留 thunk 也不炸. \
-             资源 leak 到进程退出 (total {}ms)\n",
-            t0.elapsed().as_millis()
-        ));
-        return;
-    }
 
     // ============================================================
     // Phase 3: 释放资源 (drain 归零后才安全拆 OAT bypass)

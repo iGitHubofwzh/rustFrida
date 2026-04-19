@@ -974,11 +974,13 @@ pub fn cut_java_hooks() {
 /// 诊断走 `output_message` 保证始终可见（不依赖 VERBOSE 开关）。
 pub fn drain_thunk_in_flight() -> bool {
     use crate::jsapi::console::output_message;
-    // 30s 硬上限。Phase 1 已 cut 全部 routing 入口，counter 只减不增；
-    // 到 30s 还没归零 = 剩下的线程 parked 在 hooked 深处（Looper.pollOnce / JNI
-    // monitor 等），醒不过来也没关系 —— 调用方见 false 会走 leak 分支，
-    // 保留 pool + walkstack guards 到进程退出，parked 线程 PC 永远 valid。
-    let total_limit = std::time::Duration::from_secs(30);
+    // 无限等待 — 必须归零才能安全 munmap pool。
+    // Phase 1 已 cut 全部 routing 入口，counter 只减不增。若线程 parked 在 hooked 深处
+    // (Looper.pollOnce / JNI monitor 等)，等它醒。用户侧 Ctrl-C 可强制中断 rustfrida CLI,
+    // 但 agent 仍应尝试真正归零; 这是 "完整卸载不 leak" 的前提。
+    //
+    // 每 5s 打印一次 counter 值诊断卡在哪。返回值始终 true — 调用方 unconditional
+    // 走 Phase 3/4.
     let start = std::time::Instant::now();
     let initial = in_flight_java_hook_callbacks();
     output_message(&format!("[drain] start, thunk_in_flight={}", initial));
@@ -993,18 +995,10 @@ pub fn drain_thunk_in_flight() -> bool {
             return true;
         }
         rounds += 1;
-        let remaining = in_flight_java_hook_callbacks();
-        if start.elapsed() >= total_limit {
-            output_message(&format!(
-                "[drain] TIMEOUT {}s, thunk_in_flight={} — 跳过 free/munmap, leak 到进程退出",
-                total_limit.as_secs(),
-                remaining
-            ));
-            return false;
-        }
         if rounds % 10 == 0 {
+            let remaining = in_flight_java_hook_callbacks();
             output_message(&format!(
-                "[drain] round {}, {}ms, thunk_in_flight={}",
+                "[drain] round {}, {}ms, thunk_in_flight={} (无限等待归零)",
                 rounds,
                 start.elapsed().as_millis(),
                 remaining

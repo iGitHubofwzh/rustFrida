@@ -120,10 +120,11 @@ frida_main (void * user_data)
   int ctrlfd_for_peer, ctrlfd, agent_codefd, agent_ctrlfd;
 
   thread_id = frida_gettid ();
-  /* RESIDENT: 不 dlclose agent.so，避免 exec pool 中的 trampoline/thunk
-   * 指向已卸载代码导致 SIGSEGV（对标 Frida 默认行为）。
-   * agent 内存成本 ~3MB，但消除了 dlclose 后的 use-after-unload 崩溃。 */
-  unload_policy = FRIDA_UNLOAD_POLICY_RESIDENT;
+  /* IMMEDIATE: agent 在 shutdown 时 drain thunk_in_flight=0 后才 munmap pool,
+   * 无限等待直到归零 (quickjs_loader::cleanup) — 保证 dlclose 时没有残留 thunk,
+   * exec pool 已 munmap, 不会有 use-after-unload。完整卸载 agent.so 释放 ~3MB,
+   * 同一进程可反复 inject。*/
+  unload_policy = FRIDA_UNLOAD_POLICY_IMMEDIATE;
   ctrlfd = -1;
   agent_codefd = -1;
   agent_ctrlfd = -1;
