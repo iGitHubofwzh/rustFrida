@@ -1,7 +1,7 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -136,7 +136,6 @@ impl Session {
 /// 多会话管理器
 pub(crate) struct SessionManager {
     sessions: Mutex<HashMap<u32, Arc<Session>>>,
-    next_id: AtomicU32,
     active_id: Mutex<Option<u32>>,
 }
 
@@ -144,15 +143,19 @@ impl SessionManager {
     pub(crate) fn new() -> Self {
         SessionManager {
             sessions: Mutex::new(HashMap::new()),
-            next_id: AtomicU32::new(1),
             active_id: Mutex::new(None),
         }
     }
 
     pub(crate) fn create_session(&self, label: String) -> Arc<Session> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut sessions = self.sessions.lock().unwrap();
+        // 复用已释放的 id：从 1 开始挑最小的空缺
+        let mut id: u32 = 1;
+        while sessions.contains_key(&id) {
+            id += 1;
+        }
         let session = Arc::new(Session::new(id, label));
-        self.sessions.lock().unwrap().insert(id, session.clone());
+        sessions.insert(id, session.clone());
         session
     }
 
