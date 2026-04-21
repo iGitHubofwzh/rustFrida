@@ -271,15 +271,32 @@ static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
     /* X16 points to matched table entry; load replacement ArtMethod* from offset 8 */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
 
+    /* WalkStack 根治: 提前把 replacement 写到 SP+0, 覆盖 prologue 的 original.
+     * 这样 ART StackVisitor 在本线程 (或 peer 线程) 读 *cur_quick_frame = *SP
+     * 时立即看到 replacement (K_ACC_NATIVE) → GetDexPc 走 native 早退路径.
+     * 在 BLR art_router_stack_check 之前执行, 避免 BLR 进入 Rust 后被其他线程
+     * suspend 时 SP+0 还是 original (non-native) → 触发 StackMap not found abort. */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+
     /* --- Stack check: 防止 callOriginal 递归 (对标 Frida) ---
      * 保存 X16(table entry), X17(replacement) 到 callee-saved X20, X21 (已在 prologue 保存)。
-     * 调用 art_router_stack_check(replacement): 返回 0 表示递归 → 走 not_found 路径。 */
+     * 调用 art_router_stack_check(replacement): 返回 0 表示递归 → 走 not_found 路径。
+     * NOTE: 递归 (not_found) 时 restore_all 会用 SP+0 的值覆盖 x0, 所以要
+     * 在 CBZ 后、走 not_found 分支前先把 SP+0 恢复成 original (否则 x0 变 replacement
+     * 破坏原方法调用约定). */
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X20, ARM64_REG_X16);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X21, ARM64_REG_X17);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X17);
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)art_router_stack_check);
     arm64_writer_put_blr_reg(w, ARM64_REG_X16);
-    arm64_writer_put_cbz_reg_label(w, ARM64_REG_X0, lbl_not_found);
+    /* 递归路径: 恢复 SP+0 为 original (table entry 的 first u64), 再跳 not_found.
+     * X20 仍是 table entry 指针, 读 [X20, 0] 得 original, 写回 SP+0. */
+    uint64_t lbl_found_continue = arm64_writer_new_label_id(w);
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_found_continue);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 0);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+    arm64_writer_put_b_label(w, lbl_not_found);
+    arm64_writer_put_label(w, lbl_found_continue);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X20);
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X17, ARM64_REG_X21);
 
@@ -288,8 +305,7 @@ static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X0, 0);   /* W0 = original->declaring_class_ */
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X17, 0);  /* replacement->declaring_class_ = W0 */
 
-    /* Overwrite saved X0 on stack (SP+0) with replacement ArtMethod* */
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+    /* SP+0 已提前置为 replacement (见上). restore_all 从 SP+0 读回 x0 → x0 = replacement. */
 
     /* Restore all regs — X0 now holds replacement ArtMethod*
      * (dec 在 restore_all 尾部) */
@@ -314,18 +330,95 @@ static void emit_art_router_not_found_path(Arm64Writer* w, uint64_t lbl_not_foun
 }
 
 /* ============================================================================
+ * 伪 OatQuickMethodHeader 前置 (WalkStack 根治)
+ *
+ * Android 16 (API 36) OatQuickMethodHeader 布局 (libart_base_commit):
+ *   class PACKED(4) OatQuickMethodHeader {
+ *       uint32_t code_info_offset_;     // offset from code_ back to CodeInfo
+ *       uint8_t  code_[0];              // actual method code starts here
+ *   };
+ *
+ * ART 的 GetOatQuickMethodHeader(pc) 逻辑:
+ *   header = FromEntryPoint(entry_point) = entry_point - sizeof(header) = entry_point - 4
+ *   if (header->Contains(pc))  // code <= pc <= code + GetCodeSize()
+ *     return header
+ *
+ * GetDexPc 在 method->IsNative() 时直接 return kDexNoIndex, 不访问 StackMap.
+ * 所以我们:
+ *   1. 在 thunk 前放 CodeInfo 字节 + 4B 伪 header
+ *   2. code_info_offset_ = 距 code_ 前的 CodeInfo 字节数
+ *   3. code_size_ 写 thunk 实际字节数 (body_size)
+ *   4. thunk 一开头就把 replacement (native ArtMethod*) 写到 SP+0
+ *      → WalkStack 读 *SP = replacement → IsNative=true → ToDexPc 走 native 早退路径
+ *
+ * CodeInfo 最小编码 (7 个 interleaved varints, 4 bits each):
+ *   [flags=0, code_size=15(next 32 bits), frame=0, core=0, fp=0, dex_regs=0, bit_flags=0]
+ *   = 28 bits nibbles + 32 bits code_size = 60 bits = 8 bytes (4 trailing bits=0)
+ *
+ * 总前缀 12 字节: 8B CodeInfo + 4B OatQuickMethodHeader
+ * ============================================================================ */
+
+#define FAKE_OAT_PREFIX_SIZE 12  /* 8B CodeInfo + 4B header */
+#define FAKE_OAT_CODEINFO_BYTES 8
+
+/* 写 8 字节 CodeInfo 到 buf, 编码 code_size = size (code_size_ 字段).
+ * bit layout (LSB first within byte):
+ *   byte 0: nibble0=flags_=0 (bits 0..3) | nibble1=code_size marker=15 (bits 4..7)
+ *   byte 1: nibble2=packed_frame_size_=0 | nibble3=core_spill_mask_=0
+ *   byte 2: nibble4=fp_spill_mask_=0 | nibble5=number_of_dex_registers_=0
+ *   byte 3: nibble6=bit_table_flags_=0 (bits 0..3) | code_size bits 0..3 (bits 4..7)
+ *   byte 4: code_size bits 4..11
+ *   byte 5: code_size bits 12..19
+ *   byte 6: code_size bits 20..27
+ *   byte 7: code_size bits 28..31 (bits 0..3) | 0 pad (bits 4..7)
+ */
+static void encode_fake_codeinfo_code_size(uint8_t buf[FAKE_OAT_CODEINFO_BYTES], uint32_t code_size) {
+    memset(buf, 0, FAKE_OAT_CODEINFO_BYTES);
+    buf[0] = 0xF0;  /* 0b11110000: flags=0 | code_size marker=15 */
+    /* code_size 占 32 bits, 从 bit 28 开始 */
+    buf[3] |= (uint8_t)((code_size & 0x0F) << 4);
+    buf[4]  = (uint8_t)((code_size >> 4)  & 0xFF);
+    buf[5]  = (uint8_t)((code_size >> 12) & 0xFF);
+    buf[6]  = (uint8_t)((code_size >> 20) & 0xFF);
+    buf[7]  = (uint8_t)((code_size >> 28) & 0x0F);
+}
+
+/* 填充 thunk 前 12 字节: [CodeInfo 8B][OatQuickMethodHeader 4B].
+ * body_size: thunk body 真实字节数 (不含 12B 前缀).
+ * 调用时机: thunk 全部生成完毕后、patch_target 之前. */
+static void backfill_fake_oat_header(void* thunk_mem, uint32_t body_size) {
+    uint8_t* p = (uint8_t*)thunk_mem;
+    encode_fake_codeinfo_code_size(p, body_size);
+    /* code_info_offset_ = 距 code_ 向前的字节数 = 8 (CodeInfo 紧挨着 header) */
+    uint32_t code_info_offset = FAKE_OAT_CODEINFO_BYTES;
+    memcpy(p + FAKE_OAT_CODEINFO_BYTES, &code_info_offset, sizeof(uint32_t));
+}
+
+/* ============================================================================
  * ART router thunk generation (uses helpers above)
  *
  * not_found path: jump to trampoline_target (relocated original instructions).
  * X16/X17 are NOT restored (clobbered by thunk, caller uses X17 for jump-back).
+ *
+ * 布局: [12B 伪 OAT header/CodeInfo] [thunk body]
+ * entry_point 指向 thunk + 12 (body start).
  * ============================================================================ */
 
 static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
                                          void* trampoline_target,
                                          uint32_t quickcode_offset,
                                          uint64_t current_pc_hint) {
+    /* 前 12 字节是 CodeInfo+header 占位, 最后 backfill.
+     * Arm64Writer 初始化到 body 起点 (thunk_mem + 12). */
+    if (thunk_alloc < FAKE_OAT_PREFIX_SIZE + 64) {
+        hook_log("[art_router] thunk_alloc %zu too small for fake header", thunk_alloc);
+        return 0;
+    }
+    void* body_mem = (uint8_t*)thunk_mem + FAKE_OAT_PREFIX_SIZE;
+    size_t body_alloc = thunk_alloc - FAKE_OAT_PREFIX_SIZE;
+
     Arm64Writer w;
-    arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, thunk_alloc);
+    arm64_writer_init(&w, body_mem, (uint64_t)body_mem, body_alloc);
 
     emit_art_router_prologue(&w);
 
@@ -337,10 +430,14 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
     emit_art_router_not_found_path(&w, lbl_not_found, (uint64_t)trampoline_target);
 
     arm64_writer_flush(&w);
-    size_t thunk_size = arm64_writer_offset(&w);
+    size_t body_size = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 
-    return thunk_size;
+    /* 回填伪 OAT header + CodeInfo (Contains(pc) 覆盖整个 thunk body) */
+    backfill_fake_oat_header(thunk_mem, (uint32_t)body_size);
+
+    /* 返回总字节数 (含 12B 前缀), 调用方用于 hook_flush_cache */
+    return FAKE_OAT_PREFIX_SIZE + body_size;
 }
 
 /* ============================================================================
@@ -464,7 +561,9 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         return NULL;
     }
 
-    /* Generate router thunk — not_found path jumps to trampoline */
+    /* Generate router thunk — not_found path jumps to trampoline.
+     * Thunk 布局: [12B 伪 OAT header/CodeInfo] [thunk body].
+     * thunk_size 返回值含 12B 前缀. entry_point/patch_target 指向 body start. */
     size_t thunk_size = generate_art_router_thunk(
         entry->thunk, art_thunk_alloc,
         entry->trampoline, quickcode_offset, current_pc_hint);
@@ -474,8 +573,8 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         return NULL;
     }
 
-    /* Patch target to jump to router thunk */
-    void* patch_dest = entry->thunk;
+    /* Patch target to jump to router thunk body (跳过 12B 伪 header) */
+    void* patch_dest = (uint8_t*)entry->thunk + FAKE_OAT_PREFIX_SIZE;
     if (patch_target(target, patch_dest, stealth, entry) != 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
@@ -509,7 +608,8 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
 
     pthread_mutex_lock(&g_engine.lock);
 
-    /* stub 通过 ArtMethod.entry_point_ 指针间接调用，不需要 near */
+    /* stub 通过 ArtMethod.entry_point_ 指针间接调用，不需要 near.
+     * 布局: [12B 伪 OAT header/CodeInfo] [stub body]. 返回 body 起点. */
     size_t stub_alloc = 2048;
     void* stub_mem = hook_alloc(stub_alloc);
     if (!stub_mem) {
@@ -517,8 +617,11 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
         return NULL;
     }
 
+    void* body_mem = (uint8_t*)stub_mem + FAKE_OAT_PREFIX_SIZE;
+    size_t body_alloc = stub_alloc - FAKE_OAT_PREFIX_SIZE;
+
     Arm64Writer w;
-    arm64_writer_init(&w, stub_mem, (uint64_t)stub_mem, stub_alloc);
+    arm64_writer_init(&w, body_mem, (uint64_t)body_mem, body_alloc);
 
     emit_art_router_prologue(&w);
 
@@ -530,17 +633,20 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
     emit_art_router_not_found_path(&w, lbl_not_found, fallback_target);
 
     arm64_writer_flush(&w);
-    size_t stub_size = arm64_writer_offset(&w);
+    size_t body_size = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 
-    hook_flush_cache(stub_mem, stub_size);
+    /* 回填 12B 伪 OAT header + CodeInfo */
+    backfill_fake_oat_header(stub_mem, (uint32_t)body_size);
+
+    hook_flush_cache(stub_mem, FAKE_OAT_PREFIX_SIZE + body_size);
 
     pthread_mutex_unlock(&g_engine.lock);
 
-    hook_log("[art_router] stub created: %p (fallback=%llx, size=%zu)",
-             stub_mem, (unsigned long long)fallback_target, stub_size);
+    hook_log("[art_router] stub created: %p (body=%p, fallback=%llx, body_size=%zu)",
+             stub_mem, body_mem, (unsigned long long)fallback_target, body_size);
 
-    return stub_mem;
+    return body_mem;  /* entry_point 指向 body, 前 12B 是伪 OAT header */
 }
 
 /* ============================================================================
