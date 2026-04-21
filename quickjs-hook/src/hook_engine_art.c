@@ -157,6 +157,11 @@ void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0) {
 #define ROUTER_FRAME_GPR_OFF  16  /* x0(16) */
 #define ROUTER_FRAME_SIZE    224  /* 64 + 144 + 16 */
 
+/* Return PC offset within 224-byte frame = 224 - 8 = 216.
+ * ART StackVisitor::GetReturnPcAddr = SP + frame_size - 8.
+ * 我们在 prologue 尾部 STR LR, [SP, #216] 让 GC WalkStack 读到正确 caller LR. */
+#define ROUTER_FRAME_RETURN_PC_OFF 216
+
 /* Named offsets for specific saved registers within the router frame.
  * x20 is the second reg in STP x7,x20 at GPR_OFF+48 → offset 72.
  * LR  is the second reg in STP x29,lr at GPR_OFF+128 → offset 152. */
@@ -184,6 +189,11 @@ static void emit_art_router_prologue(Arm64Writer* w) {
     arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_LR,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 128, ARM64_INDEX_SIGNED_OFFSET);
     /* x0 at SP+0 */
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    /* WalkStack 根治: 在 frame 尾部 (SP + frame_size - 8 = SP + 216) 也存一份 caller LR.
+     * 这是伪 OatQuickMethodHeader 的 GetReturnPcOffset(). ART StackVisitor::WalkStack
+     * advance 到下一帧时, next_pc = *(SP + frame_size - 8). 如不写, GC 在此位置读到
+     * 未初始化字节 → 把垃圾 PC 交给下一帧的 GetOatQuickMethodHeader → wild branch SEGV. */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_LR, ARM64_REG_SP, ROUTER_FRAME_RETURN_PC_OFF);
     /* Load table pointer for scan */
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)g_art_router_table);
 }
@@ -361,35 +371,71 @@ static void emit_art_router_not_found_path(Arm64Writer* w, uint64_t lbl_not_foun
 #define FAKE_OAT_PREFIX_SIZE 12  /* 8B CodeInfo + 4B header */
 #define FAKE_OAT_CODEINFO_BYTES 8
 
-/* 写 8 字节 CodeInfo 到 buf, 编码 code_size = size (code_size_ 字段).
- * bit layout (LSB first within byte):
- *   byte 0: nibble0=flags_=0 (bits 0..3) | nibble1=code_size marker=15 (bits 4..7)
- *   byte 1: nibble2=packed_frame_size_=0 | nibble3=core_spill_mask_=0
- *   byte 2: nibble4=fp_spill_mask_=0 | nibble5=number_of_dex_registers_=0
- *   byte 3: nibble6=bit_table_flags_=0 (bits 0..3) | code_size bits 0..3 (bits 4..7)
- *   byte 4: code_size bits 4..11
- *   byte 5: code_size bits 12..19
- *   byte 6: code_size bits 20..27
- *   byte 7: code_size bits 28..31 (bits 0..3) | 0 pad (bits 4..7)
- */
-static void encode_fake_codeinfo_code_size(uint8_t buf[FAKE_OAT_CODEINFO_BYTES], uint32_t code_size) {
+/* router thunk 实际 frame_size (SUB SP, #0xE0 → 224) / kStackAlignment (16) = 14 */
+#define FAKE_PACKED_FRAME_SIZE 14
+
+/* CodeInfo 编码: 7 个 interleaved 4-bit varint + 追加 32-bit 值 (当 nibble >= 12).
+ * 需要 code_size_ 和 packed_frame_size_ 都 > 11 (long format), 其他 5 字段 = 0.
+ * 布局 (LSB-first within byte):
+ *   bit 0..3   = flags_ = 0
+ *   bit 4..7   = code_size marker = 15 (next 32 bits hold value)
+ *   bit 8..11  = packed_frame_size marker = 15 (next 32 bits)
+ *   bit 12..15 = core_spill_mask_ = 0
+ *   bit 16..19 = fp_spill_mask_ = 0
+ *   bit 20..23 = number_of_dex_registers_ = 0
+ *   bit 24..27 = bit_table_flags_ = 0
+ *   bit 28..31 = pad = 0 (next 32 bits align to byte boundary)
+ *   bit 32..63 = code_size_ value (32 bits LE-bit)
+ *   bit 64..95 = packed_frame_size_ value (32 bits)
+ * 共 12 bytes. */
+static void encode_fake_codeinfo_v2(uint8_t buf[FAKE_OAT_CODEINFO_BYTES],
+                                     uint32_t code_size, uint32_t frame_packed) {
     memset(buf, 0, FAKE_OAT_CODEINFO_BYTES);
-    buf[0] = 0xF0;  /* 0b11110000: flags=0 | code_size marker=15 */
-    /* code_size 占 32 bits, 从 bit 28 开始 */
-    buf[3] |= (uint8_t)((code_size & 0x0F) << 4);
-    buf[4]  = (uint8_t)((code_size >> 4)  & 0xFF);
-    buf[5]  = (uint8_t)((code_size >> 12) & 0xFF);
-    buf[6]  = (uint8_t)((code_size >> 20) & 0xFF);
-    buf[7]  = (uint8_t)((code_size >> 28) & 0x0F);
+    /* ART bit-stream, LSB-first within each byte, bytes LE in memory.
+     *
+     * Phase A (28 nibble bits = 7 * 4):
+     *   bit  0..3  : nibble0 = flags             = 0
+     *   bit  4..7  : nibble1 = code_size marker  = 15 (0xF)  → 下面跟 32 bits 值
+     *   bit  8..11 : nibble2 = frame_size marker = 15 (0xF)  → 再跟 32 bits 值
+     *   bit 12..15 : nibble3 = core_spill_mask   = 0
+     *   bit 16..19 : nibble4 = fp_spill_mask     = 0
+     *   bit 20..23 : nibble5 = num_dex_registers = 0
+     *   bit 24..27 : nibble6 = bit_table_flags   = 0
+     *
+     * Phase B (code_size 32 bits starting at bit 28):
+     *   bit 28..31 = byte 3 high nibble = code_size bits 0..3
+     *   bit 32..39 = byte 4             = code_size bits 4..11
+     *   bit 40..47 = byte 5             = code_size bits 12..19
+     *   bit 48..55 = byte 6             = code_size bits 20..27
+     *   bit 56..59 = byte 7 low nibble  = code_size bits 28..31
+     *
+     * Phase C (frame_packed 32 bits starting at bit 60):
+     *   bit 60..63 = byte 7 high nibble = frame_size bits 0..3
+     *   bit 64..71 = byte 8             = frame_size bits 4..11
+     *   bit 72..79 = byte 9             = frame_size bits 12..19
+     *   bit 80..87 = byte 10            = frame_size bits 20..27
+     *   bit 88..91 = byte 11 low nibble = frame_size bits 28..31
+     *   bit 92..95 = byte 11 high nibble = pad = 0
+     */
+    buf[0] = 0xF0;  /* nibble0=0 (low), nibble1=15 (high) */
+    buf[1] = 0x0F;  /* nibble2=15 (low), nibble3=0 (high) */
+    buf[2] = 0x00;  /* nibble4=0, nibble5=0 */
+    buf[3] = (uint8_t)((code_size & 0x0F) << 4);  /* nibble6=0 (low) | code_size bits 0..3 (high) */
+    buf[4] = (uint8_t)((code_size >> 4)  & 0xFF);
+    buf[5] = (uint8_t)((code_size >> 12) & 0xFF);
+    buf[6] = (uint8_t)((code_size >> 20) & 0xFF);
+    buf[7] = (uint8_t)(((code_size >> 28) & 0x0F) | ((frame_packed & 0x0F) << 4));
+    buf[8] = (uint8_t)((frame_packed >> 4)  & 0xFF);
+    buf[9] = (uint8_t)((frame_packed >> 12) & 0xFF);
+    buf[10]= (uint8_t)((frame_packed >> 20) & 0xFF);
+    buf[11]= (uint8_t)((frame_packed >> 28) & 0x0F);
 }
 
-/* 填充 thunk 前 12 字节: [CodeInfo 8B][OatQuickMethodHeader 4B].
- * body_size: thunk body 真实字节数 (不含 12B 前缀).
- * 调用时机: thunk 全部生成完毕后、patch_target 之前. */
+/* 填充 thunk 前 16 字节: [CodeInfo 12B][OatQuickMethodHeader 4B]. */
 static void backfill_fake_oat_header(void* thunk_mem, uint32_t body_size) {
     uint8_t* p = (uint8_t*)thunk_mem;
-    encode_fake_codeinfo_code_size(p, body_size);
-    /* code_info_offset_ = 距 code_ 向前的字节数 = 8 (CodeInfo 紧挨着 header) */
+    encode_fake_codeinfo_v2(p, body_size, FAKE_PACKED_FRAME_SIZE);
+    /* code_info_offset_ = 距 code_ 向前的字节数 = 12 (CodeInfo 紧挨着 header) */
     uint32_t code_info_offset = FAKE_OAT_CODEINFO_BYTES;
     memcpy(p + FAKE_OAT_CODEINFO_BYTES, &code_info_offset, sizeof(uint32_t));
 }
