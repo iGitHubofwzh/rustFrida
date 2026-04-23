@@ -289,7 +289,7 @@ pub(crate) unsafe extern "C" fn lua_call_original(
 }
 
 /// Lua 值 → JNI jvalue (u64)
-unsafe fn lua_to_jvalue(
+pub(crate) unsafe fn lua_to_jvalue(
     L: *mut ffi::lua_State,
     idx: i32,
     type_sig: Option<&str>,

@@ -121,7 +121,7 @@ pub(super) fn wait_for_in_flight_java_hook_callbacks(timeout: std::time::Duratio
 
 /// Parse JNI signature to extract the return type character.
 /// "(II)V" → b'V', "(Ljava/lang/String;)Ljava/lang/Object;" → b'L'
-pub(super) fn get_return_type_from_sig(sig: &str) -> u8 {
+pub(crate) fn get_return_type_from_sig(sig: &str) -> u8 {
     if let Some(pos) = sig.rfind(')') {
         let ret = &sig[pos + 1..];
         match ret.as_bytes().first() {
@@ -135,7 +135,7 @@ pub(super) fn get_return_type_from_sig(sig: &str) -> u8 {
 
 /// Extract the full return type descriptor from a JNI method signature.
 /// "(II)V" → "V", "(I)Ljava/lang/String;" → "Ljava/lang/String;", "()[B" → "[B"
-pub(super) fn get_return_type_sig(sig: &str) -> String {
+pub(crate) fn get_return_type_sig(sig: &str) -> String {
     if let Some(pos) = sig.rfind(')') {
         sig[pos + 1..].to_string()
     } else {

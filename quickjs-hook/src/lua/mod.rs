@@ -2,6 +2,7 @@ pub mod ffi;
 pub mod state;
 pub mod api;
 pub mod callback;
+pub mod jni_call;
 pub mod script;
 
 use state::LuaState;

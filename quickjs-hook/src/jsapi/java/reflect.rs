@@ -1313,7 +1313,7 @@ pub(crate) unsafe fn get_class_name_unchecked(env_ptr: u64, cls_ptr: u64) -> Opt
 /// 但 walkstack guards (hook_replace GetOatQuickMethodHeader + 内联 OAT patch +
 /// PrettyMethod + SIGSEGV handler) 已到位, WalkStack 碰 hook 帧现在是安全的,
 /// 无需 block/绕行.
-pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std::ffi::c_void {
+pub(crate) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std::ffi::c_void {
     // Clear any stale exception before calling FindClass.
     // ART's FindClass asserts no pending exception — calling it with one → SIGABRT.
     jni_check_exc(env);
@@ -1414,10 +1414,10 @@ unsafe fn find_class_via_classloader(env: JniEnv, class_name: &str) -> *mut std:
 // JNI reflection — enumerate methods for auto-overload detection
 // ============================================================================
 
-pub(super) struct MethodInfo {
-    pub(super) name: String,
-    pub(super) sig: String,
-    pub(super) is_static: bool,
+pub(crate) struct MethodInfo {
+    pub(crate) name: String,
+    pub(crate) sig: String,
+    pub(crate) is_static: bool,
 }
 
 /// Convert Java type name (from Class.getName()) to JNI type descriptor.
@@ -1446,7 +1446,7 @@ pub(super) fn java_type_to_jni(type_name: &str) -> String {
 /// Enumerate methods of a Java class via JNI reflection.
 /// Uses getDeclaredMethods() to include private/protected methods.
 /// Falls back to getMethods() for inherited public methods if no match found.
-pub(super) unsafe fn enumerate_methods(env: JniEnv, class_name: &str) -> Result<Vec<MethodInfo>, String> {
+pub(crate) unsafe fn enumerate_methods(env: JniEnv, class_name: &str) -> Result<Vec<MethodInfo>, String> {
     use std::ffi::CStr;
     use std::ptr;
 

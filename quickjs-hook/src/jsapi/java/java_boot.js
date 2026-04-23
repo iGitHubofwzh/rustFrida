@@ -18,6 +18,8 @@
     var _releaseInstanceRefs = Java._releaseInstanceRefs;
     delete Java.hook;
     delete Java.unhook;
+    // _methods 保留给 Lua Java.use 使用 (重命名为 __luaMethods)
+    Java.__luaMethods = Java._methods;
     delete Java._methods;
     delete Java._invokeStaticMethod;
     delete Java._newObject;

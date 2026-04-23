@@ -33,11 +33,21 @@ unsafe fn register_all_apis(state: &LuaState) {
     let L = state.as_ptr();
 
     // ---- Java ----
-    ffi::lua_createtable(L, 0, 3);
+    ffi::lua_createtable(L, 0, 8);
     set_cfn(L, c"hook", lua_java_hook);
     set_cfn(L, c"unhook", lua_java_unhook);
     set_cfn(L, c"jstring", lua_jstring);
+    set_cfn(L, c"_call", super::jni_call::lua_jni_call);
+    set_cfn(L, c"_staticCall", super::jni_call::lua_jni_static_call);
+    set_cfn(L, c"_new", super::jni_call::lua_jni_new);
+    set_cfn(L, c"_methods", super::jni_call::lua_jni_methods);
     ffi::lua_setglobal(L, c"Java".as_ptr());
+
+    // ---- Java.use() 纯 Lua 实现 (metatable) ----
+    let lua_use_code = include_str!("java_use.lua");
+    if let Err(e) = state.dostring(lua_use_code) {
+        crate::jsapi::console::output_message(&format!("[lua] Java.use init error: {}", e));
+    }
 
     // ---- Module ----
     ffi::lua_createtable(L, 0, 3);

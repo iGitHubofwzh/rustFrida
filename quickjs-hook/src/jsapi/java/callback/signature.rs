@@ -45,7 +45,7 @@ pub(super) fn count_jni_params(sig: &str) -> usize {
 
 /// Parse a JNI method signature into individual parameter type descriptors.
 /// "(ILjava/lang/String;[B)V" → ["I", "Ljava/lang/String;", "[B"]
-pub(super) fn parse_jni_param_types(sig: &str) -> Vec<String> {
+pub(crate) fn parse_jni_param_types(sig: &str) -> Vec<String> {
     let bytes = sig.as_bytes();
     let mut result = Vec::new();
     for_each_jni_param(sig, |start, end| {
