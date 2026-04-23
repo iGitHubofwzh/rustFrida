@@ -208,6 +208,65 @@ static void emit_art_router_fast_bypass(Arm64Writer* w, uint64_t lbl_normal) {
     }
 }
 
+/* --- Fast $orig bypass slot management (called from Rust) --- */
+
+int orig_bypass_set(uint64_t thread, uint64_t method, uint64_t trampoline) {
+    for (int i = 0; i < ORIG_BYPASS_SLOTS; i++) {
+        OrigBypassState* slot = &g_orig_bypass[i];
+        uint64_t expected = 0;
+        if (__atomic_compare_exchange_n(&slot->thread, &expected, (uint64_t)1,
+                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            slot->method = method;
+            slot->trampoline = trampoline;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            slot->thread = thread;
+            __atomic_add_fetch(&g_orig_bypass_active, 1, __ATOMIC_RELEASE);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void orig_bypass_clear(uint64_t thread) {
+    for (int i = 0; i < ORIG_BYPASS_SLOTS; i++) {
+        OrigBypassState* slot = &g_orig_bypass[i];
+        if (__atomic_load_n(&slot->thread, __ATOMIC_RELAXED) == thread) {
+            __atomic_store_n(&slot->thread, 0, __ATOMIC_RELEASE);
+            __atomic_sub_fetch(&g_orig_bypass_active, 1, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+}
+
+/* --- BLR fast $orig: post-callback flag (separate from entry bypass) --- */
+
+FastOrigSlot g_fast_orig_slots[FAST_ORIG_SLOTS] = {{0}};
+volatile uint64_t g_fast_orig_active = 0;
+
+int fast_orig_set(uint64_t thread) {
+    for (int i = 0; i < FAST_ORIG_SLOTS; i++) {
+        FastOrigSlot* slot = &g_fast_orig_slots[i];
+        uint64_t expected = 0;
+        if (__atomic_compare_exchange_n(&slot->thread, &expected, thread,
+                                         0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            __atomic_add_fetch(&g_fast_orig_active, 1, __ATOMIC_RELEASE);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void fast_orig_clear(uint64_t thread) {
+    for (int i = 0; i < FAST_ORIG_SLOTS; i++) {
+        FastOrigSlot* slot = &g_fast_orig_slots[i];
+        if (__atomic_load_n(&slot->thread, __ATOMIC_RELAXED) == thread) {
+            __atomic_store_n(&slot->thread, 0, __ATOMIC_RELEASE);
+            __atomic_sub_fetch(&g_fast_orig_active, 1, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+}
+
 static void emit_art_router_prologue(Arm64Writer* w) {
     /* thunk-level 计数废弃, 见 hook_engine_inline.c emit_save_hook_context 注释.
      * 计数改为只在 Rust java_hook_callback 进出点 inc/dec. */
@@ -380,6 +439,201 @@ static void emit_art_router_not_found_path(Arm64Writer* w, uint64_t lbl_not_foun
 }
 
 /* ============================================================================
+ * BLR variant helpers
+ * ============================================================================ */
+
+/* Restore only argument regs (x0-x7, d0-d7) from frame. No callee-saved, no frame pop. */
+static void emit_restore_args_only(Arm64Writer* w) {
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X2, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 0, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 16, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 32, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 48);
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP,
+            ROUTER_FRAME_FP_OFF + i * 8);
+    }
+}
+
+/* Restore callee-saved regs (x20-x28, x29, LR) from frame + pop frame.
+ * Clobbers NO scratch regs (x16/x17 untouched). */
+static void emit_restore_callee_and_pop(Arm64Writer* w) {
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X20, ARM64_REG_SP,
+        ROUTER_SAVED_X20_OFF);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 64, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 80, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 96, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 112, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 128);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_LR, ARM64_REG_SP,
+        ROUTER_SAVED_LR_OFF);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
+}
+
+/* BLR variant of found path for Layer 3 per-method thunks.
+ *
+ * Key difference from BR variant: keeps frame on stack, uses BLR to call replacement,
+ * then post-callback checks if fast $orig was requested.
+ *   - If yes: restore original Quick regs from frame, BR trampoline (zero JNI overhead)
+ *   - If no: return callback value to caller
+ *
+ * trampoline_target: relocated original instructions (known at thunk generation time).
+ * Stored in callee-saved X22 to survive the BLR. */
+static void emit_art_router_found_path_blr(Arm64Writer* w, uint64_t lbl_found,
+                                            uint32_t quickcode_offset,
+                                            uint64_t lbl_not_found,
+                                            uint64_t trampoline_target) {
+    arm64_writer_put_label(w, lbl_found);
+
+    /* Debug: increment hit counter */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_art_router_hit_count);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X0, ARM64_REG_X0, 1);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
+
+    /* Load replacement ArtMethod* from table entry offset 8 */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);
+
+    /* WalkStack: write replacement to SP+0 early (same as BR variant) */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+
+    /* --- Stack check (identical to BR variant) --- */
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X20, ARM64_REG_X16);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X21, ARM64_REG_X17);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X17);
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)art_router_stack_check);
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+    uint64_t lbl_found_continue = arm64_writer_new_label_id(w);
+    arm64_writer_put_cbnz_reg_label(w, ARM64_REG_X0, lbl_found_continue);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X20, 0);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);
+    arm64_writer_put_b_label(w, lbl_not_found);
+    arm64_writer_put_label(w, lbl_found_continue);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X20);
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X17, ARM64_REG_X21);
+
+    /* Sync declaring_class_ (same as BR variant) */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 0);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X0, 0);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_W0, ARM64_REG_X17, 0);
+
+    /* === BLR-specific: prepare callee-saved state for post-callback === */
+
+    /* X22 = trampoline (survives BLR via callee-saved) */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X22, trampoline_target);
+
+    /* Load replacement.entry_point_ */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, quickcode_offset);
+
+    /* Restore argument regs from frame (don't pop, don't restore callee-saved) */
+    emit_restore_args_only(w);
+
+    /* BLR: call replacement, frame stays on stack */
+    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+
+    /* === Post-callback: check fast $orig flag ===
+     * x0 = callback return value (from JNI)
+     * X20 = table entry ptr (callee-saved, preserved by BLR target)
+     * X22 = trampoline_target (callee-saved, preserved)
+     * SP → art_router frame (intact, never popped) */
+
+    uint64_t lbl_no_orig = arm64_writer_new_label_id(w);
+    uint64_t lbl_do_orig = arm64_writer_new_label_id(w);
+
+    /* Quick check: g_fast_orig_active == 0 → no fast orig */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_fast_orig_active);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X17, 0);
+    arm64_writer_put_cbz_reg_label(w, ARM64_REG_X17, lbl_no_orig);
+
+    /* Scan slots for current thread match */
+    arm64_writer_put_mrs_reg(w, ARM64_REG_X16, SYSREG_TPIDR_EL0);
+    for (int i = 0; i < FAST_ORIG_SLOTS; i++) {
+        FastOrigSlot* slot = &g_fast_orig_slots[i];
+        arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&slot->thread);
+        arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X17, 0);
+        arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X16, ARM64_REG_X17);
+        arm64_writer_put_b_cond_label(w, ARM64_COND_EQ, lbl_do_orig);
+    }
+    arm64_writer_put_b_label(w, lbl_no_orig);
+
+    /* === do_orig: restore original Quick regs, BR trampoline === */
+    arm64_writer_put_label(w, lbl_do_orig);
+
+    /* Clear matched slot: scan and zero (X16 = current TPIDR_EL0) */
+    for (int i = 0; i < FAST_ORIG_SLOTS; i++) {
+        FastOrigSlot* slot = &g_fast_orig_slots[i];
+        uint64_t lbl_skip = arm64_writer_new_label_id(w);
+        arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&slot->thread);
+        arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X17, 0);
+        arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X16, ARM64_REG_X0);
+        arm64_writer_put_b_cond_label(w, ARM64_COND_NE, lbl_skip);
+        arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_X17, 0);
+        arm64_writer_put_label(w, lbl_skip);
+    }
+    /* Decrement active */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_fast_orig_active);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
+    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, 1);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
+
+    /* Debug hit counter */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_orig_bypass_hit);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X16, ARM64_REG_X16, 1);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 0);
+
+    /* Restore original Quick regs:
+     * x0 = original ArtMethod* (from table entry via X20)
+     * x1-x7, d0-d7 from frame (original caller's args) */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X1, ARM64_REG_X2, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 0, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3, ARM64_REG_X4, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 16, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5, ARM64_REG_X6, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 32, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X7, ARM64_REG_SP,
+        ROUTER_FRAME_GPR_OFF + 48);
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP,
+            ROUTER_FRAME_FP_OFF + i * 8);
+    }
+
+    /* Save trampoline to X16 BEFORE restoring callee-saved (which overwrites X22) */
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X22);
+
+    /* Restore callee-saved + pop frame */
+    emit_restore_callee_and_pop(w);
+
+    /* BR trampoline → original method → RET to caller */
+    arm64_writer_put_br_reg(w, ARM64_REG_X16);
+
+    /* === no_orig: return callback value === */
+    arm64_writer_put_label(w, lbl_no_orig);
+
+    /* Save callback return value (x0) to X16 */
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X16, ARM64_REG_X0);
+
+    /* Restore callee-saved + pop frame */
+    emit_restore_callee_and_pop(w);
+
+    /* Restore callback return value */
+    arm64_writer_put_mov_reg_reg(w, ARM64_REG_X0, ARM64_REG_X16);
+
+    /* RET to caller */
+    arm64_writer_put_ret(w);
+}
+
+/* ============================================================================
  * 伪 OatQuickMethodHeader 前置 (WalkStack 根治)
  *
  * Android 16 (API 36) OatQuickMethodHeader 布局 (libart_base_commit):
@@ -493,7 +747,8 @@ static void backfill_fake_oat_header(void* thunk_mem, uint32_t body_size) {
 static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
                                          void* trampoline_target,
                                          uint32_t quickcode_offset,
-                                         uint64_t current_pc_hint) {
+                                         uint64_t current_pc_hint,
+                                         int use_blr) {
     /* 前 12 字节是 CodeInfo+header 占位, 最后 backfill.
      * Arm64Writer 初始化到 body 起点 (thunk_mem + 12). */
     if (thunk_alloc < FAKE_OAT_PREFIX_SIZE + 64) {
@@ -506,11 +761,24 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
     Arm64Writer w;
     arm64_writer_init(&w, body_mem, (uint64_t)body_mem, body_alloc);
 
+    /* Fast $orig bypass — checked BEFORE prologue (zero register save overhead).
+     * This handles the JNI-path $orig re-entry (orig_bypass_set from Rust). */
+    uint64_t lbl_normal_path = arm64_writer_new_label_id(&w);
+    emit_art_router_fast_bypass(&w, lbl_normal_path);
+    arm64_writer_put_label(&w, lbl_normal_path);
+
     emit_art_router_prologue(&w);
 
     uint64_t lbl_found, lbl_not_found;
     emit_art_router_scan_loop(&w, &lbl_found, &lbl_not_found);
-    emit_art_router_found_path(&w, lbl_found, quickcode_offset, current_pc_hint, lbl_not_found);
+
+    if (use_blr) {
+        /* BLR variant: keeps frame on stack, calls trampoline post-callback if $orig set */
+        emit_art_router_found_path_blr(&w, lbl_found, quickcode_offset, lbl_not_found,
+                                        (uint64_t)trampoline_target);
+    } else {
+        emit_art_router_found_path(&w, lbl_found, quickcode_offset, current_pc_hint, lbl_not_found);
+    }
 
     /* === not_found path: fall through to trampoline === */
     emit_art_router_not_found_path(&w, lbl_not_found, (uint64_t)trampoline_target);
@@ -593,7 +861,8 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                int stealth, void* jni_env,
                                void** out_hooked_target,
                                int skip_resolve,
-                               uint64_t current_pc_hint) {
+                               uint64_t current_pc_hint,
+                               int use_blr) {
     if (!g_engine.initialized || !target) {
         return NULL;
     }
@@ -652,7 +921,7 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
      * thunk_size 返回值含 12B 前缀. entry_point/patch_target 指向 body start. */
     size_t thunk_size = generate_art_router_thunk(
         entry->thunk, art_thunk_alloc,
-        entry->trampoline, quickcode_offset, current_pc_hint);
+        entry->trampoline, quickcode_offset, current_pc_hint, use_blr);
     if (thunk_size == 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);

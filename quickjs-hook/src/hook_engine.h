@@ -366,6 +366,27 @@ extern OrigBypassState g_orig_bypass[ORIG_BYPASS_SLOTS];
 extern volatile uint64_t g_orig_bypass_active;  /* >0 when any slot in use */
 extern volatile uint64_t g_orig_bypass_hit;     /* debug counter */
 
+/* Set/clear a fast $orig bypass slot (entry-level: thunk skips prologue+scan).
+ * orig_bypass_set: atomically claim a free slot, write thread+method+trampoline.
+ *   Returns 0 on success, -1 if all slots are busy (fallback to TLS bypass).
+ * orig_bypass_clear: release the slot for the given thread. */
+int orig_bypass_set(uint64_t thread, uint64_t method, uint64_t trampoline);
+void orig_bypass_clear(uint64_t thread);
+
+/* BLR fast $orig: post-callback flag slots (separate from entry bypass).
+ * Set by Rust $orig to signal thunk should call trampoline after callback. */
+#define FAST_ORIG_SLOTS 4
+typedef struct {
+    volatile uint64_t thread;   /* TPIDR_EL0, 0 = free slot */
+    uint64_t _pad[3];
+} FastOrigSlot;
+
+extern FastOrigSlot g_fast_orig_slots[FAST_ORIG_SLOTS];
+extern volatile uint64_t g_fast_orig_active;
+
+int fast_orig_set(uint64_t thread);
+void fast_orig_clear(uint64_t thread);
+
 /*
  * Dump all entries in the ART router lookup table (via hook_log).
  */
@@ -422,7 +443,8 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
                                int stealth, void* jni_env,
                                void** out_hooked_target,
                                int skip_resolve,
-                               uint64_t current_pc_hint);
+                               uint64_t current_pc_hint,
+                               int use_blr);
 
 /*
  * Resolve tiny ART trampolines (LDR Xt,[X19,#imm]; BR Xt) to actual target.

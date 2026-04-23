@@ -469,6 +469,7 @@ pub(super) fn ensure_art_controller_initialized(
                 &mut hooked_target,
                 1, // skip_resolve: 已在 prepare_hook_target 中 resolve
                 0, // no hint — replacement is kAccNative, ART handles it
+                0, // use_blr=0: Layer 1 shared stubs 不用 BLR
             )
         };
         if !trampoline.is_null() {

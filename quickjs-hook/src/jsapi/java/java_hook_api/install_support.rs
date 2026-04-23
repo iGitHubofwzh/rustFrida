@@ -221,6 +221,7 @@ pub(super) unsafe fn install_per_method_router_hook(
             &mut hooked_target,
             1, // skip_resolve
             0, // no hint — replacement is kAccNative, ART handles it
+            0, // use_blr=0: Layer 3 BLR 暂时关闭 (调试中)
         );
 
         if trampoline.is_null() {

@@ -391,12 +391,29 @@ pub(super) unsafe fn invoke_original_jni(
 ) -> u64 {
     jni_check_exc(env);
 
+    let thread_id = crate::current_thread_id_u64();
+
+    // BLR fast $orig: 暂时关闭 (调试中)
+    // if quick_trampoline != 0 && hook_ffi::fast_orig_set(thread_id) == 0 {
+    //     return 0;
+    // }
+
+    // Fallback: full JNI path (Layer 1/2 or fast_orig slots full)
     crate::jsapi::java::art_controller::set_call_original_bypass(art_method_addr);
+
+    let bypass_set = if quick_trampoline != 0 {
+        hook_ffi::orig_bypass_set(thread_id, art_method_addr, quick_trampoline) == 0
+    } else {
+        false
+    };
 
     let result = invoke_original_jni_inner(
         env, art_method_addr, class_global_ref, this_obj, return_type, is_static, jargs_ptr,
     );
 
+    if bypass_set {
+        hook_ffi::orig_bypass_clear(thread_id);
+    }
     crate::jsapi::java::art_controller::clear_call_original_bypass();
     result
 }
