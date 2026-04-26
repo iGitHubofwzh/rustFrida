@@ -3032,6 +3032,22 @@ enum DslValue {
     },
 }
 
+enum DslCondition {
+    Null {
+        value: DslValue,
+        invert: bool,
+    },
+    Cmp {
+        op: IfCmpOp,
+        left: DslValue,
+        right: DslValue,
+    },
+    InstanceOf {
+        value: DslValue,
+        class_name: String,
+    },
+}
+
 impl DslValue {
     fn into_statement(self) -> Option<DslStmt> {
         match self {
@@ -3112,6 +3128,9 @@ impl<'a> DslParser<'a> {
             self.expect_char(';')?;
             return Ok(DslStmt::ReturnValue { value });
         }
+        if self.peek_ident("if") {
+            return self.parse_js_if_statement();
+        }
 
         let name = self.parse_ident()?;
         self.skip_ws();
@@ -3127,6 +3146,20 @@ impl<'a> DslParser<'a> {
         if self.peek() == Some('.') {
             let value = self.parse_js_member_value(name)?;
             self.skip_ws();
+            if self.peek() == Some('=') {
+                self.expect_char('=')?;
+                let rhs = self.parse_value_arg()?;
+                self.skip_ws();
+                self.expect_char(';')?;
+                return match value {
+                    DslValue::FieldGet { stmt, is_static } => {
+                        let mut stmt = *stmt;
+                        stmt.value = Some(rhs);
+                        Ok(DslStmt::FieldWrite { stmt, is_static })
+                    }
+                    _ => Err(self.err("only fields can be assigned")),
+                };
+            }
             self.expect_char(';')?;
             return value.into_statement().ok_or_else(|| {
                 self.err("only method calls and field reads can be used as expression statements")
@@ -3134,106 +3167,6 @@ impl<'a> DslParser<'a> {
         }
         self.expect_char('(')?;
         let stmt = match name.as_str() {
-            "let" => {
-                let local_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let value = self.parse_value_arg()?;
-                self.expect_char(')')?;
-                DslStmt::Let {
-                    name: local_name,
-                    type_name,
-                    value,
-                }
-            }
-            "ifNull" | "ifNotNull" => {
-                let value = self.parse_value_arg()?;
-                self.expect_char(')')?;
-                let then_stmts = self.parse_block()?;
-                self.skip_ws();
-                let else_stmts = if self.peek_ident("else") {
-                    self.expect_ident("else")?;
-                    self.parse_block()?
-                } else {
-                    Vec::new()
-                };
-                return Ok(DslStmt::IfNull {
-                    value,
-                    invert: name == "ifNotNull",
-                    then_stmts,
-                    else_stmts,
-                });
-            }
-            "ifEq" | "ifNe" | "ifLt" | "ifGe" | "ifGt" | "ifLe" => {
-                let left = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let right = self.parse_value_arg()?;
-                self.expect_char(')')?;
-                let then_stmts = self.parse_block()?;
-                self.skip_ws();
-                let else_stmts = if self.peek_ident("else") {
-                    self.expect_ident("else")?;
-                    self.parse_block()?
-                } else {
-                    Vec::new()
-                };
-                let op = match name.as_str() {
-                    "ifEq" => IfCmpOp::Eq,
-                    "ifNe" => IfCmpOp::Ne,
-                    "ifLt" => IfCmpOp::Lt,
-                    "ifGe" => IfCmpOp::Ge,
-                    "ifGt" => IfCmpOp::Gt,
-                    "ifLe" => IfCmpOp::Le,
-                    _ => unreachable!(),
-                };
-                return Ok(DslStmt::IfCmp {
-                    op,
-                    left,
-                    right,
-                    then_stmts,
-                    else_stmts,
-                });
-            }
-            "ifInstanceOf" => {
-                let value = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(')')?;
-                let then_stmts = self.parse_block()?;
-                self.skip_ws();
-                let else_stmts = if self.peek_ident("else") {
-                    self.expect_ident("else")?;
-                    self.parse_block()?
-                } else {
-                    Vec::new()
-                };
-                return Ok(DslStmt::IfInstanceOf {
-                    value,
-                    class_name,
-                    then_stmts,
-                    else_stmts,
-                });
-            }
-            "$new" | "new" => {
-                self.skip_ws();
-                let class_name = self.parse_string()?;
-                self.skip_ws();
-                let (ctor_sig, args) = if self.peek() == Some(',') {
-                    self.expect_char(',')?;
-                    let sig = self.parse_string_arg()?;
-                    let args = self.parse_optional_value_args()?;
-                    (Some(sig), args)
-                } else {
-                    (None, Vec::new())
-                };
-                self.expect_char(')')?;
-                DslStmt::New {
-                    class_name,
-                    ctor_sig,
-                    args,
-                }
-            }
             "newArray" => {
                 let array_type_name = self.parse_string_arg()?;
                 self.expect_char(',')?;
@@ -3257,48 +3190,6 @@ impl<'a> DslParser<'a> {
                     class_name,
                     iterations,
                 }
-            }
-            "call" | "callVirtual" | "callInterface" => {
-                let kind = if name == "callInterface" {
-                    DslCallKind::Interface
-                } else {
-                    DslCallKind::Virtual
-                };
-                let target = self.parse_target_arg()?;
-                self.skip_ws();
-                self.expect_char(',')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let method_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let sig = self.parse_string_arg()?;
-                let args = self.parse_optional_value_args()?;
-                self.expect_char(')')?;
-                DslStmt::Call(DslCallStmt {
-                    kind,
-                    target: Some(target),
-                    class_name,
-                    method_name,
-                    sig,
-                    args,
-                })
-            }
-            "callStatic" => {
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let method_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let sig = self.parse_string_arg()?;
-                let args = self.parse_optional_value_args()?;
-                self.expect_char(')')?;
-                DslStmt::Call(DslCallStmt {
-                    kind: DslCallKind::Static,
-                    target: None,
-                    class_name,
-                    method_name,
-                    sig,
-                    args,
-                })
             }
             "cast" => {
                 let value = self.parse_value_arg()?;
@@ -3339,88 +3230,6 @@ impl<'a> DslParser<'a> {
                     index,
                     type_name,
                     value,
-                }
-            }
-            "get" => {
-                let target = self.parse_target_arg()?;
-                self.skip_ws();
-                self.expect_char(',')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let field_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(')')?;
-                DslStmt::FieldRead {
-                    stmt: DslFieldStmt {
-                        target: Some(target),
-                        class_name,
-                        field_name,
-                        type_name,
-                        value: None,
-                    },
-                    is_static: false,
-                }
-            }
-            "set" => {
-                let target = self.parse_target_arg()?;
-                self.skip_ws();
-                self.expect_char(',')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let field_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let value = self.parse_value_arg()?;
-                self.expect_char(')')?;
-                DslStmt::FieldWrite {
-                    stmt: DslFieldStmt {
-                        target: Some(target),
-                        class_name,
-                        field_name,
-                        type_name,
-                        value: Some(value),
-                    },
-                    is_static: false,
-                }
-            }
-            "getStatic" => {
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let field_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(')')?;
-                DslStmt::FieldRead {
-                    stmt: DslFieldStmt {
-                        target: None,
-                        class_name,
-                        field_name,
-                        type_name,
-                        value: None,
-                    },
-                    is_static: true,
-                }
-            }
-            "setStatic" => {
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let field_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let value = self.parse_value_arg()?;
-                self.expect_char(')')?;
-                DslStmt::FieldWrite {
-                    stmt: DslFieldStmt {
-                        target: None,
-                        class_name,
-                        field_name,
-                        type_name,
-                        value: Some(value),
-                    },
-                    is_static: true,
                 }
             }
             other => return Err(self.err(&format!("unknown managed DSL statement '{}'", other))),
@@ -3466,6 +3275,48 @@ impl<'a> DslParser<'a> {
             class_name,
             ctor_sig,
             args,
+        })
+    }
+
+    fn parse_js_if_statement(&mut self) -> Result<DslStmt, String> {
+        self.expect_ident("if")?;
+        self.skip_ws();
+        self.expect_char('(')?;
+        let condition = self.parse_js_condition()?;
+        self.expect_char(')')?;
+        let then_stmts = self.parse_block()?;
+        self.skip_ws();
+        let else_stmts = if self.peek_ident("else") {
+            self.expect_ident("else")?;
+            self.skip_ws();
+            if self.peek_ident("if") {
+                vec![self.parse_js_if_statement()?]
+            } else {
+                self.parse_block()?
+            }
+        } else {
+            Vec::new()
+        };
+        Ok(match condition {
+            DslCondition::Null { value, invert } => DslStmt::IfNull {
+                value,
+                invert,
+                then_stmts,
+                else_stmts,
+            },
+            DslCondition::Cmp { op, left, right } => DslStmt::IfCmp {
+                op,
+                left,
+                right,
+                then_stmts,
+                else_stmts,
+            },
+            DslCondition::InstanceOf { value, class_name } => DslStmt::IfInstanceOf {
+                value,
+                class_name,
+                then_stmts,
+                else_stmts,
+            },
         })
     }
 }
@@ -3672,17 +3523,6 @@ impl<'a> DslParser<'a> {
         Ok(value as i8)
     }
 
-    fn parse_target_arg(&mut self) -> Result<DslTarget, String> {
-        self.skip_ws();
-        let name = if self.peek() == Some('"') {
-            self.parse_string()?
-        } else {
-            self.parse_ident()?
-        };
-        self.skip_ws();
-        parse_target_name(&name).ok_or_else(|| self.err(&format!("unknown target '{}'", name)))
-    }
-
     fn parse_value_arg(&mut self) -> Result<DslValue, String> {
         self.skip_ws();
         let value = if self.peek() == Some('"') {
@@ -3707,90 +3547,6 @@ impl<'a> DslParser<'a> {
                     DslValue::AddLit(Box::new(base), literal)
                 } else {
                     DslValue::SubLit(Box::new(base), literal)
-                }
-            } else if ident == "call" || ident == "callVirtual" || ident == "callInterface" {
-                self.skip_ws();
-                self.expect_char('(')?;
-                let kind = if ident == "callInterface" {
-                    DslCallKind::Interface
-                } else {
-                    DslCallKind::Virtual
-                };
-                let target = self.parse_target_arg()?;
-                self.skip_ws();
-                self.expect_char(',')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let method_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let sig = self.parse_string_arg()?;
-                let args = self.parse_optional_value_args()?;
-                self.expect_char(')')?;
-                DslValue::Call(DslCallStmt {
-                    kind,
-                    target: Some(target),
-                    class_name,
-                    method_name,
-                    sig,
-                    args,
-                })
-            } else if ident == "callStatic" {
-                self.skip_ws();
-                self.expect_char('(')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let method_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let sig = self.parse_string_arg()?;
-                let args = self.parse_optional_value_args()?;
-                self.expect_char(')')?;
-                DslValue::Call(DslCallStmt {
-                    kind: DslCallKind::Static,
-                    target: None,
-                    class_name,
-                    method_name,
-                    sig,
-                    args,
-                })
-            } else if ident == "get" {
-                self.skip_ws();
-                self.expect_char('(')?;
-                let target = self.parse_target_arg()?;
-                self.expect_char(',')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let field_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(')')?;
-                DslValue::FieldGet {
-                    stmt: Box::new(DslFieldStmt {
-                        target: Some(target),
-                        class_name,
-                        field_name,
-                        type_name,
-                        value: None,
-                    }),
-                    is_static: false,
-                }
-            } else if ident == "getStatic" {
-                self.skip_ws();
-                self.expect_char('(')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let field_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(')')?;
-                DslValue::FieldGet {
-                    stmt: Box::new(DslFieldStmt {
-                        target: None,
-                        class_name,
-                        field_name,
-                        type_name,
-                        value: None,
-                    }),
-                    is_static: true,
                 }
             } else if ident == "cast" {
                 self.skip_ws();
@@ -3907,6 +3663,75 @@ impl<'a> DslParser<'a> {
                     is_static: true,
                 })
             }
+        }
+    }
+
+    fn parse_js_condition(&mut self) -> Result<DslCondition, String> {
+        let left = self.parse_value_arg()?;
+        self.skip_ws();
+        if self.peek_ident("instanceof") {
+            self.expect_ident("instanceof")?;
+            let class_name = self.parse_type_name()?;
+            return Ok(DslCondition::InstanceOf {
+                value: left,
+                class_name,
+            });
+        }
+        let op = self.parse_js_cmp_op()?;
+        let right = self.parse_value_arg()?;
+        let left_is_null = matches!(left, DslValue::Null);
+        let right_is_null = matches!(right, DslValue::Null);
+        if right_is_null {
+            return match op {
+                IfCmpOp::Eq => Ok(DslCondition::Null {
+                    value: left,
+                    invert: false,
+                }),
+                IfCmpOp::Ne => Ok(DslCondition::Null {
+                    value: left,
+                    invert: true,
+                }),
+                _ => Err(self.err("null condition only supports == and !=")),
+            };
+        }
+        if left_is_null {
+            return match op {
+                IfCmpOp::Eq => Ok(DslCondition::Null {
+                    value: right,
+                    invert: false,
+                }),
+                IfCmpOp::Ne => Ok(DslCondition::Null {
+                    value: right,
+                    invert: true,
+                }),
+                _ => Err(self.err("null condition only supports == and !=")),
+            };
+        }
+        Ok(DslCondition::Cmp { op, left, right })
+    }
+
+    fn parse_js_cmp_op(&mut self) -> Result<IfCmpOp, String> {
+        self.skip_ws();
+        if self.input[self.pos..].starts_with("==") {
+            self.pos += 2;
+            Ok(IfCmpOp::Eq)
+        } else if self.input[self.pos..].starts_with("!=") {
+            self.pos += 2;
+            Ok(IfCmpOp::Ne)
+        } else if self.input[self.pos..].starts_with("<=") {
+            self.pos += 2;
+            Ok(IfCmpOp::Le)
+        } else if self.input[self.pos..].starts_with(">=") {
+            self.pos += 2;
+            Ok(IfCmpOp::Ge)
+        } else if self.peek() == Some('<') {
+            self.pos += 1;
+            Ok(IfCmpOp::Lt)
+        } else if self.peek() == Some('>') {
+            self.pos += 1;
+            Ok(IfCmpOp::Gt)
+        } else {
+            Err(self.err("expected comparison operator"))
         }
     }
 
