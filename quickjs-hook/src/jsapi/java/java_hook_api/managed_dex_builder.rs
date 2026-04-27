@@ -10,9 +10,6 @@ pub(super) const ACC_NATIVE: u32 = 0x0100;
 pub(super) const ACC_CONSTRUCTOR: u32 = 0x0001_0000;
 pub(super) const ACC_DECLARED_SYNCHRONIZED: u32 = 0x0002_0000;
 
-pub(super) const MANAGED_ORIG_NATIVE_NAME: &str = "__rf_arm_orig";
-pub(super) const MANAGED_ORIG_NATIVE_SIG: &str = "()V";
-
 const TYPE_HEADER_ITEM: u16 = 0x0000;
 const TYPE_STRING_ID_ITEM: u16 = 0x0001;
 const TYPE_TYPE_ID_ITEM: u16 = 0x0002;
@@ -1374,7 +1371,7 @@ pub(super) struct GeneratedManagedDex {
     pub class_name: String,
     pub method_name: String,
     pub method_sig: String,
-    pub orig_native: bool,
+    pub uses_orig: bool,
     pub string_literals: Vec<GeneratedStringLiteral>,
 }
 
@@ -1944,7 +1941,7 @@ fn emit_load_value(
             index,
             type_name,
         } => {
-            let component_type = java_class_to_descriptor_or_primitive(type_name)?;
+            let component_type = resolve_array_component_type(array, type_name.as_deref(), layout)?;
             if !value_descriptor_assignable_to(&component_type, expected_type) {
                 return Err(format!(
                     "aget expression type {} cannot be passed as {}",
@@ -1958,6 +1955,52 @@ fn emit_load_value(
 
 fn value_descriptor_assignable_to(src: &str, dst: &str) -> bool {
     src == dst || (return_is_object(src) && return_is_object(dst))
+}
+
+fn array_component_descriptor(array_desc: &str) -> Result<String, String> {
+    array_desc
+        .strip_prefix('[')
+        .map(|desc| desc.to_string())
+        .ok_or_else(|| format!("expected array descriptor, got {}", array_desc))
+}
+
+fn infer_value_descriptor(value: &DslValue, layout: &HelperParamLayout) -> Result<Option<String>, String> {
+    match value {
+        DslValue::Target(target) => resolve_target_descriptor(target, layout).map(Some),
+        DslValue::String(_) => Ok(Some("Ljava/lang/String;".to_string())),
+        DslValue::Int(_) | DslValue::AddLit(_, _) | DslValue::SubLit(_, _) | DslValue::ArrayLength(_) => {
+            Ok(Some("I".to_string()))
+        }
+        DslValue::Null => Ok(None),
+        DslValue::Call(stmt) => {
+            let (_, return_type) = parse_method_signature(&stmt.sig)?;
+            if return_type == "V" {
+                Ok(None)
+            } else {
+                Ok(Some(return_type))
+            }
+        }
+        DslValue::FieldGet { stmt, .. } => java_class_to_descriptor_or_primitive(&stmt.type_name).map(Some),
+        DslValue::Cast { class_name, .. } => java_class_to_descriptor(class_name).map(Some),
+        DslValue::ArrayGet { type_name, .. } => match type_name {
+            Some(type_name) => java_class_to_descriptor_or_primitive(type_name).map(Some),
+            None => Ok(None),
+        },
+    }
+}
+
+fn resolve_array_component_type(
+    array: &DslValue,
+    explicit_type_name: Option<&str>,
+    layout: &HelperParamLayout,
+) -> Result<String, String> {
+    if let Some(type_name) = explicit_type_name {
+        return java_class_to_descriptor_or_primitive(type_name);
+    }
+    let Some(array_desc) = infer_value_descriptor(array, layout)? else {
+        return Err("array element type cannot be inferred; use arr[index: Type]".to_string());
+    };
+    array_component_descriptor(&array_desc)
 }
 
 fn emit_array_length_value(
@@ -2186,8 +2229,9 @@ fn infer_cmp_descriptor(value: &DslValue, layout: &HelperParamLayout) -> Option<
             .ok()
             .and_then(|desc| if desc == "I" { Some("I") } else { None }),
         DslValue::ArrayLength(_) => Some("I"),
-        DslValue::ArrayGet { type_name, .. } => java_class_to_descriptor_or_primitive(type_name)
-            .ok()
+        DslValue::ArrayGet { type_name, .. } => type_name
+            .as_ref()
+            .and_then(|type_name| java_class_to_descriptor_or_primitive(type_name).ok())
             .and_then(|desc| if desc == "I" { Some("I") } else { None }),
         _ => None,
     }
@@ -2292,11 +2336,11 @@ fn emit_array_get_stmt(
     ir: &mut DexIrBuilder,
     array: &DslValue,
     index: &DslValue,
-    type_name: &str,
+    type_name: Option<&str>,
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let component_type = java_class_to_descriptor_or_primitive(type_name)?;
+    let component_type = resolve_array_component_type(array, type_name, layout)?;
     let kind = value_kind_from_descriptor(&component_type)?;
     let dst = if matches!(kind, ValueKind::Object) {
         REG_LAST_OBJECT
@@ -2311,12 +2355,12 @@ fn emit_array_put(
     ir: &mut DexIrBuilder,
     array: &DslValue,
     index: &DslValue,
-    type_name: &str,
+    type_name: Option<&str>,
     value: &DslValue,
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
-    let component_type = java_class_to_descriptor_or_primitive(type_name)?;
+    let component_type = resolve_array_component_type(array, type_name, layout)?;
     let kind = value_kind_from_descriptor(&component_type)?;
     let array_reg = emit_load_value(ir, array, "Ljava/lang/Object;", REG_TMP1, layout, dsl_ctx)?;
     let array_reg = emit_copy_object_if_needed(ir, array_reg, REG_TMP1);
@@ -2711,15 +2755,11 @@ struct EmitContext<'a> {
     local_count: u16,
     ins_size: u16,
     target: &'a MethodRef,
-    orig_arm_method: Option<&'a MethodRef>,
     return_type: &'a str,
     sink: &'a FieldRef,
 }
 
 fn emit_return_orig(ir: &mut DexIrBuilder, emit_ctx: &EmitContext<'_>) -> Result<(), String> {
-    if let Some(orig_arm_method) = emit_ctx.orig_arm_method {
-        ir.invoke_static(Vec::new(), orig_arm_method.clone());
-    }
     if emit_ctx.is_static {
         ir.invoke_static_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
     } else {
@@ -2846,7 +2886,7 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             index,
             type_name,
         } => {
-            emit_array_get_stmt(ir, array, index, type_name, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+            emit_array_get_stmt(ir, array, index, type_name.as_deref(), emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
         DslStmt::ArrayPut {
@@ -2855,7 +2895,7 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             type_name,
             value,
         } => {
-            emit_array_put(ir, array, index, type_name, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+            emit_array_put(ir, array, index, type_name.as_deref(), value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
         DslStmt::FieldRead { stmt, is_static } => {
@@ -2960,17 +3000,6 @@ pub(super) fn build_managed_dsl_dex(
         return_type.clone(),
         target_params.clone(),
     );
-    let orig_arm_method = if uses_orig {
-        Some(MethodRef::new(
-            generated_type.clone(),
-            MANAGED_ORIG_NATIVE_NAME.to_string(),
-            "V".to_string(),
-            Vec::new(),
-        ))
-    } else {
-        None
-    };
-
     let mut ir = DexIrBuilder::new(registers_size, ins_size, outs_size);
     let layout = helper_param_layout(is_static, &target_type, &target_params, local_count, local_slots)?;
     let mut emit_ctx = EmitContext {
@@ -2980,7 +3009,6 @@ pub(super) fn build_managed_dsl_dex(
         local_count,
         ins_size,
         target: &target,
-        orig_arm_method: orig_arm_method.as_ref(),
         return_type: &return_type,
         sink: &sink,
     };
@@ -2997,14 +3025,6 @@ pub(super) fn build_managed_dsl_dex(
             &lit.field_name,
             "Ljava/lang/String;",
             ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE,
-        );
-    }
-    if uses_orig {
-        class.native_direct_method(
-            MANAGED_ORIG_NATIVE_NAME,
-            "V",
-            Vec::new(),
-            ACC_PRIVATE | ACC_STATIC | ACC_NATIVE,
         );
     }
     class.direct_method(
@@ -3025,7 +3045,7 @@ pub(super) fn build_managed_dsl_dex(
         class_name: generated_class_name,
         method_name: "hook".to_string(),
         method_sig: build_method_sig(&helper_params, &return_type),
-        orig_native: uses_orig,
+        uses_orig,
         string_literals: dsl_ctx.string_literals,
     })
 }
@@ -3060,12 +3080,12 @@ enum DslStmt {
     ArrayGet {
         array: DslValue,
         index: DslValue,
-        type_name: String,
+        type_name: Option<String>,
     },
     ArrayPut {
         array: DslValue,
         index: DslValue,
-        type_name: String,
+        type_name: Option<String>,
         value: DslValue,
     },
     FieldRead {
@@ -3151,7 +3171,7 @@ enum DslValue {
     ArrayGet {
         array: Box<DslValue>,
         index: Box<DslValue>,
-        type_name: String,
+        type_name: Option<String>,
     },
 }
 
@@ -3627,8 +3647,12 @@ impl<'a> DslParser<'a> {
             } else if self.peek() == Some('[') {
                 self.expect_char('[')?;
                 let index = self.parse_value_arg()?;
-                self.expect_char(':')?;
-                let type_name = self.parse_type_name()?;
+                let type_name = if self.peek() == Some(':') {
+                    self.expect_char(':')?;
+                    Some(self.parse_type_name()?)
+                } else {
+                    None
+                };
                 self.expect_char(']')?;
                 value = DslValue::ArrayGet {
                     array: Box::new(value),

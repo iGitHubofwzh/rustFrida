@@ -6,16 +6,14 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use super::super::art_controller::ensure_art_controller_initialized;
+use super::super::art_controller::{ensure_art_controller_initialized, refresh_walkstack_sigsegv_guard};
 use super::super::art_method::*;
 use super::super::callback::*;
 use super::super::java_lua_fast_api::{compile_art_method_to_quick, RequestedCompileKind};
 use super::super::jni_core::*;
 use super::super::reflect::{decode_method_id, find_class_safe, get_app_classloader_local_ref};
 use super::install_support::{create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard};
-use super::managed_dex_builder::{
-    build_managed_dsl_dex, GeneratedStringLiteral, MANAGED_ORIG_NATIVE_NAME, MANAGED_ORIG_NATIVE_SIG,
-};
+use super::managed_dex_builder::{build_managed_dsl_dex, GeneratedStringLiteral};
 
 struct DynamicManagedHelperRefs {
     class_global_ref: u64,
@@ -221,47 +219,6 @@ unsafe fn initialize_generated_string_literals(
     Ok(())
 }
 
-unsafe fn register_managed_orig_native(
-    env: JniEnv,
-    helper_cls: *mut std::ffi::c_void,
-    original_method: u64,
-    trampoline_target: u64,
-    out_state: *mut *mut std::ffi::c_void,
-) -> Result<(), String> {
-    let native_body =
-        crate::ffi::hook::hook_create_managed_orig_bypass_native(original_method, trampoline_target, out_state);
-    if native_body.is_null() {
-        return Err("hook_create_managed_orig_bypass_native failed".to_string());
-    }
-
-    let register_natives: RegisterNativesFn = jni_fn!(env, RegisterNativesFn, JNI_REGISTER_NATIVES);
-    let name = CString::new(MANAGED_ORIG_NATIVE_NAME).unwrap();
-    let sig = CString::new(MANAGED_ORIG_NATIVE_SIG).unwrap();
-    let method = JniNativeMethod {
-        name: name.as_ptr(),
-        signature: sig.as_ptr(),
-        fn_ptr: native_body,
-    };
-    let rc = register_natives(env, helper_cls, &method, 1);
-    if rc != 0 || jni_check_exc(env) {
-        return Err(format!(
-            "RegisterNatives({}) failed rc={}",
-            MANAGED_ORIG_NATIVE_NAME, rc
-        ));
-    }
-    output_message(&format!(
-        "[managedHook] registered {} native body={:?} state={:?}",
-        MANAGED_ORIG_NATIVE_NAME,
-        native_body,
-        if out_state.is_null() {
-            std::ptr::null_mut()
-        } else {
-            *out_state
-        }
-    ));
-    Ok(())
-}
-
 unsafe fn install_managed_method_helper(
     env: JniEnv,
     class_name: &str,
@@ -271,7 +228,7 @@ unsafe fn install_managed_method_helper(
     helper_method_name_str: &str,
     helper_method_sig_str: &str,
     label: &str,
-    orig_native: bool,
+    uses_orig: bool,
 ) -> Result<(), String> {
     let (art_method, _is_static) = resolve_art_method(env, class_name, method_name, actual_sig, false)?;
 
@@ -330,14 +287,6 @@ unsafe fn install_managed_method_helper(
         ));
     }
 
-    let mut orig_native_state: *mut std::ffi::c_void = std::ptr::null_mut();
-    if orig_native {
-        if let Err(e) = register_managed_orig_native(env, helper_cls, art_method, 0, &mut orig_native_state) {
-            delete_local_ref(env, helper_cls);
-            return Err(e);
-        }
-    }
-
     let helper_spec = get_art_method_spec(env, helper_art_method);
     let helper_compile = compile_art_method_to_quick(
         env,
@@ -361,7 +310,6 @@ unsafe fn install_managed_method_helper(
         return Err("managed helper still has shared ART entrypoint after compile".to_string());
     }
     let helper_entry_point = read_entry_point(helper_art_method, helper_spec.entry_point_offset);
-
     let class_global_ref = create_class_global_ref(env, class_name)?;
     let mut install_guard = JavaHookInstallGuard::new(
         art_method,
@@ -390,17 +338,11 @@ unsafe fn install_managed_method_helper(
         helper_art_method,
         helper_entry_point,
         art_method,
+        if uses_orig { 1 } else { 0 },
     );
     if quick_trampoline.is_null() {
         delete_local_ref(env, helper_cls);
         return Err("hook_install_managed_direct_router failed".to_string());
-    }
-    if !orig_native_state.is_null() {
-        crate::ffi::hook::hook_update_managed_orig_bypass_native(
-            orig_native_state,
-            art_method,
-            quick_trampoline as u64,
-        );
     }
     delete_local_ref(env, helper_cls);
     super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
@@ -477,8 +419,10 @@ unsafe fn install_managed_dsl_inner(class_name: &str, method_name: &str, sig: &s
         &generated.method_name,
         &generated.method_sig,
         "generic-dsl",
-        generated.orig_native,
-    )
+        generated.uses_orig,
+    )?;
+    refresh_walkstack_sigsegv_guard();
+    Ok(())
 }
 
 unsafe fn extract_string_prop(

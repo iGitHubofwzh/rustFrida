@@ -1631,33 +1631,12 @@ static void emit_managed_direct_set_bypass(Arm64Writer* w, uint64_t original_met
     arm64_writer_put_label(w, lbl_done);
 }
 
-static void emit_managed_direct_clear_bypass_current_thread(Arm64Writer* w) {
-    uint64_t lbl_done = arm64_writer_new_label_id(w);
-
-    arm64_writer_put_mrs_reg(w, ARM64_REG_X15, SYSREG_TPIDR_EL0);
-    for (int i = 0; i < ORIG_BYPASS_SLOTS; i++) {
-        OrigBypassState* slot = &g_orig_bypass[i];
-        uint64_t lbl_next = arm64_writer_new_label_id(w);
-
-        arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)&slot->thread);
-        arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
-        arm64_writer_put_cmp_reg_reg(w, ARM64_REG_X17, ARM64_REG_X15);
-        arm64_writer_put_b_cond_label(w, ARM64_COND_NE, lbl_next);
-
-        arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_XZR, ARM64_REG_X16, 0);
-        emit_atomic_dec64(w, &g_orig_bypass_active);
-        arm64_writer_put_b_label(w, lbl_done);
-        arm64_writer_put_label(w, lbl_next);
-    }
-
-    arm64_writer_put_label(w, lbl_done);
-}
-
 static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
                                             void* trampoline_target,
                                             uint64_t helper_method,
                                             uint64_t helper_entry,
-                                            uint64_t original_method) {
+                                            uint64_t original_method,
+                                            int set_orig_bypass) {
     if (thunk_alloc < 2048) return 0;
 
     Arm64Writer w;
@@ -1669,10 +1648,12 @@ static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
 
     emit_atomic_inc64(&w, &g_managed_direct_hit_count);
 
+    if (set_orig_bypass) {
+        emit_managed_direct_set_bypass(&w, original_method, (uint64_t)trampoline_target);
+    }
+
     arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X0, helper_method);
     arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, helper_entry);
-    (void)trampoline_target;
-    (void)original_method;
     /* Tail-call the generated managed helper. Keeping LR unchanged makes the
      * helper return to the original Java caller, so no hook-pool return PC is
      * exposed to ART stack walking during allocation/GC. */
@@ -1690,78 +1671,14 @@ static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
     return size;
 }
 
-typedef struct ManagedOrigBypassNativeState {
-    uint64_t original_method;
-    uint64_t trampoline_target;
-} ManagedOrigBypassNativeState;
-
-void hook_update_managed_orig_bypass_native(void* state,
-                                            uint64_t original_method,
-                                            uint64_t trampoline_target) {
-    ManagedOrigBypassNativeState* s = (ManagedOrigBypassNativeState*)state;
-    if (!s) return;
-    __atomic_store_n(&s->original_method, original_method, __ATOMIC_RELEASE);
-    __atomic_store_n(&s->trampoline_target, trampoline_target, __ATOMIC_RELEASE);
-}
-
-void* hook_create_managed_orig_bypass_native(uint64_t original_method,
-                                             uint64_t trampoline_target,
-                                             void** out_state) {
-    ManagedOrigBypassNativeState* state =
-        (ManagedOrigBypassNativeState*)calloc(1, sizeof(ManagedOrigBypassNativeState));
-    if (!state) {
-        hook_log("[managed_direct] orig native state alloc failed");
-        return NULL;
-    }
-    hook_update_managed_orig_bypass_native(state, original_method, trampoline_target);
-
-    void* native_mem = hook_alloc_near(128, (void*)(uintptr_t)trampoline_target);
-    if (!native_mem) {
-        native_mem = hook_alloc(128);
-    }
-    if (!native_mem) {
-        free(state);
-        hook_log("[managed_direct] orig native alloc failed");
-        return NULL;
-    }
-
-    Arm64Writer w;
-    arm64_writer_init(&w, native_mem, (uint64_t)native_mem, 128);
-    arm64_writer_put_stp_reg_reg_reg_offset(&w, ARM64_REG_X29, ARM64_REG_X30,
-                                            ARM64_REG_SP, -16, ARM64_INDEX_PRE_ADJUST);
-    arm64_writer_put_mov_reg_reg(&w, ARM64_REG_X29, ARM64_REG_SP);
-    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)state);
-    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_X16, 0);
-    arm64_writer_put_ldr_reg_reg_offset(&w, ARM64_REG_X1, ARM64_REG_X16, 8);
-    arm64_writer_put_ldr_reg_u64(&w, ARM64_REG_X16, (uint64_t)orig_bypass_set_current_thread);
-    arm64_writer_put_blr_reg(&w, ARM64_REG_X16);
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X29, ARM64_REG_X30,
-                                            ARM64_REG_SP, 16, ARM64_INDEX_POST_ADJUST);
-    arm64_writer_put_ret(&w);
-
-    if (arm64_writer_flush(&w) != 0) {
-        hook_log("[managed_direct] orig native label resolution failed");
-        return NULL;
-    }
-    size_t size = arm64_writer_offset(&w);
-    hook_flush_cache(native_mem, size);
-    if (out_state) {
-        *out_state = state;
-    }
-    hook_log("[managed_direct] orig native=%p state=%p size=%zu original=%llx trampoline=%llx",
-             native_mem, (void*)state,
-             size, (unsigned long long)original_method,
-             (unsigned long long)trampoline_target);
-    return native_mem;
-}
-
 void* hook_install_managed_direct_router(void* target,
                                          int stealth,
                                          void* jni_env,
                                          void** out_hooked_target,
                                          uint64_t helper_method,
                                          uint64_t helper_entry,
-                                         uint64_t original_method) {
+                                         uint64_t original_method,
+                                         int set_orig_bypass) {
     if (!g_engine.initialized || !target || !helper_method || !helper_entry || !original_method) {
         return NULL;
     }
@@ -1807,7 +1724,7 @@ void* hook_install_managed_direct_router(void* target,
     }
 
     size_t thunk_size = generate_managed_direct_thunk(
-        entry->thunk, thunk_alloc, entry->trampoline, helper_method, helper_entry, original_method);
+        entry->thunk, thunk_alloc, entry->trampoline, helper_method, helper_entry, original_method, set_orig_bypass);
     if (thunk_size == 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);

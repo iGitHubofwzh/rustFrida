@@ -1435,7 +1435,6 @@ static WALKSTACK_GUARD_INSTALLED: AtomicBool = AtomicBool::new(false);
 // SuspendAll eventually times out. Register as a libsigchain special handler
 // and consume only this exact instruction as a fallback after ART's handler.
 
-const ARM64_IMPLICIT_SUSPEND_CHECK_LDR: u32 = 0xf94002b5;
 const INVALID_THREAD_OFFSET: u64 = u64::MAX;
 
 #[repr(C)]
@@ -1449,7 +1448,27 @@ static IMPLICIT_SUSPEND_GUARD_INSTALLED: AtomicBool = AtomicBool::new(false);
 static IMPLICIT_SUSPEND_ENTRYPOINT: AtomicU64 = AtomicU64::new(0);
 static IMPLICIT_SUSPEND_TRIGGER_OFFSET: AtomicU64 = AtomicU64::new(INVALID_THREAD_OFFSET);
 
-unsafe extern "C" fn managed_implicit_suspend_sigsegv_handler(
+fn arm64_self_ldr_reg(inst: u32) -> Option<usize> {
+    // LDR Xt, [Xn, #0]. ART normally uses `ldr x21, [x21]` for implicit
+    // suspend checks, but some generated helper code has shown up outside
+    // ART's generated-code range accounting. Match the instruction shape and
+    // then validate against Thread::tlsPtr_.suspend_trigger before handling.
+    if (inst & 0xffc0_0000) != 0xf940_0000 {
+        return None;
+    }
+    if ((inst >> 10) & 0x0fff) != 0 {
+        return None;
+    }
+    let rn = ((inst >> 5) & 0x1f) as usize;
+    let rt = (inst & 0x1f) as usize;
+    if rn == rt {
+        Some(rt)
+    } else {
+        None
+    }
+}
+
+unsafe fn try_handle_managed_implicit_suspend(
     sig: libc::c_int,
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
@@ -1459,34 +1478,49 @@ unsafe extern "C" fn managed_implicit_suspend_sigsegv_handler(
     }
 
     let entry = IMPLICIT_SUSPEND_ENTRYPOINT.load(Ordering::Relaxed);
-    if entry == 0 {
+    let offset = IMPLICIT_SUSPEND_TRIGGER_OFFSET.load(Ordering::Relaxed);
+    if entry == 0 || offset == INVALID_THREAD_OFFSET {
         return false;
     }
 
     let uc = context as *mut libc::ucontext_t;
     let mc = &mut (*uc).uc_mcontext;
     let pc = mc.pc & PAC_STRIP_MASK;
-    if pc == 0 {
+    if pc == 0 || (pc & 0x3) != 0 {
         return false;
     }
 
     let inst = core::ptr::read_unaligned(pc as *const u32);
-    if inst != ARM64_IMPLICIT_SUSPEND_CHECK_LDR {
+    let Some(suspend_reg) = arm64_self_ldr_reg(inst) else {
         return false;
-    }
+    };
 
     let thread = mc.regs[19] & PAC_STRIP_MASK;
-    let offset = IMPLICIT_SUSPEND_TRIGGER_OFFSET.load(Ordering::Relaxed);
-    if thread == 0 || offset == INVALID_THREAD_OFFSET {
+    if thread == 0 || (thread & 0x7) != 0 {
         return false;
     }
 
     let suspend_trigger_addr = thread.wrapping_add(offset);
+    let stored_trigger = core::ptr::read(suspend_trigger_addr as *const u64);
+    let fault_addr = (*info).si_addr() as u64;
+    let reg_value = mc.regs[suspend_reg] & PAC_STRIP_MASK;
+    if stored_trigger != reg_value && stored_trigger != fault_addr {
+        return false;
+    }
+
     core::ptr::write(suspend_trigger_addr as *mut u64, suspend_trigger_addr);
 
     mc.regs[30] = pc.wrapping_add(4);
     mc.pc = entry;
     true
+}
+
+unsafe extern "C" fn managed_implicit_suspend_sigsegv_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) -> bool {
+    try_handle_managed_implicit_suspend(sig, info, context)
 }
 
 unsafe fn install_managed_implicit_suspend_guard(spec: &ArtThreadSpec) {
@@ -1535,6 +1569,10 @@ unsafe extern "C" fn walkstack_sigsegv_handler(
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
+    if try_handle_managed_implicit_suspend(sig, info, context) {
+        return;
+    }
+
     if !info.is_null() && !context.is_null() {
         let fault_addr = (*info).si_addr() as u64;
         // 精准匹配: fault_addr == 0x18 说明是 NULL+0x18 解引用 (OAT header 字段访问)
