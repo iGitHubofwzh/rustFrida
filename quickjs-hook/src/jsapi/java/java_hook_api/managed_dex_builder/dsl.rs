@@ -4,12 +4,14 @@ mod assignment;
 mod ast;
 mod condition;
 pub(super) use ast::*;
+mod cursor;
 mod lexer;
 mod member;
 use lexer::TokenKind as DslTokenKind;
 mod parser;
 use parser::DslParser;
 mod scope;
+mod syntax;
 
 mod expression;
 mod helpers;
