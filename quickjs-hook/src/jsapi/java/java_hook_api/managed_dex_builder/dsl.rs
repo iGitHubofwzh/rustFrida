@@ -8,6 +8,7 @@ mod member;
 use lexer::TokenKind as DslTokenKind;
 mod parser;
 use parser::DslParser;
+mod scope;
 
 mod expression;
 mod helpers;
