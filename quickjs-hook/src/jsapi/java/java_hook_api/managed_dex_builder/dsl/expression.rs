@@ -10,7 +10,7 @@ impl<'a> DslParser<'a> {
     }
 
     fn parse_ternary_expr(&mut self) -> Result<DslValue, String> {
-        let checkpoint = self.pos;
+        let checkpoint = self.mark();
         if let Ok(condition) = self.parse_js_condition() {
             self.skip_ws();
             if self.peek() == Some('?') {
@@ -21,7 +21,7 @@ impl<'a> DslParser<'a> {
                 return Ok(fold_ternary(condition, then_value, else_value));
             }
         }
-        self.pos = checkpoint;
+        self.restore(checkpoint);
         self.parse_int_binary_expr(0)
     }
 
@@ -47,7 +47,7 @@ impl<'a> DslParser<'a> {
         if self.peek() == Some('-') {
             self.expect_char('-')?;
             if self.peek_number() {
-                self.pos = self.pos.saturating_sub(1);
+                self.rewind_one();
                 return Ok(DslValue::Int(self.parse_i16()?));
             }
             let value = self.parse_value_unary()?;

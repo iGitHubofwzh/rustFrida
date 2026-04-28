@@ -660,14 +660,14 @@ impl<'a> DslParser<'a> {
 
     fn parse_catch_param(&mut self) -> Result<(String, String), String> {
         self.skip_ws();
-        let checkpoint = self.pos;
+        let checkpoint = self.mark();
         if let Ok(catch_name) = self.parse_ident() {
             self.skip_ws();
             if self.peek() == Some(')') {
                 return Ok(("java.lang.Throwable".to_string(), catch_name));
             }
         }
-        self.pos = checkpoint;
+        self.restore(checkpoint);
         let catch_type = self.parse_type_name()?;
         self.skip_ws();
         let catch_name = self.parse_ident()?;

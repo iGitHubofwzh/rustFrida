@@ -6,7 +6,7 @@ use super::*;
 pub(super) struct DslParser<'a> {
     input: &'a str,
     tokens: Vec<DslToken>,
-    pub(super) pos: usize,
+    pos: usize,
     local_scopes: Vec<BTreeMap<String, String>>,
     next_local_id: usize,
 }
@@ -64,6 +64,18 @@ impl<'a> DslParser<'a> {
     }
 
     pub(super) fn skip_ws(&mut self) {}
+
+    pub(super) fn mark(&self) -> usize {
+        self.pos
+    }
+
+    pub(super) fn restore(&mut self, mark: usize) {
+        self.pos = mark;
+    }
+
+    pub(super) fn rewind_one(&mut self) {
+        self.pos = self.pos.saturating_sub(1);
+    }
 
     pub(super) fn expect_ident(&mut self, expected: &str) -> Result<(), String> {
         match self.tokens.get(self.pos).map(|token| &token.kind) {

@@ -6,14 +6,14 @@ impl<'a> DslParser<'a> {
     }
 
     pub(super) fn parse_js_if_condition(&mut self) -> Result<DslCondition, String> {
-        let checkpoint = self.pos;
+        let checkpoint = self.mark();
         if let Ok(value) = self.parse_value_arg() {
             self.skip_ws();
             if self.peek() == Some(')') {
                 return Ok(value.into_bool_condition());
             }
         }
-        self.pos = checkpoint;
+        self.restore(checkpoint);
 
         let condition = self.parse_js_condition()?;
         self.skip_ws();
@@ -135,10 +135,10 @@ impl<'a> DslParser<'a> {
             self.expect_op(">=")?;
             Ok(IfCmpOp::Ge)
         } else if self.peek() == Some('<') {
-            self.pos += 1;
+            self.expect_char('<')?;
             Ok(IfCmpOp::Lt)
         } else if self.peek() == Some('>') {
-            self.pos += 1;
+            self.expect_char('>')?;
             Ok(IfCmpOp::Gt)
         } else {
             Err(self.err("expected comparison operator"))

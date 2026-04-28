@@ -22,14 +22,14 @@ impl<'a> DslParser<'a> {
         }
 
         let call_kind = if self.peek() == Some('.') {
-            let checkpoint = self.pos;
+            let checkpoint = self.mark();
             self.expect_char('.')?;
             if self.peek_ident("interface") {
                 self.expect_ident("interface")?;
                 self.skip_ws();
                 DslCallKind::Interface
             } else {
-                self.pos = checkpoint;
+                self.restore(checkpoint);
                 DslCallKind::Virtual
             }
         } else {
@@ -194,7 +194,7 @@ impl<'a> DslParser<'a> {
                 });
             }
             if allow_explicit_class && self.peek() == Some(',') && looks_like_type_name(&first) {
-                let checkpoint = self.pos;
+                let checkpoint = self.mark();
                 self.expect_char(',')?;
                 self.skip_ws();
                 if self.peek_string() {
@@ -209,7 +209,7 @@ impl<'a> DslParser<'a> {
                         });
                     }
                 }
-                self.pos = checkpoint;
+                self.restore(checkpoint);
             }
             if allow_field && self.peek() == Some(')') && looks_like_type_name(&first) {
                 self.expect_char(')')?;
