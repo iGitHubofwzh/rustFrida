@@ -361,9 +361,9 @@ fn format_inferred_arg_types(arg_types: &[Option<String>]) -> String {
 
 mod emitter;
 use emitter::{
-    collect_local_slots, emit_statements, helper_param_layout, program_int_expr_scratch_count,
-    program_max_invoke_depth, program_max_invoke_words, program_uses_orig, DslBuildContext, EmitContext,
-    BASE_LOCAL_REG_COUNT,
+    collect_local_slots, emit_statements, helper_param_layout, precollect_string_literals,
+    program_int_expr_scratch_count, program_max_invoke_depth, program_max_invoke_words, program_uses_orig,
+    DslBuildContext, EmitContext, BASE_LOCAL_REG_COUNT,
 };
 
 pub(super) unsafe fn build_managed_dsl_dex(
@@ -444,6 +444,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
         invoke_frame_words,
         max_invoke_depth,
     );
+    precollect_string_literals(&program, &mut dsl_ctx);
     let target = MethodRef::new(
         target_type.clone(),
         target_method_name.to_string(),

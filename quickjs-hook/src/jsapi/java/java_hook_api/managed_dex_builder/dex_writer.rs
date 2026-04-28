@@ -629,11 +629,7 @@ fn shorty_char(descriptor: &str) -> char {
 }
 
 fn write_map_list(out: &mut Vec<u8>, entries: &[(u16, u32, u32)]) {
-    let mut filtered: Vec<(u16, u32, u32)> = entries
-        .iter()
-        .copied()
-        .filter(|(_, size, off)| *size != 0 || *off == 0)
-        .collect();
+    let mut filtered: Vec<(u16, u32, u32)> = entries.iter().copied().filter(|(_, size, _)| *size != 0).collect();
     filtered.sort_by_key(|(_, _, off)| *off);
     write_u32(out, filtered.len() as u32);
     for (ty, size, off) in filtered {

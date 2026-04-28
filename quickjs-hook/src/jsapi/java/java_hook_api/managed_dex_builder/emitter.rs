@@ -260,6 +260,205 @@ impl DslBuildContext {
     }
 }
 
+pub(super) fn precollect_string_literals(program: &DslProgram, dsl_ctx: &mut DslBuildContext) {
+    collect_stmt_strings(&program.stmts, dsl_ctx);
+}
+
+fn collect_stmt_strings(stmts: &[DslStmt], dsl_ctx: &mut DslBuildContext) {
+    for stmt in stmts {
+        match stmt {
+            DslStmt::Block(stmts) => collect_stmt_strings(stmts, dsl_ctx),
+            DslStmt::Let { value, .. } | DslStmt::Assign { value, .. } | DslStmt::Throw { value } => {
+                collect_value_strings(value, dsl_ctx)
+            }
+            DslStmt::LetOrig { args, .. } | DslStmt::ReturnOrig { args } => collect_orig_arg_strings(args, dsl_ctx),
+            DslStmt::New { args, .. } => collect_values_strings(args, dsl_ctx),
+            DslStmt::NewArray { size, .. }
+            | DslStmt::Cast { value: size, .. }
+            | DslStmt::ArrayLength { array: size } => collect_value_strings(size, dsl_ctx),
+            DslStmt::Call(call) => collect_call_strings(call, dsl_ctx),
+            DslStmt::ArrayGet { array, index, .. } => {
+                collect_value_strings(array, dsl_ctx);
+                collect_value_strings(index, dsl_ctx);
+            }
+            DslStmt::ArrayPut {
+                array, index, value, ..
+            }
+            | DslStmt::ArrayUpdate {
+                array, index, value, ..
+            } => {
+                collect_value_strings(array, dsl_ctx);
+                collect_value_strings(index, dsl_ctx);
+                collect_value_strings(value, dsl_ctx);
+            }
+            DslStmt::FieldRead { stmt, .. } | DslStmt::FieldWrite { stmt, .. } => {
+                collect_field_stmt_strings(stmt, dsl_ctx)
+            }
+            DslStmt::FieldUpdate { stmt, value, .. } => {
+                collect_field_stmt_strings(stmt, dsl_ctx);
+                collect_value_strings(value, dsl_ctx);
+            }
+            DslStmt::IfNull {
+                value,
+                then_stmts,
+                else_stmts,
+                ..
+            }
+            | DslStmt::IfBool {
+                value,
+                then_stmts,
+                else_stmts,
+            }
+            | DslStmt::IfInstanceOf {
+                value,
+                then_stmts,
+                else_stmts,
+                ..
+            } => {
+                collect_value_strings(value, dsl_ctx);
+                collect_stmt_strings(then_stmts, dsl_ctx);
+                collect_stmt_strings(else_stmts, dsl_ctx);
+            }
+            DslStmt::IfCmp {
+                left,
+                right,
+                then_stmts,
+                else_stmts,
+                ..
+            } => {
+                collect_value_strings(left, dsl_ctx);
+                collect_value_strings(right, dsl_ctx);
+                collect_stmt_strings(then_stmts, dsl_ctx);
+                collect_stmt_strings(else_stmts, dsl_ctx);
+            }
+            DslStmt::Switch {
+                value,
+                cases,
+                default_stmts,
+            } => {
+                collect_value_strings(value, dsl_ctx);
+                for (_, stmts) in cases {
+                    collect_stmt_strings(stmts, dsl_ctx);
+                }
+                if let Some(stmts) = default_stmts {
+                    collect_stmt_strings(stmts, dsl_ctx);
+                }
+            }
+            DslStmt::TryCatch { try_stmts, catches } => {
+                collect_stmt_strings(try_stmts, dsl_ctx);
+                for catch in catches {
+                    collect_stmt_strings(&catch.catch_stmts, dsl_ctx);
+                }
+            }
+            DslStmt::While { condition, body_stmts } | DslStmt::DoWhile { body_stmts, condition } => {
+                collect_condition_strings(condition, dsl_ctx);
+                collect_stmt_strings(body_stmts, dsl_ctx);
+            }
+            DslStmt::For {
+                init_stmts,
+                condition,
+                update_stmts,
+                body_stmts,
+            } => {
+                collect_stmt_strings(init_stmts, dsl_ctx);
+                if let Some(condition) = condition {
+                    collect_condition_strings(condition, dsl_ctx);
+                }
+                collect_stmt_strings(update_stmts, dsl_ctx);
+                collect_stmt_strings(body_stmts, dsl_ctx);
+            }
+            DslStmt::ReturnValue { value } => {
+                if let Some(value) = value {
+                    collect_value_strings(value, dsl_ctx);
+                }
+            }
+            DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => {}
+        }
+    }
+}
+
+fn collect_value_strings(value: &DslValue, dsl_ctx: &mut DslBuildContext) {
+    match value {
+        DslValue::String(value) => {
+            dsl_ctx.string_literal_field(value);
+        }
+        DslValue::UnaryOp { value, .. } | DslValue::Cast { value, .. } | DslValue::ArrayLength(value) => {
+            collect_value_strings(value, dsl_ctx)
+        }
+        DslValue::IntBinOp { left, right, .. }
+        | DslValue::ArrayGet {
+            array: left,
+            index: right,
+            ..
+        } => {
+            collect_value_strings(left, dsl_ctx);
+            collect_value_strings(right, dsl_ctx);
+        }
+        DslValue::Ternary {
+            condition,
+            then_value,
+            else_value,
+        } => {
+            collect_condition_strings(condition, dsl_ctx);
+            collect_value_strings(then_value, dsl_ctx);
+            collect_value_strings(else_value, dsl_ctx);
+        }
+        DslValue::OrigCall(args) => collect_orig_arg_strings(args, dsl_ctx),
+        DslValue::Call(call) => collect_call_strings(call, dsl_ctx),
+        DslValue::NewObject { args, .. } | DslValue::ArrayLiteral { elements: args } => {
+            collect_values_strings(args, dsl_ctx)
+        }
+        DslValue::FieldGet { stmt, .. } => collect_field_stmt_strings(stmt, dsl_ctx),
+        DslValue::Target(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => {}
+    }
+}
+
+fn collect_values_strings(values: &[DslValue], dsl_ctx: &mut DslBuildContext) {
+    for value in values {
+        collect_value_strings(value, dsl_ctx);
+    }
+}
+
+fn collect_call_strings(call: &DslCallStmt, dsl_ctx: &mut DslBuildContext) {
+    if let Some(receiver) = &call.receiver {
+        collect_value_strings(receiver, dsl_ctx);
+    }
+    collect_values_strings(&call.args, dsl_ctx);
+}
+
+fn collect_field_stmt_strings(stmt: &DslFieldStmt, dsl_ctx: &mut DslBuildContext) {
+    if let Some(receiver) = &stmt.receiver {
+        collect_value_strings(receiver, dsl_ctx);
+    }
+    if let Some(value) = &stmt.value {
+        collect_value_strings(value, dsl_ctx);
+    }
+}
+
+fn collect_orig_arg_strings(args: &DslOrigArgs, dsl_ctx: &mut DslBuildContext) {
+    if let DslOrigArgs::Values(values) = args {
+        collect_values_strings(values, dsl_ctx);
+    }
+}
+
+fn collect_condition_strings(condition: &DslCondition, dsl_ctx: &mut DslBuildContext) {
+    match condition {
+        DslCondition::Null { value, .. } | DslCondition::InstanceOf { value, .. } | DslCondition::Bool { value } => {
+            collect_value_strings(value, dsl_ctx)
+        }
+        DslCondition::Cmp { left, right, .. } => {
+            collect_value_strings(left, dsl_ctx);
+            collect_value_strings(right, dsl_ctx);
+        }
+        DslCondition::And(left, right) | DslCondition::Or(left, right) => {
+            collect_condition_strings(left, dsl_ctx);
+            collect_condition_strings(right, dsl_ctx);
+        }
+        DslCondition::Not(condition) => collect_condition_strings(condition, dsl_ctx),
+        DslCondition::Const(_) => {}
+    }
+}
+
 fn condition_narrow_facts_when_true(condition: &DslCondition) -> Result<Vec<(DslTargetKey, String)>, String> {
     match condition {
         DslCondition::InstanceOf { value, class_name } => {
@@ -758,6 +957,9 @@ fn emit_load_value(
             }
             emit_array_get_value(ir, array, index, &component_type, temp_reg, layout, dsl_ctx)
         }
+        DslValue::ArrayLiteral { elements } => {
+            emit_array_literal_value(ir, elements, expected_type, temp_reg, layout, dsl_ctx)
+        }
     }
 }
 
@@ -1201,7 +1403,27 @@ fn infer_value_descriptor(
             Some(type_name) => java_class_to_descriptor_or_primitive(type_name).map(Some),
             None => Ok(None),
         },
+        DslValue::ArrayLiteral { elements } => infer_array_literal_descriptor(elements, layout, dsl_ctx),
     }
+}
+
+fn infer_array_literal_descriptor(
+    elements: &[DslValue],
+    layout: &HelperParamLayout,
+    dsl_ctx: &DslBuildContext,
+) -> Result<Option<String>, String> {
+    let mut component = None;
+    for element in elements {
+        component = common_value_descriptor_with_env(
+            component,
+            infer_value_descriptor(element, layout, dsl_ctx)?,
+            dsl_ctx.env,
+        )?;
+    }
+    let Some(component) = component else {
+        return Ok(None);
+    };
+    Ok(Some(format!("[{}", component)))
 }
 
 fn resolve_array_component_type(
@@ -1231,6 +1453,107 @@ fn emit_array_length_value(
     let dst = if dst <= 0x0f { dst } else { REG_TMP0 };
     ir.array_length(dst, array_reg);
     Ok(dst)
+}
+
+fn emit_array_literal_value(
+    ir: &mut DexIrBuilder,
+    elements: &[DslValue],
+    expected_type: &str,
+    dst: u8,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    let array_type = if expected_type.starts_with('[') {
+        expected_type.to_string()
+    } else {
+        infer_array_literal_descriptor(elements, layout, dsl_ctx)?
+            .ok_or_else(|| "array literal type cannot be inferred from context or elements".to_string())?
+    };
+    if !array_type.starts_with('[') {
+        return Err(format!("array literal cannot be passed as {}", expected_type));
+    }
+    let component_type = array_component_descriptor(&array_type)?;
+    let kind = value_kind_from_descriptor(&component_type)?;
+    let array_reg = if dst <= 0x0f && dst != REG_TMP0 {
+        dst
+    } else {
+        REG_LAST_OBJECT
+    };
+    let len = i16::try_from(elements.len()).map_err(|_| "array literal is too large".to_string())?;
+    if (0..=7).contains(&len) {
+        ir.const4(REG_TMP0, len as i8);
+    } else {
+        ir.const16(REG_TMP0, len);
+    }
+    ir.new_array(array_reg, REG_TMP0, array_type.clone());
+
+    for (index, element) in elements.iter().enumerate() {
+        let index = i16::try_from(index).map_err(|_| "array literal is too large".to_string())?;
+        if (0..=7).contains(&index) {
+            ir.const4(REG_TMP0, index as i8);
+        } else {
+            ir.const16(REG_TMP0, index);
+        }
+        let value_reg =
+            emit_simple_array_literal_element(ir, element, &component_type, kind, array_reg, layout, dsl_ctx)?;
+        ir.aput(value_reg, array_reg, REG_TMP0, kind);
+    }
+
+    if array_reg != dst {
+        ir.move_from16(dst, array_reg as u16, ValueKind::Object);
+    }
+    Ok(dst)
+}
+
+fn emit_simple_array_literal_element(
+    ir: &mut DexIrBuilder,
+    element: &DslValue,
+    component_type: &str,
+    kind: ValueKind,
+    array_reg: u8,
+    layout: &HelperParamLayout,
+    _dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    match element {
+        DslValue::String(value) => {
+            if !return_is_object(component_type) {
+                return Err(format!("string literal cannot be stored in {}", component_type));
+            }
+            let field = _dsl_ctx.string_literal_field(value);
+            ir.sget(REG_TMP1, field, ValueKind::Object);
+            Ok(REG_TMP1)
+        }
+        DslValue::Int(value) => {
+            if component_type != "I" {
+                return Err(format!("int literal cannot be stored in {}", component_type));
+            }
+            ir.const16(REG_TMP1, *value);
+            Ok(REG_TMP1)
+        }
+        DslValue::Bool(value) => {
+            if component_type != "Z" {
+                return Err(format!("boolean literal cannot be stored in {}", component_type));
+            }
+            ir.const4(REG_TMP1, if *value { 1 } else { 0 });
+            Ok(REG_TMP1)
+        }
+        DslValue::Null => {
+            if !return_is_object(component_type) {
+                return Err(format!("null cannot be stored in {}", component_type));
+            }
+            ir.const4(REG_TMP1, 0);
+            Ok(REG_TMP1)
+        }
+        DslValue::Target(target) => {
+            let reg = resolve_target_reg(target, layout)?;
+            let reg = emit_copy_field_value_if_needed(ir, reg, REG_TMP1, kind);
+            if reg == array_reg {
+                return Err("array literal element cannot use the destination array register".to_string());
+            }
+            Ok(reg)
+        }
+        _ => Err("array literal currently supports simple literal/target elements only".to_string()),
+    }
 }
 
 fn emit_array_get_value(
@@ -2039,8 +2362,10 @@ fn emit_array_put(
     let array_reg = emit_copy_object_if_needed(ir, array_reg, REG_TMP1);
     let index_reg = emit_load_value(ir, index, "I", REG_TMP0, layout, dsl_ctx)?;
     let index_reg = emit_copy_field_value_if_needed(ir, index_reg, REG_TMP0, ValueKind::Narrow);
-    let value_temp = if matches!(kind, ValueKind::Object) {
+    let value_temp = if matches!(kind, ValueKind::Object) && array_reg != REG_LAST_OBJECT {
         REG_LAST_OBJECT
+    } else if matches!(kind, ValueKind::Object) {
+        REG_TMP1
     } else {
         REG_LOOP_LIMIT
     };
@@ -2511,6 +2836,7 @@ fn value_max_invoke_depth(value: &DslValue) -> u16 {
             .max(value_max_invoke_depth(else_value)),
         DslValue::FieldGet { stmt, .. } => field_stmt_max_invoke_depth(stmt),
         DslValue::ArrayGet { array, index, .. } => value_max_invoke_depth(array).max(value_max_invoke_depth(index)),
+        DslValue::ArrayLiteral { elements } => values_max_invoke_depth(elements),
         DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => 0,
     }
 }
@@ -2687,6 +3013,7 @@ fn value_int_expr_scratch_count(value: &DslValue) -> u16 {
         DslValue::ArrayGet { array, index, .. } => {
             value_int_expr_scratch_count(array).max(value_int_expr_scratch_count(index))
         }
+        DslValue::ArrayLiteral { elements } => values_int_expr_scratch_count(elements),
         DslValue::Target(_)
         | DslValue::String(_)
         | DslValue::Int(_)
@@ -2908,6 +3235,9 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
         DslValue::ArrayGet { array, index, .. } => {
             Ok(value_max_invoke_words(array)?.max(value_max_invoke_words(index)?))
         }
+        DslValue::ArrayLiteral { elements } => elements.iter().try_fold(0, |max_words, element| {
+            value_max_invoke_words(element).map(|words| max_words.max(words))
+        }),
         DslValue::FieldGet { .. }
         | DslValue::Target(_)
         | DslValue::String(_)
@@ -3101,6 +3431,7 @@ fn value_uses_orig(value: &DslValue) -> bool {
         DslValue::NewObject { args, .. } => args.iter().any(value_uses_orig),
         DslValue::FieldGet { stmt, .. } => field_stmt_uses_orig(stmt),
         DslValue::ArrayGet { array, index, .. } => value_uses_orig(array) || value_uses_orig(index),
+        DslValue::ArrayLiteral { elements } => elements.iter().any(value_uses_orig),
         DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => false,
     }
 }
@@ -3379,13 +3710,14 @@ fn emit_try_catch(
     let try_start = ir.new_label();
     let try_end = ir.new_label();
     let catch_handlers = catches.iter().map(|_| ir.new_label()).collect::<Vec<_>>();
-    let done = ir.new_label();
+    let mut done = None;
 
     ir.bind(try_start)?;
     let try_returns = emit_statements(ir, try_stmts, emit_ctx)?;
     ir.bind(try_end)?;
     if !try_returns {
-        ir.goto16(done);
+        let done_label = *done.get_or_insert_with(|| ir.new_label());
+        ir.goto16(done_label);
     }
 
     let mut catch_returns = true;
@@ -3412,11 +3744,14 @@ fn emit_try_catch(
         ir.move_exception(catch_slot.reg);
         let branch_returns = emit_statements(ir, &catch.catch_stmts, emit_ctx)?;
         if !branch_returns {
-            ir.goto16(done);
+            let done_label = *done.get_or_insert_with(|| ir.new_label());
+            ir.goto16(done_label);
         }
         catch_returns = catch_returns && branch_returns;
     }
-    ir.bind(done)?;
+    if let Some(done) = done {
+        ir.bind(done)?;
+    }
     ir.add_try_handlers(try_start, try_end, handler_items, None);
 
     Ok(try_returns && catch_returns)

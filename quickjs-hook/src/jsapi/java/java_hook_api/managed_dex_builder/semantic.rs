@@ -260,7 +260,19 @@ impl DslSemanticContext {
                     array_component_descriptor(&array_desc).map(Some)
                 }
             },
+            DslValue::ArrayLiteral { elements } => self.infer_array_literal_descriptor(elements),
         }
+    }
+
+    fn infer_array_literal_descriptor(&self, elements: &[DslValue]) -> Result<Option<String>, String> {
+        let mut component = None;
+        for element in elements {
+            component = common_value_descriptor_with_env(component, self.infer_value_descriptor(element)?, self.env)?;
+        }
+        let Some(component) = component else {
+            return Ok(None);
+        };
+        Ok(Some(format!("[{}", component)))
     }
 
     fn is_known_nonnull_target(&self, target: &DslTarget) -> bool {
@@ -360,6 +372,35 @@ impl DslSemanticContext {
                 self.validate_value_inner(index, require_nonnull_receiver)?;
                 if self.infer_value_descriptor(array)?.is_none() {
                     return Err("array element type cannot be inferred; use arr[index: Type]".to_string());
+                }
+            }
+            DslValue::ArrayLiteral { elements } => {
+                if elements.is_empty() {
+                    return Err(
+                        "empty array literal type cannot be inferred; assign from new Type[](size)".to_string(),
+                    );
+                }
+                for element in elements {
+                    self.validate_value_inner(element, require_nonnull_receiver)?;
+                }
+                let Some(array_desc) = self.infer_array_literal_descriptor(elements)? else {
+                    return Err("array literal type cannot be inferred from null-only elements".to_string());
+                };
+                let component = array_component_descriptor(&array_desc)?;
+                for element in elements {
+                    if let Some(element_desc) = self.infer_value_descriptor(element)? {
+                        if !value_descriptor_assignable_to(&element_desc, &component) {
+                            return Err(format!(
+                                "array literal element type mismatch: cannot store {} in {}",
+                                element_desc, component
+                            ));
+                        }
+                    } else if !return_is_object(&component) {
+                        return Err(format!(
+                            "array literal element type mismatch: cannot store null in {}",
+                            component
+                        ));
+                    }
                 }
             }
             DslValue::OrigCall(args) => {
@@ -871,6 +912,7 @@ impl DslSemanticContext {
                 }
             }
             DslStmt::TryCatch { try_stmts, catches } => {
+                self.validate_catch_order(catches)?;
                 self.validate_stmts(try_stmts)?;
                 for catch in catches {
                     self.validate_catch_block(catch)?;
@@ -986,6 +1028,23 @@ impl DslSemanticContext {
                 .insert(catch.catch_name.clone(), catch_descriptor);
         }
         self.validate_stmts(&catch.catch_stmts)
+    }
+
+    fn validate_catch_order(&self, catches: &[DslCatch]) -> Result<(), String> {
+        let mut previous = Vec::<(&DslCatch, String)>::new();
+        for catch in catches {
+            let catch_descriptor = java_class_to_descriptor(&catch.catch_type)?;
+            for (prev, prev_descriptor) in &previous {
+                if object_assignability_score(self.env, &catch_descriptor, prev_descriptor).is_some() {
+                    return Err(format!(
+                        "catch({}) is unreachable because earlier catch({}) also matches {}; put the more specific catch first",
+                        catch.catch_type, prev.catch_type, catch.catch_type
+                    ));
+                }
+            }
+            previous.push((catch, catch_descriptor));
+        }
+        Ok(())
     }
 }
 

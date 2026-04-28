@@ -233,6 +233,9 @@ pub(super) enum DslValue {
         class_name: String,
     },
     ArrayLength(Box<DslValue>),
+    ArrayLiteral {
+        elements: Vec<DslValue>,
+    },
     ArrayGet {
         array: Box<DslValue>,
         index: Box<DslValue>,
@@ -1069,9 +1072,7 @@ impl<'a> DslParser<'a> {
             self.expect_ident("catch")?;
             self.skip_ws();
             self.expect_char('(')?;
-            let catch_type = self.parse_type_name()?;
-            self.skip_ws();
-            let catch_name = self.parse_ident()?;
+            let (catch_type, catch_name) = self.parse_catch_param()?;
             self.skip_ws();
             self.expect_char(')')?;
             let (catch_name, catch_stmts) = self.with_local_scope(|parser| {
@@ -1089,6 +1090,22 @@ impl<'a> DslParser<'a> {
             return Err(self.err("try requires at least one catch block"));
         }
         Ok(DslStmt::TryCatch { try_stmts, catches })
+    }
+
+    fn parse_catch_param(&mut self) -> Result<(String, String), String> {
+        self.skip_ws();
+        let checkpoint = self.pos;
+        if let Ok(catch_name) = self.parse_ident() {
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                return Ok(("java.lang.Throwable".to_string(), catch_name));
+            }
+        }
+        self.pos = checkpoint;
+        let catch_type = self.parse_type_name()?;
+        self.skip_ws();
+        let catch_name = self.parse_ident()?;
+        Ok((catch_type, catch_name))
     }
 }
 
@@ -1510,6 +1527,8 @@ impl<'a> DslParser<'a> {
             let value = self.parse_value_arg()?;
             self.expect_char(')')?;
             value
+        } else if self.peek() == Some('[') {
+            self.parse_array_literal()?
         } else {
             let ident = self.parse_ident()?;
             if ident == "null" {
@@ -1674,6 +1693,36 @@ impl<'a> DslParser<'a> {
             DslValue::Target(target)
         };
         self.parse_value_postfix(value)
+    }
+
+    fn parse_array_literal(&mut self) -> Result<DslValue, String> {
+        self.expect_char('[')?;
+        let mut elements = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(']') {
+                self.expect_char(']')?;
+                break;
+            }
+            elements.push(self.parse_value_arg()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.expect_char(',')?;
+                    self.skip_ws();
+                    if self.peek() == Some(']') {
+                        self.expect_char(']')?;
+                        break;
+                    }
+                }
+                Some(']') => {
+                    self.expect_char(']')?;
+                    break;
+                }
+                _ => return Err(self.err("array literal expects ',' or ']'")),
+            }
+        }
+        Ok(DslValue::ArrayLiteral { elements })
     }
 
     fn parse_value_postfix(&mut self, mut value: DslValue) -> Result<DslValue, String> {
