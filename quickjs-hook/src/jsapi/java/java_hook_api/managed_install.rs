@@ -13,9 +13,10 @@ use super::super::java_lua_fast_api::{compile_art_method_to_quick, RequestedComp
 use super::super::jni_core::*;
 use super::super::reflect::{decode_method_id, find_class_safe, get_app_classloader_local_ref};
 use super::install_support::{create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard};
-use super::managed_dex_builder::{build_managed_dsl_dex, GeneratedStringLiteral};
+use super::managed_dex_builder::{build_managed_dsl_dex, GeneratedCounter, GeneratedStringLiteral};
 
 struct DynamicManagedHelperRefs {
+    class_name: String,
     class_global_ref: u64,
     loader_global_ref: u64,
     dex_bytes: Vec<u8>,
@@ -33,6 +34,7 @@ unsafe fn load_dynamic_managed_helper_class(
         let mut refs = DYNAMIC_MANAGED_HELPER_REFS.lock().unwrap_or_else(|e| e.into_inner());
         let idx = refs.len();
         refs.push(DynamicManagedHelperRefs {
+            class_name: helper_class_name.to_string(),
             class_global_ref: 0,
             loader_global_ref: 0,
             dex_bytes,
@@ -166,6 +168,13 @@ unsafe fn load_dynamic_managed_helper_class(
     delete_local_ref(env, find_loader_cls);
 
     Ok(helper_cls)
+}
+
+fn find_dynamic_managed_helper_class(class_name: &str) -> Option<*mut std::ffi::c_void> {
+    let refs = DYNAMIC_MANAGED_HELPER_REFS.lock().unwrap_or_else(|e| e.into_inner());
+    refs.iter()
+        .find(|slot| slot.class_name == class_name && slot.class_global_ref != 0)
+        .map(|slot| slot.class_global_ref as *mut std::ffi::c_void)
 }
 
 unsafe fn initialize_generated_string_literals(
@@ -469,11 +478,30 @@ unsafe fn install_managed_method_helper(
     Ok(())
 }
 
-unsafe fn install_managed_dsl_inner(class_name: &str, method_name: &str, sig: &str, dsl: &str) -> Result<(), String> {
-    let env = ensure_jni_initialized()?;
+struct ManagedDslInstallResult {
+    helper_class: String,
+    helper_method: String,
+    helper_signature: String,
+    uses_orig: bool,
+    counters: Vec<GeneratedCounter>,
+}
+
+unsafe fn install_managed_dsl_inner(
+    class_name: &str,
+    method_name: &str,
+    sig: &str,
+    dsl: &str,
+) -> Result<ManagedDslInstallResult, String> {
+    let scoped_env = scoped_jni_env()?;
+    let env = scoped_env.env();
     let (_, is_static) = resolve_art_method(env, class_name, method_name, sig, false)?;
     let class_id = DYNAMIC_MANAGED_CLASS_ID.fetch_add(1, Ordering::Relaxed);
     let generated = build_managed_dsl_dex(env, class_id, class_name, method_name, sig, is_static, dsl)?;
+    let helper_class = generated.class_name.clone();
+    let helper_method = generated.method_name.clone();
+    let helper_signature = generated.method_sig.clone();
+    let uses_orig = generated.uses_orig;
+    let counters = generated.counters.clone();
     output_message(&format!(
         "[managedHook] generated generic DSL dex class={} target={}.{}{} static={} dexSize={}",
         generated.class_name,
@@ -501,7 +529,13 @@ unsafe fn install_managed_dsl_inner(class_name: &str, method_name: &str, sig: &s
         generated.uses_orig,
     )?;
     refresh_walkstack_sigsegv_guard();
-    Ok(())
+    Ok(ManagedDslInstallResult {
+        helper_class,
+        helper_method,
+        helper_signature,
+        uses_orig,
+        counters,
+    })
 }
 
 unsafe fn extract_string_prop(
@@ -593,8 +627,62 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_hook_dsl(
         Err(e) => return e,
     };
 
-    match install_managed_dsl_inner(&class_name, &method_name, &sig, &dsl) {
-        Ok(()) => JSValue::bool(true).raw(),
-        Err(msg) => throw_internal_error(ctx, msg),
+    let result = match install_managed_dsl_inner(&class_name, &method_name, &sig, &dsl) {
+        Ok(result) => result,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
+
+    let obj = JSValue(ffi::JS_NewObject(ctx));
+    obj.set_property(ctx, "success", JSValue::bool(true));
+    obj.set_property(ctx, "helperClass", JSValue::string(ctx, &result.helper_class));
+    obj.set_property(ctx, "helperMethod", JSValue::string(ctx, &result.helper_method));
+    obj.set_property(ctx, "helperSignature", JSValue::string(ctx, &result.helper_signature));
+    obj.set_property(ctx, "usesOrig", JSValue::bool(result.uses_orig));
+    let counters = JSValue(ffi::JS_NewObject(ctx));
+    for counter in result.counters {
+        counters.set_property(ctx, &counter.name, JSValue::string(ctx, &counter.field_name));
     }
+    obj.set_property(ctx, "counters", counters);
+    obj.raw()
+}
+
+pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_read_counter(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return throw_internal_error(ctx, "managedReadCounter requires (helperClass, fieldName)");
+    }
+    let Some(helper_class) = JSValue(*argv).to_string(ctx) else {
+        return throw_internal_error(ctx, "managedReadCounter helperClass must be a string");
+    };
+    let Some(field_name) = JSValue(*argv.add(1)).to_string(ctx) else {
+        return throw_internal_error(ctx, "managedReadCounter fieldName must be a string");
+    };
+    let Some(helper_cls) = find_dynamic_managed_helper_class(&helper_class) else {
+        return throw_internal_error(ctx, format!("managed helper class not found: {}", helper_class));
+    };
+    let scoped_env = match scoped_jni_env_detach_on_drop() {
+        Ok(env) => env,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
+    let env = scoped_env.env();
+    let get_static_field_id: GetStaticFieldIdFn = jni_fn!(env, GetStaticFieldIdFn, JNI_GET_STATIC_FIELD_ID);
+    let get_static_int_field: GetStaticIntFieldFn = jni_fn!(env, GetStaticIntFieldFn, JNI_GET_STATIC_INT_FIELD);
+    let field_name = match CString::new(field_name.as_str()) {
+        Ok(value) => value,
+        Err(_) => return throw_internal_error(ctx, "managedReadCounter fieldName contains NUL byte"),
+    };
+    let int_sig = CString::new("I").unwrap();
+    let field_id = get_static_field_id(env, helper_cls, field_name.as_ptr(), int_sig.as_ptr());
+    if field_id.is_null() || jni_check_exc(env) {
+        return throw_internal_error(ctx, "managedReadCounter counter field not found");
+    }
+    let value = get_static_int_field(env, helper_cls, field_id);
+    if jni_check_exc(env) {
+        return throw_internal_error(ctx, "managedReadCounter GetStaticIntField failed");
+    }
+    ffi::JS_NewBigUint64(ctx, value as u32 as u64)
 }

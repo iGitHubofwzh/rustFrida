@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use super::art_method::get_art_field_spec;
 use super::jni_core::*;
@@ -350,12 +350,59 @@ unsafe fn check_array_contains(
 // GC 安全: 线程状态切换 — 对标 Frida withRunnableArtThread
 // ============================================================================
 
-/// ART kRunnable 状态值 — 在所有 ART 版本中固定为 67
-///
-/// enum ThreadState { kTerminated = 66, kRunnable = 67, ... }
-/// 66 来自 java.lang.Thread.State.TERMINATED (Java spec 定义)，
-/// kRunnable 紧随其后，跨所有 ART 版本稳定。
-const K_RUNNABLE: u16 = 67;
+/// ART ThreadState encoding has changed across Android releases.
+/// API 35/36 stores kRunnable as 0 in the high 8 bits of state_and_flags; older
+/// ART used kRunnable=67 in the high 16 bits.
+const K_RUNNABLE_CURRENT: u16 = 0;
+const K_RUNNABLE_OBSOLETE: u16 = 67;
+const K_NATIVE_ANDROID_16: u16 = 92;
+
+#[derive(Clone, Copy)]
+enum ThreadStateEncoding {
+    High8,
+    High16,
+}
+
+impl ThreadStateEncoding {
+    fn decode_state(self, value: u32) -> u16 {
+        match self {
+            ThreadStateEncoding::High8 => ((value >> 24) & 0xff) as u16,
+            ThreadStateEncoding::High16 => ((value >> 16) & 0xffff) as u16,
+        }
+    }
+
+    fn runnable_value(self) -> u16 {
+        match self {
+            ThreadStateEncoding::High8 => K_RUNNABLE_CURRENT,
+            ThreadStateEncoding::High16 => K_RUNNABLE_OBSOLETE,
+        }
+    }
+
+    fn encode_state(self, original: u32, state: u32) -> u32 {
+        match self {
+            ThreadStateEncoding::High8 => (original & 0x00ff_ffff) | ((state & 0xff) << 24),
+            ThreadStateEncoding::High16 => (original & 0x0000_ffff) | ((state & 0xffff) << 16),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ThreadStateSlot {
+    offset: usize,
+    native_state: u16,
+    encoding: ThreadStateEncoding,
+}
+
+static THREAD_STATE_SLOT: Mutex<Option<ThreadStateSlot>> = Mutex::new(None);
+
+fn remember_thread_state_slot(slot: ThreadStateSlot) {
+    let mut guard = THREAD_STATE_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(slot);
+}
+
+fn cached_thread_state_slot() -> Option<ThreadStateSlot> {
+    *THREAD_STATE_SLOT.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// 从 JNIEnvExt 获取 Thread* 指针
 ///
@@ -372,24 +419,97 @@ unsafe fn get_thread_ptr(env: JniEnv) -> u64 {
 /// tls32_ 是 Thread 的第一个数据成员（无 vtable），所以通常在 offset 0。
 /// 但厂商构建可能在前面插入字段，因此动态探测。
 ///
-/// 布局: union { struct { u16 flags, u16 state } as_struct; i32 as_int; }
-/// 当前线程在 JNI 代码中应处于 kNative 状态 (值 77-90 取决于版本)，
-/// flags 通常为 0 或很小。通过特征匹配定位。
+/// 当前线程在 JNI 代码中应处于 kNative 状态。通过特征匹配定位字段和编码。
 ///
-/// 返回 (offset, current_state_value)
-unsafe fn detect_state_and_flags(thread: u64) -> Option<(usize, u16)> {
+/// 返回 (offset, current_state_value, encoding)
+unsafe fn detect_state_and_flags(thread: u64) -> Option<(usize, u16, ThreadStateEncoding)> {
     for offset in (0..64).step_by(4) {
         let val = std::ptr::read_volatile((thread as usize + offset) as *const u32);
-        let state = ((val >> 16) & 0xFFFF) as u16;
-        let flags = (val & 0xFFFF) as u16;
+        let state8 = ((val >> 24) & 0xFF) as u16;
+        let flags24 = val & 0x00ff_ffff;
 
-        // kNative 在所有 ART 版本中值 >= 67 (> kRunnable) 且 <= 100
-        // flags 在正常运行中应 < 256
-        if state > K_RUNNABLE && state <= 100 && flags < 256 {
-            return Some((offset, state));
+        if state8 >= 66 && state8 <= 120 && state8 != K_RUNNABLE_OBSOLETE && flags24 < 0x01_0000 {
+            let slot = ThreadStateSlot {
+                offset,
+                native_state: state8,
+                encoding: ThreadStateEncoding::High8,
+            };
+            remember_thread_state_slot(slot);
+            return Some((offset, state8, ThreadStateEncoding::High8));
+        }
+
+        let state16 = ((val >> 16) & 0xFFFF) as u16;
+        let flags16 = (val & 0xFFFF) as u16;
+
+        if state16 > K_RUNNABLE_OBSOLETE && state16 <= 120 && flags16 < 256 {
+            let slot = ThreadStateSlot {
+                offset,
+                native_state: state16,
+                encoding: ThreadStateEncoding::High16,
+            };
+            remember_thread_state_slot(slot);
+            return Some((offset, state16, ThreadStateEncoding::High16));
         }
     }
     None
+}
+
+/// Ensure an attached ART thread is no longer Runnable before it blocks or detaches.
+///
+/// This is required for agent/control threads: if they call JNI and then block in recv/read while
+/// still Runnable, SuspendAll waits for a checkpoint that can never run.
+pub(crate) unsafe fn transition_current_thread_to_native_for_blocking(env: JniEnv) -> bool {
+    let thread = get_thread_ptr(env);
+    if thread == 0 {
+        return false;
+    }
+
+    let slot = cached_thread_state_slot()
+        .or_else(|| {
+            detect_state_and_flags(thread).map(|(offset, native_state, encoding)| ThreadStateSlot {
+                offset,
+                native_state,
+                encoding,
+            })
+        })
+        .or_else(|| {
+            let value = unsafe { std::ptr::read_volatile(thread as *const u32) };
+            let state8 = ((value >> 24) & 0xff) as u16;
+            if state8 == K_RUNNABLE_CURRENT {
+                Some(ThreadStateSlot {
+                    offset: 0,
+                    native_state: K_NATIVE_ANDROID_16,
+                    encoding: ThreadStateEncoding::High8,
+                })
+            } else {
+                None
+            }
+        });
+    let Some(slot) = slot else {
+        output_verbose("[runnable] 无法定位 Thread state_and_flags，跳过 native transition");
+        return false;
+    };
+
+    let ptr = (thread as usize + slot.offset) as *const u32;
+    let current = std::ptr::read_volatile(ptr);
+    let state = slot.encoding.decode_state(current);
+    if state != slot.encoding.runnable_value() {
+        return true;
+    }
+
+    let from_runnable_sym = libart_dlsym("_ZN3art6Thread33TransitionFromRunnableToSuspendedENS_11ThreadStateE");
+    if from_runnable_sym.is_null() {
+        output_verbose("[runnable] TransitionFromRunnableToSuspended 不可用，直接写回 kNative state");
+        let ptr = (thread as usize + slot.offset) as *mut u32;
+        let restored = slot.encoding.encode_state(current, slot.native_state as u32);
+        std::ptr::write_volatile(ptr, restored);
+        return true;
+    }
+
+    type FromRunnableFn = unsafe extern "C" fn(this: u64, state: u32);
+    let transition: FromRunnableFn = std::mem::transmute(from_runnable_sym);
+    transition(thread, slot.native_state as u32);
+    true
 }
 
 /// 在 Runnable 状态下执行闭包（对标 Frida withRunnableArtThread）
@@ -412,16 +532,25 @@ where
         return f();
     }
 
-    // Strategy 1: dlsym TransitionFromSuspendedToRunnable
+    // Capture the native/suspended state slot before entering Runnable. If symbol-based restore
+    // is unavailable, probing after the transition is too late because the state is Runnable.
+    let state_slot_before = detect_state_and_flags(thread);
+
+    // Strategy 1: dlsym TransitionFromSuspendedToRunnable + full reverse transition.
     let to_runnable_sym = libart_dlsym("_ZN3art6Thread33TransitionFromSuspendedToRunnableEv");
+    let from_runnable_sym = libart_dlsym("_ZN3art6Thread33TransitionFromRunnableToSuspendedENS_11ThreadStateE");
 
-    if !to_runnable_sym.is_null() {
-        // 尝试找反向转换函数
-        let to_suspended_sym = libart_dlsym("_ZN3art6Thread40TransitionToSuspendedAndRunCheckpointsENS_11ThreadStateE");
-
+    if !to_runnable_sym.is_null() && !from_runnable_sym.is_null() {
         type ToRunnableFn = unsafe extern "C" fn(this: u64) -> u32;
         let transition: ToRunnableFn = std::mem::transmute(to_runnable_sym);
         let old_state = transition(thread);
+        if let Some((offset, _, encoding)) = state_slot_before {
+            remember_thread_state_slot(ThreadStateSlot {
+                offset,
+                native_state: old_state as u16,
+                encoding,
+            });
+        }
 
         output_verbose(&format!(
             "[runnable] TransitionFromSuspendedToRunnable: old_state={}",
@@ -431,35 +560,27 @@ where
         let result = f();
 
         // 恢复原始状态
-        if !to_suspended_sym.is_null() {
-            type ToSuspendedFn = unsafe extern "C" fn(this: u64, state: u32);
-            let reverse: ToSuspendedFn = std::mem::transmute(to_suspended_sym);
-            reverse(thread, old_state);
-        } else {
-            // Fallback: 直接写回状态字段
-            if let Some((offset, _)) = detect_state_and_flags(thread) {
-                let ptr = (thread as usize + offset) as *mut u32;
-                let current = std::ptr::read_volatile(ptr);
-                let restored = (current & 0xFFFF) | ((old_state & 0xFFFF) << 16);
-                std::ptr::write_volatile(ptr, restored);
-            }
-        }
+        type FromRunnableFn = unsafe extern "C" fn(this: u64, state: u32);
+        let reverse: FromRunnableFn = std::mem::transmute(from_runnable_sym);
+        reverse(thread, old_state);
 
         return result;
     }
 
     // Strategy 2: 直接操作 state_and_flags 字段
-    if let Some((offset, native_state)) = detect_state_and_flags(thread) {
+    if let Some((offset, native_state, encoding)) = state_slot_before {
         let ptr = (thread as usize + offset) as *mut u32;
         let original = std::ptr::read_volatile(ptr);
 
         // 设置 state 为 kRunnable (保留 flags 不变)
-        let runnable_val = (original & 0xFFFF) | ((K_RUNNABLE as u32) << 16);
+        let runnable_val = encoding.encode_state(original, encoding.runnable_value() as u32);
         std::ptr::write_volatile(ptr, runnable_val);
 
         output_verbose(&format!(
             "[runnable] 直接状态切换: Thread+{:#x}, kNative({})→kRunnable({})",
-            offset, native_state, K_RUNNABLE
+            offset,
+            native_state,
+            encoding.runnable_value()
         ));
 
         let result = f();

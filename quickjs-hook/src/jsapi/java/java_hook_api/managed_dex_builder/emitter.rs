@@ -10,7 +10,7 @@ use super::{
     descriptor_word_count, emit_return_from_orig, java_class_to_descriptor, java_class_to_descriptor_or_primitive,
     parse_call_params, parse_method_signature, resolve_call_proto_with_arg_types, resolve_field_with_env,
     return_is_object, value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, FieldRef,
-    GeneratedStringLiteral, IfCmpOp, MethodRef, ValueKind,
+    GeneratedCounter, GeneratedStringLiteral, IfCmpOp, MethodRef, ValueKind,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -40,12 +40,32 @@ pub(super) struct DslBuildContext {
     env: JniEnv,
     generated_type: String,
     pub(super) string_literals: Vec<GeneratedStringLiteral>,
+    pub(super) counters: Vec<GeneratedCounter>,
     int_expr_scratch_base: u16,
     int_expr_scratch_count: u16,
-    range_scratch_base: u16,
+    invoke_scratch_base: u16,
+    invoke_frame_words: u16,
+    invoke_frame_count: u16,
+    invoke_depth: u16,
     target_narrow_types: BTreeMap<DslTargetKey, String>,
     last_descriptor: Option<String>,
     result_descriptor: Option<String>,
+    orig_emit: Option<OrigEmitContext>,
+}
+
+#[derive(Clone)]
+struct OrigEmitContext {
+    is_static: bool,
+    local_count: u16,
+    ins_size: u16,
+    orig_backup: MethodRef,
+    return_type: String,
+}
+
+#[derive(Clone, Copy)]
+struct InvokeScratchFrame {
+    range_base: u16,
+    stage_base: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -77,19 +97,43 @@ impl DslBuildContext {
         generated_type: String,
         int_expr_scratch_base: u16,
         int_expr_scratch_count: u16,
-        range_scratch_base: u16,
+        invoke_scratch_base: u16,
+        invoke_frame_words: u16,
+        invoke_frame_count: u16,
     ) -> Self {
         Self {
             env,
             generated_type,
             string_literals: Vec::new(),
+            counters: Vec::new(),
             int_expr_scratch_base,
             int_expr_scratch_count,
-            range_scratch_base,
+            invoke_scratch_base,
+            invoke_frame_words,
+            invoke_frame_count,
+            invoke_depth: 0,
             target_narrow_types: BTreeMap::new(),
             last_descriptor: None,
             result_descriptor: None,
+            orig_emit: None,
         }
+    }
+
+    pub(super) fn set_orig_emit_context(
+        &mut self,
+        is_static: bool,
+        local_count: u16,
+        ins_size: u16,
+        orig_backup: MethodRef,
+        return_type: String,
+    ) {
+        self.orig_emit = Some(OrigEmitContext {
+            is_static,
+            local_count,
+            ins_size,
+            orig_backup,
+            return_type,
+        });
     }
 
     fn int_expr_scratch_reg(&self, index: u16) -> Result<u8, String> {
@@ -101,6 +145,37 @@ impl DslBuildContext {
             ));
         }
         checked_reg(self.int_expr_scratch_base + index, "int expression scratch register")
+    }
+
+    fn enter_invoke_frame(&mut self) -> Result<InvokeScratchFrame, String> {
+        if self.invoke_depth >= self.invoke_frame_count {
+            return Err(format!(
+                "invoke nesting depth {} exceeds reserved scratch frames {}",
+                self.invoke_depth + 1,
+                self.invoke_frame_count
+            ));
+        }
+        let frame_span = self
+            .invoke_frame_words
+            .checked_mul(2)
+            .ok_or_else(|| "too many dex registers".to_string())?;
+        let frame_offset = self
+            .invoke_depth
+            .checked_mul(frame_span)
+            .ok_or_else(|| "too many dex registers".to_string())?;
+        let range_base = self
+            .invoke_scratch_base
+            .checked_add(frame_offset)
+            .ok_or_else(|| "too many dex registers".to_string())?;
+        let stage_base = range_base
+            .checked_add(self.invoke_frame_words)
+            .ok_or_else(|| "too many dex registers".to_string())?;
+        self.invoke_depth += 1;
+        Ok(InvokeScratchFrame { range_base, stage_base })
+    }
+
+    fn leave_invoke_frame(&mut self) {
+        self.invoke_depth = self.invoke_depth.saturating_sub(1);
     }
 
     fn string_literal_field(&mut self, value: &str) -> FieldRef {
@@ -121,6 +196,22 @@ impl DslBuildContext {
             "Ljava/lang/String;".to_string(),
             field_name,
         )
+    }
+
+    fn counter_field(&mut self, name: &str) -> FieldRef {
+        if let Some(existing) = self.counters.iter().find(|counter| counter.name == name) {
+            return FieldRef::new(
+                self.generated_type.clone(),
+                "I".to_string(),
+                existing.field_name.clone(),
+            );
+        }
+        let field_name = format!("__rf_counter{}", self.counters.len());
+        self.counters.push(GeneratedCounter {
+            name: name.to_string(),
+            field_name: field_name.clone(),
+        });
+        FieldRef::new(self.generated_type.clone(), "I".to_string(), field_name)
     }
 
     fn with_target_narrow_type<F>(&mut self, key: DslTargetKey, descriptor: String, f: F) -> Result<bool, String>
@@ -625,6 +716,7 @@ fn emit_load_value(
             layout,
             dsl_ctx,
         ),
+        DslValue::OrigCall(args) => emit_orig_value(ir, args, expected_type, temp_reg, layout, dsl_ctx),
         DslValue::Call(stmt) => emit_call_value(ir, stmt, expected_type, temp_reg, layout, dsl_ctx),
         DslValue::NewObject {
             class_name,
@@ -1058,6 +1150,16 @@ fn infer_value_descriptor(
             common_value_descriptor_with_env(then_desc, else_desc, dsl_ctx.env)
         }
         DslValue::Null => Ok(None),
+        DslValue::OrigCall(_) => {
+            let Some(orig_ctx) = dsl_ctx.orig_emit.as_ref() else {
+                return Err("orig() is not available in this helper".to_string());
+            };
+            if orig_ctx.return_type == "V" {
+                Ok(None)
+            } else {
+                Ok(Some(orig_ctx.return_type.clone()))
+            }
+        }
         DslValue::Call(stmt) => {
             if let Ok((_, return_type)) = parse_method_signature(&stmt.sig) {
                 if return_type == "V" {
@@ -1345,6 +1447,47 @@ fn emit_field_write(
     } else {
         let obj = emit_field_receiver(ir, stmt, layout, dsl_ctx)?;
         ir.iput(src, obj, field, kind);
+    }
+    Ok(())
+}
+
+fn emit_field_update(
+    ir: &mut DexIrBuilder,
+    stmt: &DslFieldStmt,
+    is_static: bool,
+    op: DslIntBinOp,
+    value: &DslValue,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<(), String> {
+    let class_type = resolve_member_class_type(
+        stmt.class_name.as_deref(),
+        stmt.target.as_ref(),
+        stmt.receiver.as_deref(),
+        layout,
+        dsl_ctx,
+    )?;
+    let (declaring_type, field_type) = resolve_field_ref_parts(dsl_ctx.env, stmt, is_static, &class_type)?;
+    if field_type != "I" {
+        return Err(format!(
+            "field '{}' compound assignment requires int field, got {}",
+            stmt.field_name, field_type
+        ));
+    }
+    let rhs = emit_load_value(ir, value, "I", REG_LOOP_LIMIT, layout, dsl_ctx)?;
+    if rhs != REG_LOOP_LIMIT {
+        ir.move_from16(REG_LOOP_LIMIT, rhs as u16, ValueKind::Narrow);
+    }
+    let field = FieldRef::new(declaring_type, field_type, stmt.field_name.clone());
+    if is_static {
+        ir.sget(REG_RESULT, field.clone(), ValueKind::Narrow);
+        ir.int_binop(dex_int_binop(op), REG_RESULT, REG_RESULT, REG_LOOP_LIMIT);
+        ir.sput(REG_RESULT, field, ValueKind::Narrow);
+    } else {
+        let obj = emit_field_receiver(ir, stmt, layout, dsl_ctx)?;
+        ir.iget(REG_RESULT, obj, field.clone(), ValueKind::Narrow);
+        ir.int_binop(dex_int_binop(op), REG_RESULT, REG_RESULT, REG_LOOP_LIMIT);
+        ir.iput(REG_RESULT, obj, field, ValueKind::Narrow);
     }
     Ok(())
 }
@@ -1653,6 +1796,165 @@ fn emit_switch(
     Ok(default_stmts.is_some() && default_returns && cases_all_return)
 }
 
+fn emit_while(
+    ir: &mut DexIrBuilder,
+    condition: &DslCondition,
+    body_stmts: &[DslStmt],
+    emit_ctx: &mut EmitContext<'_>,
+) -> Result<bool, String> {
+    let condition_label = ir.new_label();
+    let body_label = ir.new_label();
+    let done_label = ir.new_label();
+
+    ir.bind(condition_label)?;
+    emit_condition_branch(ir, condition, body_label, done_label, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+
+    ir.bind(body_label)?;
+    emit_ctx.loop_stack.push(LoopLabels {
+        break_label: done_label,
+        continue_label: condition_label,
+    });
+
+    let facts = condition_narrow_facts_when_true(condition)?;
+    let body_returns = if facts.is_empty() {
+        emit_statements(ir, body_stmts, emit_ctx)?
+    } else {
+        let layout = emit_ctx.layout;
+        let is_static = emit_ctx.is_static;
+        let local_count = emit_ctx.local_count;
+        let ins_size = emit_ctx.ins_size;
+        let target = emit_ctx.target;
+        let orig_backup = emit_ctx.orig_backup;
+        let target_is_interface = emit_ctx.target_is_interface;
+        let return_type = emit_ctx.return_type;
+        let sink = emit_ctx.sink;
+        let loop_stack = emit_ctx.loop_stack.clone();
+        emit_ctx.dsl_ctx.with_target_narrow_types(&facts, |dsl_ctx| {
+            let mut narrowed_ctx = EmitContext {
+                layout,
+                dsl_ctx,
+                is_static,
+                local_count,
+                ins_size,
+                target,
+                orig_backup,
+                target_is_interface,
+                return_type,
+                sink,
+                loop_stack,
+            };
+            emit_statements(ir, body_stmts, &mut narrowed_ctx)
+        })?
+    };
+    emit_ctx.loop_stack.pop();
+
+    if !body_returns {
+        ir.goto16(condition_label);
+    }
+    ir.bind(done_label)?;
+    Ok(false)
+}
+
+fn emit_do_while(
+    ir: &mut DexIrBuilder,
+    body_stmts: &[DslStmt],
+    condition: &DslCondition,
+    emit_ctx: &mut EmitContext<'_>,
+) -> Result<bool, String> {
+    let body_label = ir.new_label();
+    let condition_label = ir.new_label();
+    let done_label = ir.new_label();
+
+    ir.bind(body_label)?;
+    emit_ctx.loop_stack.push(LoopLabels {
+        break_label: done_label,
+        continue_label: condition_label,
+    });
+    let _body_returns = emit_statements(ir, body_stmts, emit_ctx)?;
+    emit_ctx.loop_stack.pop();
+
+    ir.bind(condition_label)?;
+    emit_condition_branch(ir, condition, body_label, done_label, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+    ir.bind(done_label)?;
+    Ok(false)
+}
+
+fn emit_for(
+    ir: &mut DexIrBuilder,
+    init_stmts: &[DslStmt],
+    condition: Option<&DslCondition>,
+    update_stmts: &[DslStmt],
+    body_stmts: &[DslStmt],
+    emit_ctx: &mut EmitContext<'_>,
+) -> Result<bool, String> {
+    emit_statements(ir, init_stmts, emit_ctx)?;
+
+    let condition_label = ir.new_label();
+    let body_label = ir.new_label();
+    let update_label = ir.new_label();
+    let done_label = ir.new_label();
+
+    ir.bind(condition_label)?;
+    if let Some(condition) = condition {
+        emit_condition_branch(ir, condition, body_label, done_label, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+    } else {
+        ir.goto16(body_label);
+    }
+
+    ir.bind(body_label)?;
+    emit_ctx.loop_stack.push(LoopLabels {
+        break_label: done_label,
+        continue_label: update_label,
+    });
+
+    let facts = condition
+        .map(condition_narrow_facts_when_true)
+        .transpose()?
+        .unwrap_or_default();
+    let body_returns = if facts.is_empty() {
+        emit_statements(ir, body_stmts, emit_ctx)?
+    } else {
+        let layout = emit_ctx.layout;
+        let is_static = emit_ctx.is_static;
+        let local_count = emit_ctx.local_count;
+        let ins_size = emit_ctx.ins_size;
+        let target = emit_ctx.target;
+        let orig_backup = emit_ctx.orig_backup;
+        let target_is_interface = emit_ctx.target_is_interface;
+        let return_type = emit_ctx.return_type;
+        let sink = emit_ctx.sink;
+        let loop_stack = emit_ctx.loop_stack.clone();
+        emit_ctx.dsl_ctx.with_target_narrow_types(&facts, |dsl_ctx| {
+            let mut narrowed_ctx = EmitContext {
+                layout,
+                dsl_ctx,
+                is_static,
+                local_count,
+                ins_size,
+                target,
+                orig_backup,
+                target_is_interface,
+                return_type,
+                sink,
+                loop_stack,
+            };
+            emit_statements(ir, body_stmts, &mut narrowed_ctx)
+        })?
+    };
+    emit_ctx.loop_stack.pop();
+
+    if !body_returns {
+        ir.goto16(update_label);
+    }
+    ir.bind(update_label)?;
+    let update_returns = emit_statements(ir, update_stmts, emit_ctx)?;
+    if !update_returns {
+        ir.goto16(condition_label);
+    }
+    ir.bind(done_label)?;
+    Ok(false)
+}
+
 fn emit_cast(
     ir: &mut DexIrBuilder,
     value: &DslValue,
@@ -1748,6 +2050,37 @@ fn emit_array_put(
     Ok(())
 }
 
+fn emit_array_update(
+    ir: &mut DexIrBuilder,
+    array: &DslValue,
+    index: &DslValue,
+    type_name: Option<&str>,
+    op: DslIntBinOp,
+    value: &DslValue,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<(), String> {
+    let component_type = resolve_array_component_type(array, type_name, layout, dsl_ctx)?;
+    if component_type != "I" {
+        return Err(format!(
+            "array compound assignment requires int element, got {}",
+            component_type
+        ));
+    }
+    let rhs = emit_load_value(ir, value, "I", REG_LOOP_LIMIT, layout, dsl_ctx)?;
+    if rhs != REG_LOOP_LIMIT {
+        ir.move_from16(REG_LOOP_LIMIT, rhs as u16, ValueKind::Narrow);
+    }
+    let array_reg = emit_load_value(ir, array, "Ljava/lang/Object;", REG_TMP1, layout, dsl_ctx)?;
+    let array_reg = emit_copy_object_if_needed(ir, array_reg, REG_TMP1);
+    let index_reg = emit_load_value(ir, index, "I", REG_TMP0, layout, dsl_ctx)?;
+    let index_reg = emit_copy_field_value_if_needed(ir, index_reg, REG_TMP0, ValueKind::Narrow);
+    ir.aget(REG_RESULT, array_reg, index_reg, ValueKind::Narrow);
+    ir.int_binop(dex_int_binop(op), REG_RESULT, REG_RESULT, REG_LOOP_LIMIT);
+    ir.aput(REG_RESULT, array_reg, index_reg, ValueKind::Narrow);
+    Ok(())
+}
+
 fn emit_if_instance_of(
     ir: &mut DexIrBuilder,
     value: &DslValue,
@@ -1785,6 +2118,7 @@ fn emit_if_instance_of(
                 target_is_interface: emit_ctx.target_is_interface,
                 return_type: emit_ctx.return_type,
                 sink: emit_ctx.sink,
+                loop_stack: emit_ctx.loop_stack.clone(),
             };
             emit_statements(ir, then_stmts, &mut narrowed_ctx)
         })?
@@ -1828,46 +2162,6 @@ fn infer_call_arg_descriptors(
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn value_contains_invoke(value: &DslValue) -> bool {
-    match value {
-        DslValue::Call(_) | DslValue::NewObject { .. } => true,
-        DslValue::UnaryOp { value, .. } => value_contains_invoke(value),
-        DslValue::ArrayLength(value) => value_contains_invoke(value),
-        DslValue::IntBinOp { left, right, .. } => value_contains_invoke(left) || value_contains_invoke(right),
-        DslValue::Ternary {
-            condition,
-            then_value,
-            else_value,
-        } => {
-            condition_contains_invoke(condition)
-                || value_contains_invoke(then_value)
-                || value_contains_invoke(else_value)
-        }
-        DslValue::Cast { value, .. } => value_contains_invoke(value),
-        DslValue::ArrayGet { array, index, .. } => value_contains_invoke(array) || value_contains_invoke(index),
-        DslValue::FieldGet { .. }
-        | DslValue::Target(_)
-        | DslValue::String(_)
-        | DslValue::Int(_)
-        | DslValue::Bool(_)
-        | DslValue::Null => false,
-    }
-}
-
-fn condition_contains_invoke(condition: &DslCondition) -> bool {
-    match condition {
-        DslCondition::Const(_) => false,
-        DslCondition::Null { value, .. } | DslCondition::Bool { value } | DslCondition::InstanceOf { value, .. } => {
-            value_contains_invoke(value)
-        }
-        DslCondition::Cmp { left, right, .. } => value_contains_invoke(left) || value_contains_invoke(right),
-        DslCondition::And(left, right) | DslCondition::Or(left, right) => {
-            condition_contains_invoke(left) || condition_contains_invoke(right)
-        }
-        DslCondition::Not(condition) => condition_contains_invoke(condition),
-    }
-}
-
 fn emit_invoke_with_values(
     ir: &mut DexIrBuilder,
     kind: ManagedInvokeKind,
@@ -1878,13 +2172,24 @@ fn emit_invoke_with_values(
     layout: &HelperParamLayout,
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
+    let frame = dsl_ctx.enter_invoke_frame()?;
+    let result = emit_invoke_with_values_in_frame(ir, kind, method, receiver, params, args, layout, dsl_ctx, frame);
+    dsl_ctx.leave_invoke_frame();
+    result
+}
+
+fn emit_invoke_with_values_in_frame(
+    ir: &mut DexIrBuilder,
+    kind: ManagedInvokeKind,
+    method: MethodRef,
+    receiver: Option<(u8, &str)>,
+    params: &[String],
+    args: &[DslValue],
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+    frame: InvokeScratchFrame,
+) -> Result<(), String> {
     let has_wide = params.iter().any(|param| matches!(param.as_str(), "J" | "D"));
-    if args.iter().any(value_contains_invoke) {
-        return Err(
-            "call expressions cannot be nested inside invoke arguments; assign the value to a let binding first"
-                .to_string(),
-        );
-    }
     let mut regs = Vec::new();
     if let Some((receiver_reg, _)) = receiver {
         regs.push(receiver_reg);
@@ -1901,31 +2206,67 @@ fn emit_invoke_with_values(
         return Ok(());
     }
 
-    let mut next = dsl_ctx.range_scratch_base;
-    if let Some((receiver_reg, receiver_desc)) = receiver {
-        let dst = checked_reg(next, "range receiver register")?;
-        emit_copy_value(ir, dst, receiver_reg, receiver_desc)?;
-        next += 1;
-    }
-    for (idx, arg) in args.iter().enumerate() {
-        let dst = checked_reg(next, "range argument register")?;
-        let src = emit_load_value(ir, arg, &params[idx], dst, layout, dsl_ctx)?;
-        emit_copy_value(ir, dst, src, &params[idx])?;
-        next = next
-            .checked_add(descriptor_word_count(&params[idx]))
+    let mut range_next = frame.range_base;
+    let mut stage_next = frame.stage_base;
+    let receiver_dst = if let Some((_, _)) = receiver {
+        let range_dst = checked_reg(range_next, "range receiver register")?;
+        let stage_dst = checked_reg(stage_next, "stage receiver register")?;
+        range_next += 1;
+        stage_next += 1;
+        Some((range_dst, stage_dst))
+    } else {
+        None
+    };
+    let mut arg_dsts = Vec::with_capacity(args.len());
+    for (idx, _) in args.iter().enumerate() {
+        let range_dst = checked_reg(range_next, "range argument register")?;
+        let stage_dst = checked_reg(stage_next, "stage argument register")?;
+        arg_dsts.push((range_dst, stage_dst));
+        let words = descriptor_word_count(&params[idx]);
+        range_next = range_next
+            .checked_add(words)
+            .ok_or_else(|| "too many dex registers".to_string())?;
+        stage_next = stage_next
+            .checked_add(words)
             .ok_or_else(|| "too many dex registers".to_string())?;
     }
-    let arg_words = next
-        .checked_sub(dsl_ctx.range_scratch_base)
+
+    if let Some((receiver_reg, receiver_desc)) = receiver {
+        let (_, stage_dst) = receiver_dst.ok_or_else(|| "missing stage receiver register".to_string())?;
+        emit_copy_value(ir, stage_dst, receiver_reg, receiver_desc)?;
+    }
+    for (idx, arg) in args.iter().enumerate() {
+        let (_, stage_dst) = arg_dsts[idx];
+        let src = emit_load_value(ir, arg, &params[idx], stage_dst, layout, dsl_ctx)?;
+        emit_copy_value(ir, stage_dst, src, &params[idx])?;
+    }
+
+    if let Some((_, receiver_desc)) = receiver {
+        let (range_dst, stage_dst) = receiver_dst.ok_or_else(|| "missing range receiver register".to_string())?;
+        emit_copy_value(ir, range_dst, stage_dst, receiver_desc)?;
+    }
+    for (idx, _) in args.iter().enumerate() {
+        let (range_dst, stage_dst) = arg_dsts[idx];
+        emit_copy_value(ir, range_dst, stage_dst, &params[idx])?;
+    }
+
+    let arg_words = range_next
+        .checked_sub(frame.range_base)
         .ok_or_else(|| "invalid range invoke register layout".to_string())?;
+    if arg_words > dsl_ctx.invoke_frame_words {
+        return Err(format!(
+            "invoke requires {} words, reserved frame has {}",
+            arg_words, dsl_ctx.invoke_frame_words
+        ));
+    }
     if arg_words > u8::MAX as u16 {
         return Err(format!("too many invoke argument words: {}", arg_words));
     }
     match kind {
-        ManagedInvokeKind::Direct => ir.invoke_direct_range(dsl_ctx.range_scratch_base, arg_words as u8, method),
-        ManagedInvokeKind::Virtual => ir.invoke_virtual_range(dsl_ctx.range_scratch_base, arg_words as u8, method),
-        ManagedInvokeKind::Interface => ir.invoke_interface_range(dsl_ctx.range_scratch_base, arg_words as u8, method),
-        ManagedInvokeKind::Static => ir.invoke_static_range(dsl_ctx.range_scratch_base, arg_words as u8, method),
+        ManagedInvokeKind::Direct => ir.invoke_direct_range(frame.range_base, arg_words as u8, method),
+        ManagedInvokeKind::Virtual => ir.invoke_virtual_range(frame.range_base, arg_words as u8, method),
+        ManagedInvokeKind::Interface => ir.invoke_interface_range(frame.range_base, arg_words as u8, method),
+        ManagedInvokeKind::Static => ir.invoke_static_range(frame.range_base, arg_words as u8, method),
     }
     Ok(())
 }
@@ -2023,8 +2364,172 @@ pub(super) fn program_max_invoke_words(
     statements_max_invoke_words(&program.stmts, target_params, is_static)
 }
 
+pub(super) fn program_max_invoke_depth(program: &DslProgram) -> u16 {
+    statements_max_invoke_depth(&program.stmts)
+}
+
 pub(super) fn program_int_expr_scratch_count(program: &DslProgram) -> u16 {
     statements_int_expr_scratch_count(&program.stmts)
+}
+
+fn statements_max_invoke_depth(stmts: &[DslStmt]) -> u16 {
+    stmts.iter().map(stmt_max_invoke_depth).max().unwrap_or(0)
+}
+
+fn stmt_max_invoke_depth(stmt: &DslStmt) -> u16 {
+    match stmt {
+        DslStmt::Block(stmts) => statements_max_invoke_depth(stmts),
+        DslStmt::Let { value, .. }
+        | DslStmt::Assign { value, .. }
+        | DslStmt::NewArray { size: value, .. }
+        | DslStmt::Cast { value, .. }
+        | DslStmt::ArrayLength { array: value }
+        | DslStmt::Throw { value } => value_max_invoke_depth(value),
+        DslStmt::LetOrig { args, .. } | DslStmt::ReturnOrig { args } => orig_args_max_invoke_depth(args),
+        DslStmt::New { args, .. } => 1 + values_max_invoke_depth(args),
+        DslStmt::Call(stmt) => call_stmt_max_invoke_depth(stmt),
+        DslStmt::ArrayGet { array, index, .. } => value_max_invoke_depth(array).max(value_max_invoke_depth(index)),
+        DslStmt::ArrayPut {
+            array, index, value, ..
+        } => value_max_invoke_depth(array)
+            .max(value_max_invoke_depth(index))
+            .max(value_max_invoke_depth(value)),
+        DslStmt::ArrayUpdate {
+            array, index, value, ..
+        } => value_max_invoke_depth(array)
+            .max(value_max_invoke_depth(index))
+            .max(value_max_invoke_depth(value)),
+        DslStmt::FieldRead { stmt, .. } => field_stmt_max_invoke_depth(stmt),
+        DslStmt::FieldWrite { stmt, .. } => field_stmt_max_invoke_depth(stmt),
+        DslStmt::FieldUpdate { stmt, value, .. } => {
+            field_stmt_max_invoke_depth(stmt).max(value_max_invoke_depth(value))
+        }
+        DslStmt::IfNull {
+            value,
+            then_stmts,
+            else_stmts,
+            ..
+        }
+        | DslStmt::IfBool {
+            value,
+            then_stmts,
+            else_stmts,
+            ..
+        }
+        | DslStmt::IfInstanceOf {
+            value,
+            then_stmts,
+            else_stmts,
+            ..
+        } => value_max_invoke_depth(value)
+            .max(statements_max_invoke_depth(then_stmts))
+            .max(statements_max_invoke_depth(else_stmts)),
+        DslStmt::IfCmp {
+            left,
+            right,
+            then_stmts,
+            else_stmts,
+            ..
+        } => value_max_invoke_depth(left)
+            .max(value_max_invoke_depth(right))
+            .max(statements_max_invoke_depth(then_stmts))
+            .max(statements_max_invoke_depth(else_stmts)),
+        DslStmt::Switch {
+            value,
+            cases,
+            default_stmts,
+        } => {
+            let mut depth = value_max_invoke_depth(value);
+            for (_, stmts) in cases {
+                depth = depth.max(statements_max_invoke_depth(stmts));
+            }
+            if let Some(stmts) = default_stmts {
+                depth = depth.max(statements_max_invoke_depth(stmts));
+            }
+            depth
+        }
+        DslStmt::TryCatch {
+            try_stmts, catch_stmts, ..
+        } => statements_max_invoke_depth(try_stmts).max(statements_max_invoke_depth(catch_stmts)),
+        DslStmt::While { condition, body_stmts } | DslStmt::DoWhile { condition, body_stmts } => {
+            condition_max_invoke_depth(condition).max(statements_max_invoke_depth(body_stmts))
+        }
+        DslStmt::For {
+            init_stmts,
+            condition,
+            update_stmts,
+            body_stmts,
+        } => statements_max_invoke_depth(init_stmts)
+            .max(condition.as_ref().map(condition_max_invoke_depth).unwrap_or(0))
+            .max(statements_max_invoke_depth(update_stmts))
+            .max(statements_max_invoke_depth(body_stmts)),
+        DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => 0,
+        DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_depth).unwrap_or(0),
+    }
+}
+
+fn field_stmt_max_invoke_depth(stmt: &DslFieldStmt) -> u16 {
+    stmt.receiver
+        .as_deref()
+        .map(value_max_invoke_depth)
+        .unwrap_or(0)
+        .max(stmt.value.as_ref().map(value_max_invoke_depth).unwrap_or(0))
+}
+
+fn call_stmt_max_invoke_depth(stmt: &DslCallStmt) -> u16 {
+    1 + stmt
+        .receiver
+        .as_deref()
+        .map(value_max_invoke_depth)
+        .unwrap_or(0)
+        .max(values_max_invoke_depth(&stmt.args))
+}
+
+fn values_max_invoke_depth(values: &[DslValue]) -> u16 {
+    values.iter().map(value_max_invoke_depth).max().unwrap_or(0)
+}
+
+fn value_max_invoke_depth(value: &DslValue) -> u16 {
+    match value {
+        DslValue::Call(stmt) => call_stmt_max_invoke_depth(stmt),
+        DslValue::NewObject { args, .. } => 1 + values_max_invoke_depth(args),
+        DslValue::OrigCall(args) => orig_args_max_invoke_depth(args),
+        DslValue::UnaryOp { value, .. } | DslValue::Cast { value, .. } | DslValue::ArrayLength(value) => {
+            value_max_invoke_depth(value)
+        }
+        DslValue::IntBinOp { left, right, .. } => value_max_invoke_depth(left).max(value_max_invoke_depth(right)),
+        DslValue::Ternary {
+            condition,
+            then_value,
+            else_value,
+        } => condition_max_invoke_depth(condition)
+            .max(value_max_invoke_depth(then_value))
+            .max(value_max_invoke_depth(else_value)),
+        DslValue::FieldGet { stmt, .. } => field_stmt_max_invoke_depth(stmt),
+        DslValue::ArrayGet { array, index, .. } => value_max_invoke_depth(array).max(value_max_invoke_depth(index)),
+        DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => 0,
+    }
+}
+
+fn condition_max_invoke_depth(condition: &DslCondition) -> u16 {
+    match condition {
+        DslCondition::Const(_) => 0,
+        DslCondition::Null { value, .. } | DslCondition::Bool { value } | DslCondition::InstanceOf { value, .. } => {
+            value_max_invoke_depth(value)
+        }
+        DslCondition::Cmp { left, right, .. } => value_max_invoke_depth(left).max(value_max_invoke_depth(right)),
+        DslCondition::And(left, right) | DslCondition::Or(left, right) => {
+            condition_max_invoke_depth(left).max(condition_max_invoke_depth(right))
+        }
+        DslCondition::Not(condition) => condition_max_invoke_depth(condition),
+    }
+}
+
+fn orig_args_max_invoke_depth(args: &DslOrigArgs) -> u16 {
+    match args {
+        DslOrigArgs::Original => 1,
+        DslOrigArgs::Values(values) => 1 + values_max_invoke_depth(values),
+    }
 }
 
 fn statements_int_expr_scratch_count(stmts: &[DslStmt]) -> u16 {
@@ -2053,8 +2558,19 @@ fn stmt_int_expr_scratch_count(stmt: &DslStmt) -> u16 {
         } => value_int_expr_scratch_count(array)
             .max(value_int_expr_scratch_count(index))
             .max(value_int_expr_scratch_count(value)),
+        DslStmt::ArrayUpdate {
+            array, index, value, ..
+        } => value_int_expr_scratch_count(array)
+            .max(value_int_expr_scratch_count(index))
+            .max(value_int_expr_scratch_count(value)),
         DslStmt::FieldRead { .. } => 0,
         DslStmt::FieldWrite { stmt, .. } => stmt.value.as_ref().map(value_int_expr_scratch_count).unwrap_or(0),
+        DslStmt::FieldUpdate { stmt, value, .. } => stmt
+            .receiver
+            .as_deref()
+            .map(value_int_expr_scratch_count)
+            .unwrap_or(0)
+            .max(value_int_expr_scratch_count(value)),
         DslStmt::IfNull {
             value,
             then_stmts,
@@ -2101,6 +2617,19 @@ fn stmt_int_expr_scratch_count(stmt: &DslStmt) -> u16 {
         DslStmt::TryCatch {
             try_stmts, catch_stmts, ..
         } => statements_int_expr_scratch_count(try_stmts).max(statements_int_expr_scratch_count(catch_stmts)),
+        DslStmt::While { condition, body_stmts } | DslStmt::DoWhile { condition, body_stmts } => {
+            condition_int_expr_scratch_count(condition).max(statements_int_expr_scratch_count(body_stmts))
+        }
+        DslStmt::For {
+            init_stmts,
+            condition,
+            update_stmts,
+            body_stmts,
+        } => statements_int_expr_scratch_count(init_stmts)
+            .max(condition.as_ref().map(condition_int_expr_scratch_count).unwrap_or(0))
+            .max(statements_int_expr_scratch_count(update_stmts))
+            .max(statements_int_expr_scratch_count(body_stmts)),
+        DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => 0,
         DslStmt::ReturnValue { value } => value.as_ref().map(value_int_expr_scratch_count).unwrap_or(0),
         DslStmt::Throw { value } => value_int_expr_scratch_count(value),
     }
@@ -2131,6 +2660,7 @@ fn value_int_expr_scratch_count(value: &DslValue) -> u16 {
             left_count.max(right_count)
         }
         DslValue::UnaryOp { value, .. } => value_int_expr_scratch_count(value),
+        DslValue::OrigCall(args) => orig_args_int_expr_scratch_count(args),
         DslValue::NewObject { args, .. } => values_int_expr_scratch_count(args),
         DslValue::Call(stmt) => stmt
             .receiver
@@ -2260,12 +2790,39 @@ fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_s
                     try_stmts, catch_stmts, ..
                 } => statements_max_invoke_words(try_stmts, target_params, is_static)?
                     .max(statements_max_invoke_words(catch_stmts, target_params, is_static)?),
+                DslStmt::While { condition, body_stmts } | DslStmt::DoWhile { condition, body_stmts } => {
+                    condition_max_invoke_words(condition)?.max(statements_max_invoke_words(
+                        body_stmts,
+                        target_params,
+                        is_static,
+                    )?)
+                }
+                DslStmt::For {
+                    init_stmts,
+                    condition,
+                    update_stmts,
+                    body_stmts,
+                } => statements_max_invoke_words(init_stmts, target_params, is_static)?
+                    .max(
+                        condition
+                            .as_ref()
+                            .map(condition_max_invoke_words)
+                            .transpose()?
+                            .unwrap_or(0),
+                    )
+                    .max(statements_max_invoke_words(update_stmts, target_params, is_static)?)
+                    .max(statements_max_invoke_words(body_stmts, target_params, is_static)?),
                 DslStmt::Cast { value, .. } => value_max_invoke_words(value)?,
                 DslStmt::ArrayLength { array } => value_max_invoke_words(array)?,
                 DslStmt::ArrayGet { array, index, .. } => {
                     value_max_invoke_words(array)?.max(value_max_invoke_words(index)?)
                 }
                 DslStmt::ArrayPut {
+                    array, index, value, ..
+                } => value_max_invoke_words(array)?
+                    .max(value_max_invoke_words(index)?)
+                    .max(value_max_invoke_words(value)?),
+                DslStmt::ArrayUpdate {
                     array, index, value, ..
                 } => value_max_invoke_words(array)?
                     .max(value_max_invoke_words(index)?)
@@ -2277,6 +2834,14 @@ fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_s
                     .map(value_max_invoke_words)
                     .transpose()?
                     .unwrap_or(0),
+                DslStmt::FieldUpdate { stmt, value, .. } => stmt
+                    .receiver
+                    .as_deref()
+                    .map(value_max_invoke_words)
+                    .transpose()?
+                    .unwrap_or(0)
+                    .max(value_max_invoke_words(value)?),
+                DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => 0,
                 DslStmt::ReturnOrig { args } => orig_args_max_invoke_words(args, target_params, is_static)?,
                 DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_words).transpose()?.unwrap_or(0),
                 DslStmt::Throw { value } => value_max_invoke_words(value)?,
@@ -2314,6 +2879,7 @@ fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
             }
             Ok(words)
         }
+        DslValue::OrigCall(args) => orig_value_max_invoke_words(args),
         DslValue::ArrayLength(value) => value_max_invoke_words(value),
         DslValue::IntBinOp { left, right, .. } => Ok(value_max_invoke_words(left)?.max(value_max_invoke_words(right)?)),
         DslValue::UnaryOp { value, .. } => value_max_invoke_words(value),
@@ -2386,6 +2952,22 @@ fn orig_args_max_invoke_words(args: &DslOrigArgs, target_params: &[String], is_s
     Ok(words)
 }
 
+fn orig_value_max_invoke_words(args: &DslOrigArgs) -> Result<u16, String> {
+    let DslOrigArgs::Values(values) = args else {
+        return Ok(0);
+    };
+    let word_count = values
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| "too many orig argument words".to_string())?;
+    let mut words = u16::try_from(word_count).map_err(|_| "too many orig argument words".to_string())?;
+    for value in values {
+        words = words.max(value_max_invoke_words(value)?);
+    }
+    Ok(words)
+}
+
 pub(super) fn program_uses_orig(program: &DslProgram) -> bool {
     statements_use_orig(&program.stmts)
 }
@@ -2398,22 +2980,61 @@ fn stmt_uses_orig(stmt: &DslStmt) -> bool {
     match stmt {
         DslStmt::Block(stmts) => statements_use_orig(stmts),
         DslStmt::ReturnOrig { .. } | DslStmt::LetOrig { .. } => true,
+        DslStmt::Let { value, .. }
+        | DslStmt::Assign { value, .. }
+        | DslStmt::NewArray { size: value, .. }
+        | DslStmt::Cast { value, .. }
+        | DslStmt::ArrayLength { array: value }
+        | DslStmt::Throw { value } => value_uses_orig(value),
+        DslStmt::New { args, .. } => args.iter().any(value_uses_orig),
+        DslStmt::Call(stmt) => call_stmt_uses_orig(stmt),
+        DslStmt::ArrayGet { array, index, .. } => value_uses_orig(array) || value_uses_orig(index),
+        DslStmt::ArrayPut {
+            array, index, value, ..
+        } => value_uses_orig(array) || value_uses_orig(index) || value_uses_orig(value),
+        DslStmt::ArrayUpdate {
+            array, index, value, ..
+        } => value_uses_orig(array) || value_uses_orig(index) || value_uses_orig(value),
+        DslStmt::FieldRead { stmt, .. } => field_stmt_uses_orig(stmt),
+        DslStmt::FieldWrite { stmt, .. } => field_stmt_uses_orig(stmt),
+        DslStmt::FieldUpdate { stmt, value, .. } => field_stmt_uses_orig(stmt) || value_uses_orig(value),
         DslStmt::IfNull {
-            then_stmts, else_stmts, ..
+            value,
+            then_stmts,
+            else_stmts,
+            ..
         }
         | DslStmt::IfBool {
-            then_stmts, else_stmts, ..
-        }
-        | DslStmt::IfCmp {
-            then_stmts, else_stmts, ..
+            value,
+            then_stmts,
+            else_stmts,
+            ..
         }
         | DslStmt::IfInstanceOf {
-            then_stmts, else_stmts, ..
-        } => statements_use_orig(then_stmts) || statements_use_orig(else_stmts),
-        DslStmt::Switch {
-            cases, default_stmts, ..
+            value,
+            then_stmts,
+            else_stmts,
+            ..
+        } => value_uses_orig(value) || statements_use_orig(then_stmts) || statements_use_orig(else_stmts),
+        DslStmt::IfCmp {
+            left,
+            right,
+            then_stmts,
+            else_stmts,
+            ..
         } => {
-            cases.iter().any(|(_, stmts)| statements_use_orig(stmts))
+            value_uses_orig(left)
+                || value_uses_orig(right)
+                || statements_use_orig(then_stmts)
+                || statements_use_orig(else_stmts)
+        }
+        DslStmt::Switch {
+            value,
+            cases,
+            default_stmts,
+        } => {
+            value_uses_orig(value)
+                || cases.iter().any(|(_, stmts)| statements_use_orig(stmts))
                 || default_stmts
                     .as_ref()
                     .map(|stmts| statements_use_orig(stmts))
@@ -2422,220 +3043,66 @@ fn stmt_uses_orig(stmt: &DslStmt) -> bool {
         DslStmt::TryCatch {
             try_stmts, catch_stmts, ..
         } => statements_use_orig(try_stmts) || statements_use_orig(catch_stmts),
-        _ => false,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ReturnFlow {
-    falls_through: bool,
-    has_non_orig_return: bool,
-}
-
-fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
-    let mut has_non_orig_return = false;
-    for stmt in stmts {
-        let stmt_flow = match stmt {
-            DslStmt::Block(stmts) => analyze_return_flow(stmts),
-            DslStmt::ReturnOrig { .. } => ReturnFlow {
-                falls_through: false,
-                has_non_orig_return: false,
-            },
-            DslStmt::ReturnValue { .. } => ReturnFlow {
-                falls_through: false,
-                has_non_orig_return: true,
-            },
-            DslStmt::Throw { .. } => ReturnFlow {
-                falls_through: false,
-                has_non_orig_return: false,
-            },
-            DslStmt::IfNull {
-                then_stmts, else_stmts, ..
-            }
-            | DslStmt::IfBool {
-                then_stmts, else_stmts, ..
-            }
-            | DslStmt::IfCmp {
-                then_stmts, else_stmts, ..
-            }
-            | DslStmt::IfInstanceOf {
-                then_stmts, else_stmts, ..
-            } => {
-                let then_flow = analyze_return_flow(then_stmts);
-                let else_flow = analyze_return_flow(else_stmts);
-                ReturnFlow {
-                    falls_through: then_flow.falls_through || else_flow.falls_through,
-                    has_non_orig_return: then_flow.has_non_orig_return || else_flow.has_non_orig_return,
-                }
-            }
-            DslStmt::Switch {
-                cases, default_stmts, ..
-            } => {
-                let mut falls_through = default_stmts.is_none();
-                let mut has_non_orig_return = false;
-                for (_, stmts) in cases {
-                    let flow = analyze_return_flow(stmts);
-                    falls_through |= flow.falls_through;
-                    has_non_orig_return |= flow.has_non_orig_return;
-                }
-                if let Some(stmts) = default_stmts {
-                    let flow = analyze_return_flow(stmts);
-                    falls_through |= flow.falls_through;
-                    has_non_orig_return |= flow.has_non_orig_return;
-                }
-                ReturnFlow {
-                    falls_through,
-                    has_non_orig_return,
-                }
-            }
-            DslStmt::TryCatch {
-                try_stmts, catch_stmts, ..
-            } => {
-                let try_flow = analyze_return_flow(try_stmts);
-                let catch_flow = analyze_return_flow(catch_stmts);
-                ReturnFlow {
-                    falls_through: try_flow.falls_through || catch_flow.falls_through,
-                    has_non_orig_return: try_flow.has_non_orig_return,
-                }
-            }
-            _ => ReturnFlow {
-                falls_through: true,
-                has_non_orig_return: false,
-            },
-        };
-        has_non_orig_return |= stmt_flow.has_non_orig_return;
-        if !stmt_flow.falls_through {
-            return ReturnFlow {
-                falls_through: false,
-                has_non_orig_return,
-            };
+        DslStmt::While { condition, body_stmts } | DslStmt::DoWhile { condition, body_stmts } => {
+            condition_uses_orig(condition) || statements_use_orig(body_stmts)
         }
-    }
-    ReturnFlow {
-        falls_through: true,
-        has_non_orig_return,
-    }
-}
-
-pub(super) fn validate_orig_bypass_flow(program: &DslProgram) -> Result<(), String> {
-    if program_uses_orig_value(program)? {
-        return validate_orig_value_flow(program);
-    }
-    let flow = analyze_return_flow(&program.stmts);
-    if flow.has_non_orig_return || flow.falls_through {
-        return Err(
-            "managed DSL uses orig(); every return path must end with return orig() or return orig(...) for high-frequency backup-orig routing"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
-    fn visit(stmts: &[DslStmt], nested: bool, count: &mut usize) -> Result<(), String> {
-        for stmt in stmts {
-            match stmt {
-                DslStmt::Block(stmts) => visit(stmts, nested, count)?,
-                DslStmt::LetOrig { .. } => {
-                    if nested {
-                        return Err("let x = orig(...) is only supported at top level".to_string());
-                    }
-                    *count += 1;
-                }
-                DslStmt::IfNull {
-                    then_stmts, else_stmts, ..
-                }
-                | DslStmt::IfBool {
-                    then_stmts, else_stmts, ..
-                }
-                | DslStmt::IfCmp {
-                    then_stmts, else_stmts, ..
-                }
-                | DslStmt::IfInstanceOf {
-                    then_stmts, else_stmts, ..
-                } => {
-                    visit(then_stmts, true, count)?;
-                    visit(else_stmts, true, count)?;
-                }
-                DslStmt::Switch {
-                    cases, default_stmts, ..
-                } => {
-                    for (_, stmts) in cases {
-                        visit(stmts, true, count)?;
-                    }
-                    if let Some(stmts) = default_stmts {
-                        visit(stmts, true, count)?;
-                    }
-                }
-                DslStmt::TryCatch {
-                    try_stmts, catch_stmts, ..
-                } => {
-                    visit(try_stmts, true, count)?;
-                    visit(catch_stmts, true, count)?;
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    let mut count = 0usize;
-    visit(&program.stmts, false, &mut count)?;
-    if count > 1 {
-        return Err("managed DSL supports at most one let x = orig(...)".to_string());
-    }
-    Ok(count == 1)
-}
-
-fn statements_contain_return_orig(stmts: &[DslStmt]) -> bool {
-    stmts.iter().any(|stmt| match stmt {
-        DslStmt::Block(stmts) => statements_contain_return_orig(stmts),
-        DslStmt::ReturnOrig { .. } => true,
-        DslStmt::IfNull {
-            then_stmts, else_stmts, ..
-        }
-        | DslStmt::IfBool {
-            then_stmts, else_stmts, ..
-        }
-        | DslStmt::IfCmp {
-            then_stmts, else_stmts, ..
-        }
-        | DslStmt::IfInstanceOf {
-            then_stmts, else_stmts, ..
-        } => statements_contain_return_orig(then_stmts) || statements_contain_return_orig(else_stmts),
-        DslStmt::Switch {
-            cases, default_stmts, ..
+        DslStmt::For {
+            init_stmts,
+            condition,
+            update_stmts,
+            body_stmts,
         } => {
-            cases.iter().any(|(_, stmts)| statements_contain_return_orig(stmts))
-                || default_stmts
-                    .as_ref()
-                    .map(|stmts| statements_contain_return_orig(stmts))
-                    .unwrap_or(false)
+            statements_use_orig(init_stmts)
+                || condition.as_ref().map(condition_uses_orig).unwrap_or(false)
+                || statements_use_orig(update_stmts)
+                || statements_use_orig(body_stmts)
         }
-        DslStmt::TryCatch {
-            try_stmts, catch_stmts, ..
-        } => statements_contain_return_orig(try_stmts) || statements_contain_return_orig(catch_stmts),
-        _ => false,
-    })
+        DslStmt::Break | DslStmt::Continue | DslStmt::Count { .. } => false,
+        DslStmt::ReturnValue { value } => value.as_ref().map(value_uses_orig).unwrap_or(false),
+    }
 }
 
-fn validate_orig_value_flow(program: &DslProgram) -> Result<(), String> {
-    let orig_pos = program
-        .stmts
-        .iter()
-        .position(|stmt| matches!(stmt, DslStmt::LetOrig { .. }))
-        .ok_or_else(|| "internal error: missing let x = orig(...)".to_string())?;
-    if statements_contain_return_orig(&program.stmts) {
-        return Err("let x = orig(...) cannot be mixed with return orig(...)".to_string());
+fn field_stmt_uses_orig(stmt: &DslFieldStmt) -> bool {
+    stmt.receiver.as_deref().map(value_uses_orig).unwrap_or(false)
+        || stmt.value.as_ref().map(value_uses_orig).unwrap_or(false)
+}
+
+fn call_stmt_uses_orig(stmt: &DslCallStmt) -> bool {
+    stmt.receiver.as_deref().map(value_uses_orig).unwrap_or(false) || stmt.args.iter().any(value_uses_orig)
+}
+
+fn value_uses_orig(value: &DslValue) -> bool {
+    match value {
+        DslValue::OrigCall(_) => true,
+        DslValue::UnaryOp { value, .. } | DslValue::Cast { value, .. } | DslValue::ArrayLength(value) => {
+            value_uses_orig(value)
+        }
+        DslValue::IntBinOp { left, right, .. } => value_uses_orig(left) || value_uses_orig(right),
+        DslValue::Ternary {
+            condition,
+            then_value,
+            else_value,
+        } => condition_uses_orig(condition) || value_uses_orig(then_value) || value_uses_orig(else_value),
+        DslValue::Call(stmt) => call_stmt_uses_orig(stmt),
+        DslValue::NewObject { args, .. } => args.iter().any(value_uses_orig),
+        DslValue::FieldGet { stmt, .. } => field_stmt_uses_orig(stmt),
+        DslValue::ArrayGet { array, index, .. } => value_uses_orig(array) || value_uses_orig(index),
+        DslValue::Target(_) | DslValue::String(_) | DslValue::Int(_) | DslValue::Bool(_) | DslValue::Null => false,
     }
-    if orig_pos != 0 {
-        return Err("let x = orig(...) must be the first top-level statement".to_string());
+}
+
+fn condition_uses_orig(condition: &DslCondition) -> bool {
+    match condition {
+        DslCondition::Const(_) => false,
+        DslCondition::Null { value, .. } | DslCondition::Bool { value } | DslCondition::InstanceOf { value, .. } => {
+            value_uses_orig(value)
+        }
+        DslCondition::Cmp { left, right, .. } => value_uses_orig(left) || value_uses_orig(right),
+        DslCondition::And(left, right) | DslCondition::Or(left, right) => {
+            condition_uses_orig(left) || condition_uses_orig(right)
+        }
+        DslCondition::Not(condition) => condition_uses_orig(condition),
     }
-    let flow = analyze_return_flow(&program.stmts[orig_pos + 1..]);
-    if flow.falls_through {
-        return Err("managed DSL using let x = orig(...) must return on every path after orig(...)".to_string());
-    }
-    Ok(())
 }
 
 pub(super) fn collect_local_slots(
@@ -2671,6 +3138,13 @@ pub(super) struct EmitContext<'a> {
     pub(super) target_is_interface: bool,
     pub(super) return_type: &'a str,
     pub(super) sink: &'a FieldRef,
+    pub(super) loop_stack: Vec<LoopLabels>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LoopLabels {
+    break_label: DexLabel,
+    continue_label: DexLabel,
 }
 
 fn emit_orig_invoke(ir: &mut DexIrBuilder, args: &DslOrigArgs, emit_ctx: &mut EmitContext<'_>) -> Result<(), String> {
@@ -2727,6 +3201,69 @@ fn emit_orig_invoke(ir: &mut DexIrBuilder, args: &DslOrigArgs, emit_ctx: &mut Em
         }
     }
     Ok(())
+}
+
+fn emit_orig_value(
+    ir: &mut DexIrBuilder,
+    args: &DslOrigArgs,
+    expected_type: &str,
+    dst: u8,
+    layout: &HelperParamLayout,
+    dsl_ctx: &mut DslBuildContext,
+) -> Result<u8, String> {
+    let Some(orig_ctx) = dsl_ctx.orig_emit.clone() else {
+        return Err("orig() is not available in this helper".to_string());
+    };
+    if orig_ctx.return_type == "V" {
+        return Err("void orig() cannot be used as a value".to_string());
+    }
+    if !value_descriptor_assignable_to(&orig_ctx.return_type, expected_type) {
+        return Err(format!(
+            "orig() return type {} cannot be passed as {}",
+            orig_ctx.return_type, expected_type
+        ));
+    }
+    match args {
+        DslOrigArgs::Original => {
+            ir.invoke_static_range(
+                orig_ctx.local_count,
+                orig_ctx.ins_size as u8,
+                orig_ctx.orig_backup.clone(),
+            );
+        }
+        DslOrigArgs::Values(values) => {
+            if values.len() != layout.arg_descriptors.len() {
+                return Err(format!(
+                    "orig(...) expects {} argument(s), got {}",
+                    layout.arg_descriptors.len(),
+                    values.len()
+                ));
+            }
+            let (receiver, params) = if orig_ctx.is_static {
+                (None, layout.arg_descriptors.clone())
+            } else {
+                let this_desc = layout
+                    .this_descriptor
+                    .as_deref()
+                    .ok_or_else(|| "missing this descriptor for orig(...)".to_string())?;
+                let this_reg = layout
+                    .this_reg
+                    .ok_or_else(|| "missing this register for orig(...)".to_string())?;
+                (Some((this_reg, this_desc)), layout.arg_descriptors.clone())
+            };
+            emit_invoke_with_values(
+                ir,
+                ManagedInvokeKind::Static,
+                orig_ctx.orig_backup.clone(),
+                receiver,
+                &params,
+                values,
+                layout,
+                dsl_ctx,
+            )?;
+        }
+    }
+    emit_move_result_value(ir, &orig_ctx.return_type, dst)
 }
 
 fn emit_return_orig(ir: &mut DexIrBuilder, args: &DslOrigArgs, emit_ctx: &mut EmitContext<'_>) -> Result<(), String> {
@@ -2858,6 +3395,13 @@ fn emit_try_catch(
     Ok(try_returns && catch_returns)
 }
 
+fn emit_count(ir: &mut DexIrBuilder, name: &str, dsl_ctx: &mut DslBuildContext) {
+    let field = dsl_ctx.counter_field(name);
+    ir.sget(REG_TMP0, field.clone(), ValueKind::Narrow);
+    ir.int_binop_lit8(DexIntLit8Op::Add, REG_TMP0, REG_TMP0, 1);
+    ir.sput(REG_TMP0, field, ValueKind::Narrow);
+}
+
 fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitContext<'_>) -> Result<bool, String> {
     match stmt {
         DslStmt::Block(stmts) => emit_statements(ir, stmts, emit_ctx),
@@ -2948,12 +3492,40 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             )?;
             Ok(false)
         }
+        DslStmt::ArrayUpdate {
+            array,
+            index,
+            type_name,
+            op,
+            value,
+        } => {
+            emit_array_update(
+                ir,
+                array,
+                index,
+                type_name.as_deref(),
+                *op,
+                value,
+                emit_ctx.layout,
+                emit_ctx.dsl_ctx,
+            )?;
+            Ok(false)
+        }
         DslStmt::FieldRead { stmt, is_static } => {
             emit_field_read(ir, stmt, emit_ctx.layout, *is_static, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
         DslStmt::FieldWrite { stmt, is_static } => {
             emit_field_write(ir, stmt, emit_ctx.layout, *is_static, emit_ctx.dsl_ctx)?;
+            Ok(false)
+        }
+        DslStmt::FieldUpdate {
+            stmt,
+            is_static,
+            op,
+            value,
+        } => {
+            emit_field_update(ir, stmt, *is_static, *op, value, emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
         }
         DslStmt::IfNull {
@@ -2985,12 +3557,40 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             cases,
             default_stmts,
         } => emit_switch(ir, value, cases, default_stmts.as_deref(), emit_ctx),
+        DslStmt::While { condition, body_stmts } => emit_while(ir, condition, body_stmts, emit_ctx),
+        DslStmt::DoWhile { body_stmts, condition } => emit_do_while(ir, body_stmts, condition, emit_ctx),
+        DslStmt::For {
+            init_stmts,
+            condition,
+            update_stmts,
+            body_stmts,
+        } => emit_for(ir, init_stmts, condition.as_ref(), update_stmts, body_stmts, emit_ctx),
         DslStmt::TryCatch {
             try_stmts,
             catch_type,
             catch_name,
             catch_stmts,
         } => emit_try_catch(ir, try_stmts, catch_type, catch_name, catch_stmts, emit_ctx),
+        DslStmt::Break => {
+            let labels = *emit_ctx
+                .loop_stack
+                .last()
+                .ok_or_else(|| "break can only be used inside while".to_string())?;
+            ir.goto16(labels.break_label);
+            Ok(true)
+        }
+        DslStmt::Continue => {
+            let labels = *emit_ctx
+                .loop_stack
+                .last()
+                .ok_or_else(|| "continue can only be used inside while".to_string())?;
+            ir.goto16(labels.continue_label);
+            Ok(true)
+        }
+        DslStmt::Count { name } => {
+            emit_count(ir, name, emit_ctx.dsl_ctx);
+            Ok(false)
+        }
         DslStmt::ReturnOrig { args } => {
             emit_return_orig(ir, args, emit_ctx)?;
             Ok(true)

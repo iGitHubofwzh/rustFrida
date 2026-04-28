@@ -6,8 +6,8 @@ use super::dsl::{
 };
 use super::{
     array_component_descriptor, common_value_descriptor_with_env, java_class_to_descriptor,
-    java_class_to_descriptor_or_primitive, parse_method_signature, resolve_call_proto_with_arg_types,
-    resolve_field_with_env, return_is_object,
+    java_class_to_descriptor_or_primitive, object_assignability_score, parse_method_signature,
+    resolve_call_proto_with_arg_types, resolve_field_with_env, return_is_object,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -20,6 +20,7 @@ struct DslSemanticContext {
     target_narrow_types: BTreeMap<DslTargetKey, Option<String>>,
     last_descriptor: Option<String>,
     result_descriptor: Option<String>,
+    loop_depth: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,6 +51,10 @@ fn dsl_target_label(target: &DslTarget) -> String {
 
 fn value_descriptor_assignable_to(src: &str, dst: &str) -> bool {
     src == dst || (return_is_object(src) && return_is_object(dst))
+}
+
+fn value_descriptor_assignable_to_strict(env: JniEnv, src: &str, dst: &str) -> bool {
+    src == dst || object_assignability_score(env, src, dst).is_some()
 }
 
 fn nonnull_key_for_value(value: &DslValue) -> Option<DslTargetKey> {
@@ -117,6 +122,7 @@ impl DslSemanticContext {
             target_narrow_types: BTreeMap::new(),
             last_descriptor: None,
             result_descriptor: None,
+            loop_depth: 0,
         }
     }
 
@@ -220,6 +226,13 @@ impl DslSemanticContext {
             }
             DslValue::Bool(_) => Ok(Some("Z".to_string())),
             DslValue::Null => Ok(None),
+            DslValue::OrigCall(_) => {
+                if self.target_return_type == "V" {
+                    Ok(None)
+                } else {
+                    Ok(Some(self.target_return_type.clone()))
+                }
+            }
             DslValue::Call(stmt) => {
                 let class_type = self.resolve_member_class_type(
                     stmt.class_name.as_deref(),
@@ -348,6 +361,12 @@ impl DslSemanticContext {
                 if self.infer_value_descriptor(array)?.is_none() {
                     return Err("array element type cannot be inferred; use arr[index: Type]".to_string());
                 }
+            }
+            DslValue::OrigCall(args) => {
+                if self.target_return_type == "V" {
+                    return Err("void orig() cannot be used as a value".to_string());
+                }
+                self.validate_orig_args(args)?;
             }
             DslValue::NewObject {
                 class_name,
@@ -538,8 +557,22 @@ impl DslSemanticContext {
                 values.len()
             ));
         }
-        for value in values {
+        let expected_descriptors = self.arg_descriptors.clone();
+        for (index, (value, expected_desc)) in values.iter().zip(&expected_descriptors).enumerate() {
             self.validate_value(value)?;
+            if let Some(value_desc) = self.infer_value_descriptor(value)? {
+                if !value_descriptor_assignable_to_strict(self.env, &value_desc, expected_desc) {
+                    return Err(format!(
+                        "orig(arg{}) type mismatch: cannot pass {} as {}",
+                        index, value_desc, expected_desc
+                    ));
+                }
+            } else if !return_is_object(expected_desc) {
+                return Err(format!(
+                    "orig(arg{}) type mismatch: cannot pass null/void as {}",
+                    index, expected_desc
+                ));
+            }
         }
         Ok(())
     }
@@ -718,6 +751,34 @@ impl DslSemanticContext {
                     java_class_to_descriptor_or_primitive(type_name)?;
                 }
             }
+            DslStmt::ArrayUpdate {
+                array,
+                index,
+                type_name,
+                value,
+                ..
+            } => {
+                self.validate_value(array)?;
+                self.validate_value(index)?;
+                self.validate_value(value)?;
+                let component = if let Some(type_name) = type_name {
+                    java_class_to_descriptor_or_primitive(type_name)?
+                } else {
+                    let array_desc = self
+                        .infer_value_descriptor(array)?
+                        .ok_or_else(|| "array element type cannot be inferred; use arr[index: int]".to_string())?;
+                    array_component_descriptor(&array_desc)?
+                };
+                if component != "I" {
+                    return Err(format!(
+                        "array compound assignment requires int element, got {}",
+                        component
+                    ));
+                }
+                if self.infer_value_descriptor(value)?.as_deref() != Some("I") {
+                    return Err("array compound assignment rhs must be int".to_string());
+                }
+            }
             DslStmt::FieldRead { stmt, is_static } => {
                 self.validate_field(stmt, *is_static)?;
                 let descriptor = self.resolve_field_descriptor(stmt, *is_static)?;
@@ -725,6 +786,25 @@ impl DslSemanticContext {
             }
             DslStmt::FieldWrite { stmt, is_static } => {
                 self.validate_field(stmt, *is_static)?;
+            }
+            DslStmt::FieldUpdate {
+                stmt, is_static, value, ..
+            } => {
+                self.validate_field(stmt, *is_static)?;
+                self.validate_value(value)?;
+                let descriptor = self.resolve_field_descriptor(stmt, *is_static)?;
+                if descriptor != "I" {
+                    return Err(format!(
+                        "field '{}' compound assignment requires int field, got {}",
+                        stmt.field_name, descriptor
+                    ));
+                }
+                if self.infer_value_descriptor(value)?.as_deref() != Some("I") {
+                    return Err(format!(
+                        "field '{}' compound assignment rhs must be int",
+                        stmt.field_name
+                    ));
+                }
             }
             DslStmt::IfNull {
                 value,
@@ -813,10 +893,82 @@ impl DslSemanticContext {
                 }
                 self.validate_stmts(catch_stmts)?;
             }
+            DslStmt::While { condition, body_stmts } => {
+                self.validate_condition(condition)?;
+                let facts = condition_facts_when_true(condition);
+                self.loop_depth += 1;
+                let result = self.validate_with_target_facts(&facts, |ctx| ctx.validate_stmts(body_stmts));
+                self.loop_depth -= 1;
+                result?;
+            }
+            DslStmt::DoWhile { body_stmts, condition } => {
+                self.loop_depth += 1;
+                let result = self.validate_stmts(body_stmts);
+                self.loop_depth -= 1;
+                result?;
+                self.validate_condition(condition)?;
+            }
+            DslStmt::For {
+                init_stmts,
+                condition,
+                update_stmts,
+                body_stmts,
+            } => {
+                for stmt in init_stmts {
+                    self.validate_stmt(stmt)?;
+                }
+                let facts = if let Some(condition) = condition {
+                    self.validate_condition(condition)?;
+                    condition_facts_when_true(condition)
+                } else {
+                    Vec::new()
+                };
+                self.loop_depth += 1;
+                let result = self.validate_with_target_facts(&facts, |ctx| ctx.validate_stmts(body_stmts));
+                let update_result: Result<(), String> = if result.is_ok() {
+                    for stmt in update_stmts {
+                        self.validate_stmt(stmt).map_err(|err| format!("for update: {}", err))?;
+                    }
+                    Ok(())
+                } else {
+                    Ok(())
+                };
+                self.loop_depth -= 1;
+                result?;
+                update_result?;
+            }
+            DslStmt::Break | DslStmt::Continue => {
+                if self.loop_depth == 0 {
+                    return Err("break/continue can only be used inside a loop".to_string());
+                }
+            }
+            DslStmt::Count { name } => {
+                if name.is_empty() {
+                    return Err("count() name must not be empty".to_string());
+                }
+            }
             DslStmt::ReturnOrig { args } => self.validate_orig_args(args)?,
             DslStmt::ReturnValue { value } => {
                 if let Some(value) = value {
                     self.validate_value(value)?;
+                    if let Some(value_desc) = self.infer_value_descriptor(value)? {
+                        if !value_descriptor_assignable_to_strict(self.env, &value_desc, &self.target_return_type) {
+                            return Err(format!(
+                                "return type mismatch: cannot return {} from {} method",
+                                value_desc, self.target_return_type
+                            ));
+                        }
+                    } else if !return_is_object(&self.target_return_type) && self.target_return_type != "V" {
+                        return Err(format!(
+                            "return type mismatch: cannot return null/void from {} method",
+                            self.target_return_type
+                        ));
+                    }
+                } else if self.target_return_type != "V" {
+                    return Err(format!(
+                        "return type mismatch: non-void method {} requires a value",
+                        self.target_return_type
+                    ));
                 }
             }
             DslStmt::Throw { value } => {

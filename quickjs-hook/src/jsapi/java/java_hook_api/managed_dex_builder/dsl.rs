@@ -49,6 +49,13 @@ pub(super) enum DslStmt {
         type_name: Option<String>,
         value: DslValue,
     },
+    ArrayUpdate {
+        array: DslValue,
+        index: DslValue,
+        type_name: Option<String>,
+        op: DslIntBinOp,
+        value: DslValue,
+    },
     FieldRead {
         stmt: DslFieldStmt,
         is_static: bool,
@@ -56,6 +63,12 @@ pub(super) enum DslStmt {
     FieldWrite {
         stmt: DslFieldStmt,
         is_static: bool,
+    },
+    FieldUpdate {
+        stmt: DslFieldStmt,
+        is_static: bool,
+        op: DslIntBinOp,
+        value: DslValue,
     },
     IfNull {
         value: DslValue,
@@ -91,6 +104,25 @@ pub(super) enum DslStmt {
         catch_type: String,
         catch_name: String,
         catch_stmts: Vec<DslStmt>,
+    },
+    While {
+        condition: DslCondition,
+        body_stmts: Vec<DslStmt>,
+    },
+    DoWhile {
+        body_stmts: Vec<DslStmt>,
+        condition: DslCondition,
+    },
+    For {
+        init_stmts: Vec<DslStmt>,
+        condition: Option<DslCondition>,
+        update_stmts: Vec<DslStmt>,
+        body_stmts: Vec<DslStmt>,
+    },
+    Break,
+    Continue,
+    Count {
+        name: String,
     },
     Throw {
         value: DslValue,
@@ -178,6 +210,7 @@ pub(super) enum DslValue {
         then_value: Box<DslValue>,
         else_value: Box<DslValue>,
     },
+    OrigCall(DslOrigArgs),
     Call(DslCallStmt),
     NewObject {
         class_name: String,
@@ -326,6 +359,14 @@ fn fold_ternary(condition: DslCondition, then_value: DslValue, else_value: DslVa
     }
 }
 
+fn single_or_block(mut stmts: Vec<DslStmt>) -> DslStmt {
+    if stmts.len() == 1 {
+        stmts.remove(0)
+    } else {
+        DslStmt::Block(stmts)
+    }
+}
+
 impl DslValue {
     fn into_bool_condition(self) -> DslCondition {
         match self {
@@ -410,6 +451,15 @@ impl<'a> DslParser<'a> {
         self.parse_statements(true)
     }
 
+    fn parse_statement_body(&mut self) -> Result<Vec<DslStmt>, String> {
+        self.skip_ws();
+        if self.peek() == Some('{') {
+            self.parse_block()
+        } else {
+            Ok(vec![self.parse_statement()?])
+        }
+    }
+
     fn parse_statement(&mut self) -> Result<DslStmt, String> {
         self.skip_ws();
         if self.peek_ident("return") {
@@ -441,11 +491,45 @@ impl<'a> DslParser<'a> {
         if self.peek_ident("if") {
             return self.parse_js_if_statement();
         }
+        if self.peek_ident("while") {
+            return self.parse_js_while_statement();
+        }
+        if self.peek_ident("do") {
+            return self.parse_js_do_while_statement();
+        }
+        if self.peek_ident("for") {
+            return self.parse_js_for_statement();
+        }
         if self.peek_ident("switch") {
             return self.parse_js_switch_statement();
         }
         if self.peek_ident("try") {
             return self.parse_js_try_catch_statement();
+        }
+        if self.peek_ident("break") {
+            self.expect_ident("break")?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(DslStmt::Break);
+        }
+        if self.peek_ident("continue") {
+            self.expect_ident("continue")?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(DslStmt::Continue);
+        }
+        if self.peek_op("++") || self.peek_op("--") {
+            let delta = if self.peek_op("++") {
+                self.expect_op("++")?;
+                1
+            } else {
+                self.expect_op("--")?;
+                -1
+            };
+            let name = self.parse_ident()?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(self.local_increment_stmt(name, delta));
         }
 
         let name = self.parse_ident()?;
@@ -459,12 +543,41 @@ impl<'a> DslParser<'a> {
             self.expect_char(';')?;
             return Ok(stmt);
         }
+        if name == "count" && self.peek() == Some('(') {
+            self.expect_char('(')?;
+            self.skip_ws();
+            let counter_name = self.parse_string_arg()?;
+            self.skip_ws();
+            self.expect_char(')')?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(DslStmt::Count { name: counter_name });
+        }
         if self.peek() == Some('=') {
             self.expect_char('=')?;
             let value = self.parse_value_arg()?;
             self.skip_ws();
             self.expect_char(';')?;
             return Ok(DslStmt::Assign { name, value });
+        }
+        if let Some(op) = self.peek_compound_assign_op() {
+            self.consume_compound_assign_op(op)?;
+            let rhs = self.parse_value_arg()?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(self.local_compound_assign_stmt(name, op, rhs));
+        }
+        if self.peek_op("++") || self.peek_op("--") {
+            let delta = if self.peek_op("++") {
+                self.expect_op("++")?;
+                1
+            } else {
+                self.expect_op("--")?;
+                -1
+            };
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(self.local_increment_stmt(name, delta));
         }
         if self.peek() == Some('.') || self.peek() == Some('[') || self.peek_ident("as") {
             let value = self.parse_value_from_ident(name)?;
@@ -493,6 +606,25 @@ impl<'a> DslParser<'a> {
                     _ => Err(self.err("only fields and array elements can be assigned")),
                 };
             }
+            if let Some(op) = self.peek_compound_assign_op() {
+                self.consume_compound_assign_op(op)?;
+                let rhs = self.parse_value_arg()?;
+                self.skip_ws();
+                self.expect_char(';')?;
+                return self.compound_assign_value_stmt(value, op, rhs);
+            }
+            if self.peek_op("++") || self.peek_op("--") {
+                let delta = if self.peek_op("++") {
+                    self.expect_op("++")?;
+                    1
+                } else {
+                    self.expect_op("--")?;
+                    -1
+                };
+                self.skip_ws();
+                self.expect_char(';')?;
+                return self.increment_value_stmt(value, delta);
+            }
             self.expect_char(';')?;
             return value
                 .into_statement()
@@ -502,6 +634,26 @@ impl<'a> DslParser<'a> {
     }
 
     fn parse_js_let_statement(&mut self) -> Result<DslStmt, String> {
+        let stmts = self.parse_js_let_declarations_until(';')?;
+        Ok(single_or_block(stmts))
+    }
+
+    fn parse_js_let_declarations_until(&mut self, terminator: char) -> Result<Vec<DslStmt>, String> {
+        let mut stmts = Vec::new();
+        loop {
+            stmts.push(self.parse_js_let_declaration()?);
+            self.skip_ws();
+            if self.peek() == Some(',') {
+                self.expect_char(',')?;
+                continue;
+            }
+            self.expect_char(terminator)?;
+            break;
+        }
+        Ok(stmts)
+    }
+
+    fn parse_js_let_declaration(&mut self) -> Result<DslStmt, String> {
         self.skip_ws();
         let local_name = self.parse_ident()?;
         self.skip_ws();
@@ -518,7 +670,6 @@ impl<'a> DslParser<'a> {
             self.expect_ident("orig")?;
             let args = self.parse_orig_args()?;
             self.skip_ws();
-            self.expect_char(';')?;
             return Ok(DslStmt::LetOrig {
                 name: local_name,
                 type_name,
@@ -527,7 +678,6 @@ impl<'a> DslParser<'a> {
         }
         let value = self.parse_value_arg()?;
         self.skip_ws();
-        self.expect_char(';')?;
         Ok(DslStmt::Let {
             name: local_name,
             type_name,
@@ -660,7 +810,7 @@ impl<'a> DslParser<'a> {
         self.expect_char('(')?;
         let condition = self.parse_js_if_condition()?;
         self.expect_char(')')?;
-        let then_stmts = self.parse_block()?;
+        let then_stmts = self.parse_statement_body()?;
         self.skip_ws();
         let else_stmts = if self.peek_ident("else") {
             self.expect_ident("else")?;
@@ -668,12 +818,177 @@ impl<'a> DslParser<'a> {
             if self.peek_ident("if") {
                 vec![self.parse_js_if_statement()?]
             } else {
-                self.parse_block()?
+                self.parse_statement_body()?
             }
         } else {
             Vec::new()
         };
         Ok(condition.into_if_stmt(then_stmts, else_stmts))
+    }
+
+    fn parse_js_while_statement(&mut self) -> Result<DslStmt, String> {
+        self.expect_ident("while")?;
+        self.skip_ws();
+        self.expect_char('(')?;
+        let condition = self.parse_js_if_condition()?;
+        self.expect_char(')')?;
+        let body_stmts = self.parse_statement_body()?;
+        Ok(DslStmt::While { condition, body_stmts })
+    }
+
+    fn parse_js_do_while_statement(&mut self) -> Result<DslStmt, String> {
+        self.expect_ident("do")?;
+        let body_stmts = self.parse_statement_body()?;
+        self.skip_ws();
+        self.expect_ident("while")?;
+        self.skip_ws();
+        self.expect_char('(')?;
+        let condition = self.parse_js_if_condition()?;
+        self.expect_char(')')?;
+        self.skip_ws();
+        self.expect_char(';')?;
+        Ok(DslStmt::DoWhile { body_stmts, condition })
+    }
+
+    fn parse_js_for_statement(&mut self) -> Result<DslStmt, String> {
+        self.expect_ident("for")?;
+        self.skip_ws();
+        self.expect_char('(')?;
+        let init_stmts = if self.peek() == Some(';') {
+            self.expect_char(';')?;
+            Vec::new()
+        } else if self.peek_ident("let") {
+            self.expect_ident("let")?;
+            self.parse_js_let_declarations_until(';')?
+        } else {
+            self.parse_for_header_statement_list(';', false)?
+        };
+        self.skip_ws();
+        let condition = if self.peek() == Some(';') {
+            None
+        } else {
+            Some(self.parse_js_if_condition()?)
+        };
+        self.expect_char(';')?;
+        self.skip_ws();
+        let update_stmts = if self.peek() == Some(')') {
+            self.expect_char(')')?;
+            Vec::new()
+        } else {
+            self.parse_for_header_statement_list(')', false)?
+        };
+        let body_stmts = self.parse_statement_body()?;
+        Ok(DslStmt::For {
+            init_stmts,
+            condition,
+            update_stmts,
+            body_stmts,
+        })
+    }
+
+    fn parse_for_header_statement_list(&mut self, terminator: char, allow_let: bool) -> Result<Vec<DslStmt>, String> {
+        let mut stmts = Vec::new();
+        loop {
+            if self.peek_ident("let") {
+                if !allow_let {
+                    return Err(self.err("let declarations are only supported in for init"));
+                }
+                self.expect_ident("let")?;
+                stmts.extend(self.parse_js_let_declarations_until(terminator)?);
+                break;
+            }
+            stmts.push(self.parse_for_header_statement()?);
+            self.skip_ws();
+            if self.peek() == Some(',') {
+                self.expect_char(',')?;
+                continue;
+            }
+            self.expect_char(terminator)?;
+            break;
+        }
+        Ok(stmts)
+    }
+
+    fn parse_for_header_statement(&mut self) -> Result<DslStmt, String> {
+        self.skip_ws();
+        if self.peek_op("++") || self.peek_op("--") {
+            let delta = if self.peek_op("++") {
+                self.expect_op("++")?;
+                1
+            } else {
+                self.expect_op("--")?;
+                -1
+            };
+            let name = self.parse_ident()?;
+            self.skip_ws();
+            return Ok(self.local_increment_stmt(name, delta));
+        }
+        let name = self.parse_ident()?;
+        self.skip_ws();
+        let stmt = if self.peek() == Some('=') {
+            self.expect_char('=')?;
+            let value = self.parse_value_arg()?;
+            DslStmt::Assign { name, value }
+        } else if let Some(op) = self.peek_compound_assign_op() {
+            self.consume_compound_assign_op(op)?;
+            let rhs = self.parse_value_arg()?;
+            self.local_compound_assign_stmt(name, op, rhs)
+        } else if self.peek_op("++") || self.peek_op("--") {
+            let delta = if self.peek_op("++") {
+                self.expect_op("++")?;
+                1
+            } else {
+                self.expect_op("--")?;
+                -1
+            };
+            self.local_increment_stmt(name, delta)
+        } else if self.peek() == Some('.') || self.peek() == Some('[') || self.peek_ident("as") {
+            let value = self.parse_value_from_ident(name)?;
+            self.skip_ws();
+            if self.peek() == Some('=') {
+                self.expect_char('=')?;
+                let rhs = self.parse_value_arg()?;
+                match value {
+                    DslValue::FieldGet { stmt, is_static } => {
+                        let mut stmt = *stmt;
+                        stmt.value = Some(rhs);
+                        DslStmt::FieldWrite { stmt, is_static }
+                    }
+                    DslValue::ArrayGet {
+                        array,
+                        index,
+                        type_name,
+                    } => DslStmt::ArrayPut {
+                        array: *array,
+                        index: *index,
+                        type_name,
+                        value: rhs,
+                    },
+                    _ => return Err(self.err("only fields and array elements can be assigned")),
+                }
+            } else if let Some(op) = self.peek_compound_assign_op() {
+                self.consume_compound_assign_op(op)?;
+                let rhs = self.parse_value_arg()?;
+                self.compound_assign_value_stmt(value, op, rhs)?
+            } else if self.peek_op("++") || self.peek_op("--") {
+                let delta = if self.peek_op("++") {
+                    self.expect_op("++")?;
+                    1
+                } else {
+                    self.expect_op("--")?;
+                    -1
+                };
+                self.increment_value_stmt(value, delta)?
+            } else {
+                value
+                    .into_statement()
+                    .ok_or_else(|| self.err("only method calls and field reads can be used in for update"))?
+            }
+        } else {
+            return Err(self.err(&format!("unsupported for header statement '{}'", name)));
+        };
+        self.skip_ws();
+        Ok(stmt)
     }
 
     fn parse_js_switch_statement(&mut self) -> Result<DslStmt, String> {
@@ -849,10 +1164,16 @@ fn dsl_lex(input: &str) -> Result<Vec<DslToken>, String> {
             continue;
         }
         let rest = &input[pos..];
-        let op = if rest.starts_with(">>>") {
+        let op = if rest.starts_with(">>>=") {
+            Some(">>>=")
+        } else if rest.starts_with(">>>") {
             Some(">>>")
+        } else if rest.starts_with("<<=") {
+            Some("<<=")
         } else if rest.starts_with("<<") {
             Some("<<")
+        } else if rest.starts_with(">>=") {
+            Some(">>=")
         } else if rest.starts_with(">>") {
             Some(">>")
         } else if rest.starts_with("==") {
@@ -869,6 +1190,26 @@ fn dsl_lex(input: &str) -> Result<Vec<DslToken>, String> {
             Some("||")
         } else if rest.starts_with("?.") {
             Some("?.")
+        } else if rest.starts_with("++") {
+            Some("++")
+        } else if rest.starts_with("--") {
+            Some("--")
+        } else if rest.starts_with("+=") {
+            Some("+=")
+        } else if rest.starts_with("-=") {
+            Some("-=")
+        } else if rest.starts_with("*=") {
+            Some("*=")
+        } else if rest.starts_with("/=") {
+            Some("/=")
+        } else if rest.starts_with("%=") {
+            Some("%=")
+        } else if rest.starts_with("&=") {
+            Some("&=")
+        } else if rest.starts_with("|=") {
+            Some("|=")
+        } else if rest.starts_with("^=") {
+            Some("^=")
         } else {
             None
         };
@@ -1147,8 +1488,106 @@ impl<'a> DslParser<'a> {
         }
     }
 
+    fn peek_compound_assign_op(&self) -> Option<DslIntBinOp> {
+        if self.peek_op(">>>=") {
+            return Some(DslIntBinOp::Ushr);
+        }
+        if self.peek_op("<<=") {
+            return Some(DslIntBinOp::Shl);
+        }
+        if self.peek_op(">>=") {
+            return Some(DslIntBinOp::Shr);
+        }
+        if self.peek_op("+=") {
+            return Some(DslIntBinOp::Add);
+        }
+        if self.peek_op("-=") {
+            return Some(DslIntBinOp::Sub);
+        }
+        if self.peek_op("*=") {
+            return Some(DslIntBinOp::Mul);
+        }
+        if self.peek_op("/=") {
+            return Some(DslIntBinOp::Div);
+        }
+        if self.peek_op("%=") {
+            return Some(DslIntBinOp::Rem);
+        }
+        if self.peek_op("&=") {
+            return Some(DslIntBinOp::And);
+        }
+        if self.peek_op("|=") {
+            return Some(DslIntBinOp::Or);
+        }
+        if self.peek_op("^=") {
+            return Some(DslIntBinOp::Xor);
+        }
+        None
+    }
+
+    fn consume_compound_assign_op(&mut self, op: DslIntBinOp) -> Result<(), String> {
+        match op {
+            DslIntBinOp::Ushr => self.expect_op(">>>="),
+            DslIntBinOp::Shl => self.expect_op("<<="),
+            DslIntBinOp::Shr => self.expect_op(">>="),
+            DslIntBinOp::Add => self.expect_op("+="),
+            DslIntBinOp::Sub => self.expect_op("-="),
+            DslIntBinOp::Mul => self.expect_op("*="),
+            DslIntBinOp::Div => self.expect_op("/="),
+            DslIntBinOp::Rem => self.expect_op("%="),
+            DslIntBinOp::And => self.expect_op("&="),
+            DslIntBinOp::Or => self.expect_op("|="),
+            DslIntBinOp::Xor => self.expect_op("^="),
+        }
+    }
+
+    fn local_increment_stmt(&self, name: String, delta: i16) -> DslStmt {
+        let op = if delta >= 0 { DslIntBinOp::Add } else { DslIntBinOp::Sub };
+        self.local_compound_assign_stmt(name, op, DslValue::Int(delta.abs()))
+    }
+
+    fn local_compound_assign_stmt(&self, name: String, op: DslIntBinOp, rhs: DslValue) -> DslStmt {
+        let left = DslValue::Target(DslTarget::Local(name.clone()));
+        DslStmt::Assign {
+            name,
+            value: fold_int_binop(op, left, rhs),
+        }
+    }
+
+    fn increment_value_stmt(&self, value: DslValue, delta: i16) -> Result<DslStmt, String> {
+        let op = if delta >= 0 { DslIntBinOp::Add } else { DslIntBinOp::Sub };
+        self.compound_assign_value_stmt(value, op, DslValue::Int(delta.abs()))
+    }
+
+    fn compound_assign_value_stmt(&self, value: DslValue, op: DslIntBinOp, rhs: DslValue) -> Result<DslStmt, String> {
+        match value {
+            DslValue::FieldGet { stmt, is_static } => Ok(DslStmt::FieldUpdate {
+                stmt: *stmt,
+                is_static,
+                op,
+                value: rhs,
+            }),
+            DslValue::ArrayGet {
+                array,
+                index,
+                type_name,
+            } => Ok(DslStmt::ArrayUpdate {
+                array: *array,
+                index: *index,
+                type_name,
+                op,
+                value: rhs,
+            }),
+            DslValue::Target(DslTarget::Local(name)) => Ok(self.local_compound_assign_stmt(name, op, rhs)),
+            _ => Err(self.err("compound assignment supports locals, fields, and array elements")),
+        }
+    }
+
     fn parse_value_from_ident(&mut self, ident: String) -> Result<DslValue, String> {
         self.skip_ws();
+        if ident == "orig" && self.peek() == Some('(') {
+            return Ok(DslValue::OrigCall(self.parse_orig_args()?));
+        }
         let value = if self.peek() == Some('.') {
             self.parse_js_member_value(ident)?
         } else {

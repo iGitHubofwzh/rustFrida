@@ -847,6 +847,29 @@ unsafe impl Sync for JniState {}
 
 pub(super) static JNI_STATE: Mutex<Option<JniState>> = Mutex::new(None);
 
+pub(crate) struct ScopedJniEnv {
+    vm: *mut std::ffi::c_void,
+    env: JniEnv,
+    detach_on_drop: bool,
+}
+
+impl ScopedJniEnv {
+    pub(crate) fn env(&self) -> JniEnv {
+        self.env
+    }
+}
+
+impl Drop for ScopedJniEnv {
+    fn drop(&mut self) {
+        if self.detach_on_drop {
+            unsafe {
+                let _ = super::art_class::transition_current_thread_to_native_for_blocking(self.env);
+                let _ = detach_current_thread(self.vm);
+            }
+        }
+    }
+}
+
 /// 从 JNI_STATE 获取 Runtime 地址 (JavaVMExt.runtime_ at offset 8)
 pub(super) unsafe fn get_runtime_addr() -> Option<u64> {
     let vm_ptr = {
@@ -871,15 +894,18 @@ pub(super) unsafe fn get_runtime_addr() -> Option<u64> {
 /// JNIEnv is thread-local — each thread must use its own env pointer.
 /// AttachCurrentThread is idempotent (cheap if already attached).
 pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
-    // Fast path: VM already found, just attach current thread
+    let vm = get_or_init_vm()?;
+    unsafe { attach_current_thread(vm) }
+}
+
+fn get_or_init_vm() -> Result<*mut std::ffi::c_void, String> {
     {
         let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref state) = *guard {
-            return unsafe { attach_current_thread(state.vm) };
+            return Ok(state.vm);
         }
     }
 
-    // Slow path: find JavaVM first
     unsafe {
         let sym = crate::jsapi::module::libart_dlsym("JNI_GetCreatedJavaVMs");
         if sym.is_null() {
@@ -901,8 +927,50 @@ pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
             *guard = Some(JniState { vm: vm_ptr });
         }
 
-        // Attach current thread and return its env
-        attach_current_thread(vm_ptr)
+        Ok(vm_ptr)
+    }
+}
+
+pub(crate) fn scoped_jni_env() -> Result<ScopedJniEnv, String> {
+    let vm = get_or_init_vm()?;
+    unsafe {
+        if let Some(env) = get_current_thread_env(vm)? {
+            return Ok(ScopedJniEnv {
+                vm,
+                env,
+                detach_on_drop: false,
+            });
+        }
+        let env = attach_current_thread(vm)?;
+        Ok(ScopedJniEnv {
+            vm,
+            env,
+            detach_on_drop: true,
+        })
+    }
+}
+
+pub(crate) fn scoped_jni_env_detach_on_drop() -> Result<ScopedJniEnv, String> {
+    let vm = get_or_init_vm()?;
+    let env = unsafe { attach_current_thread(vm)? };
+    Ok(ScopedJniEnv {
+        vm,
+        env,
+        detach_on_drop: true,
+    })
+}
+
+unsafe fn get_current_thread_env(vm_ptr: *mut std::ffi::c_void) -> Result<Option<JniEnv>, String> {
+    let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
+    let get_env_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void, i32) -> i32 =
+        std::mem::transmute(*vm_table.add(6)); // GetEnv = index 6
+
+    let mut env_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let ret = get_env_fn(vm_ptr, &mut env_ptr, 0x00010006);
+    if ret == 0 && !env_ptr.is_null() {
+        Ok(Some(env_ptr as JniEnv))
+    } else {
+        Ok(None)
     }
 }
 
@@ -910,30 +978,36 @@ pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
 /// Idempotent — returns existing env if thread is already attached.
 unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv, String> {
     // 先试 GetEnv — 如果当前线程已 attach，直接返回（不触发 Thread::Attach）
-    let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
-    let get_env_fn: unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void, i32) -> i32 =
-        std::mem::transmute(*vm_table.add(6)); // GetEnv = index 6
-
-    let mut env_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-    let get_env_ret = get_env_fn(vm_ptr, &mut env_ptr, 0x00010006); // JNI_VERSION_1_6
-    if get_env_ret == 0 && !env_ptr.is_null() {
-        return Ok(env_ptr as JniEnv);
+    if let Some(env) = get_current_thread_env(vm_ptr)? {
+        return Ok(env);
     }
 
     // GetEnv 失败 → 需要 AttachCurrentThread
+    let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
     let attach_fn: unsafe extern "C" fn(
         *mut std::ffi::c_void,
         *mut *mut std::ffi::c_void,
         *mut std::ffi::c_void,
     ) -> i32 = std::mem::transmute(*vm_table.add(4));
 
-    env_ptr = std::ptr::null_mut();
+    let mut env_ptr = std::ptr::null_mut();
     let ret = attach_fn(vm_ptr, &mut env_ptr, std::ptr::null_mut());
     if ret != 0 || env_ptr.is_null() {
         return Err(format!("AttachCurrentThread failed (ret={})", ret));
     }
 
     Ok(env_ptr as JniEnv)
+}
+
+unsafe fn detach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<(), String> {
+    let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
+    let detach_fn: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32 = std::mem::transmute(*vm_table.add(5)); // DetachCurrentThread = index 5
+    let ret = detach_fn(vm_ptr);
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(format!("DetachCurrentThread failed (ret={})", ret))
+    }
 }
 
 /// Get a valid JNIEnv* for the current thread via AttachCurrentThread.

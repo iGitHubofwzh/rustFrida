@@ -86,12 +86,19 @@ pub(super) struct GeneratedManagedDex {
     pub orig_backup_sig: Option<String>,
     pub uses_orig: bool,
     pub string_literals: Vec<GeneratedStringLiteral>,
+    pub counters: Vec<GeneratedCounter>,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct GeneratedStringLiteral {
     pub field_name: String,
     pub value: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct GeneratedCounter {
+    pub name: String,
+    pub field_name: String,
 }
 
 mod descriptor;
@@ -354,7 +361,7 @@ fn format_inferred_arg_types(arg_types: &[Option<String>]) -> String {
 mod emitter;
 use emitter::{
     collect_local_slots, emit_statements, helper_param_layout, program_int_expr_scratch_count,
-    program_max_invoke_words, program_uses_orig, validate_orig_bypass_flow, DslBuildContext, EmitContext,
+    program_max_invoke_depth, program_max_invoke_words, program_uses_orig, DslBuildContext, EmitContext,
     BASE_LOCAL_REG_COUNT,
 };
 
@@ -369,9 +376,6 @@ pub(super) unsafe fn build_managed_dsl_dex(
 ) -> Result<GeneratedManagedDex, String> {
     let program = parse_managed_dsl(dsl)?;
     let uses_orig = program_uses_orig(&program);
-    if uses_orig {
-        validate_orig_bypass_flow(&program)?;
-    }
     let target_type = java_class_to_descriptor(target_class_name)?;
     let object_type = "Ljava/lang/Object;".to_string();
     let (target_params, return_type) = parse_method_signature(target_sig)?;
@@ -397,12 +401,20 @@ pub(super) unsafe fn build_managed_dsl_dex(
     if max_invoke_words > u8::MAX as u16 {
         return Err(format!("too many DSL invoke argument words: {}", max_invoke_words));
     }
+    let max_invoke_depth = program_max_invoke_depth(&program).max(1);
     let int_expr_scratch_count = program_int_expr_scratch_count(&program);
-    let range_scratch_base = BASE_LOCAL_REG_COUNT
+    let invoke_scratch_base = BASE_LOCAL_REG_COUNT
         .checked_add(int_expr_scratch_count)
         .ok_or_else(|| "too many dex registers".to_string())?;
-    let locals_start = range_scratch_base
-        .checked_add(max_invoke_words)
+    let invoke_frame_words = max_invoke_words.max(1);
+    let invoke_frame_span = invoke_frame_words
+        .checked_mul(2)
+        .ok_or_else(|| "too many dex registers".to_string())?;
+    let invoke_scratch_words = invoke_frame_span
+        .checked_mul(max_invoke_depth)
+        .ok_or_else(|| "too many dex registers".to_string())?;
+    let locals_start = invoke_scratch_base
+        .checked_add(invoke_scratch_words)
         .ok_or_else(|| "too many dex registers".to_string())?;
     let (local_slots, local_words) = collect_local_slots(&local_descriptors, locals_start)?;
     let local_count = locals_start
@@ -427,7 +439,9 @@ pub(super) unsafe fn build_managed_dsl_dex(
         generated_type.clone(),
         BASE_LOCAL_REG_COUNT,
         int_expr_scratch_count,
-        range_scratch_base,
+        invoke_scratch_base,
+        invoke_frame_words,
+        max_invoke_depth,
     );
     let target = MethodRef::new(
         target_type.clone(),
@@ -443,6 +457,15 @@ pub(super) unsafe fn build_managed_dsl_dex(
         return_type.clone(),
         helper_params.clone(),
     );
+    if uses_orig {
+        dsl_ctx.set_orig_emit_context(
+            is_static,
+            local_count,
+            ins_size,
+            orig_backup.clone(),
+            return_type.clone(),
+        );
+    }
     let mut ir = DexIrBuilder::new(registers_size, ins_size, outs_size);
     let layout = helper_param_layout(is_static, &target_type, &target_params, local_count, local_slots)?;
     let target_is_interface = !is_static && descriptor_is_interface(env, &target_type);
@@ -457,6 +480,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
         target_is_interface,
         return_type: &return_type,
         sink: &sink,
+        loop_stack: Vec::new(),
     };
     let saw_return = emit_statements(&mut ir, &program.stmts, &mut emit_ctx)?;
     if !saw_return {
@@ -472,6 +496,9 @@ pub(super) unsafe fn build_managed_dsl_dex(
             "Ljava/lang/String;",
             ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE,
         );
+    }
+    for counter in &dsl_ctx.counters {
+        class.static_field(&counter.field_name, "I", ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE);
     }
     class.direct_method(
         "hook",
@@ -507,6 +534,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
         orig_backup_sig: uses_orig.then_some(orig_backup_sig),
         uses_orig,
         string_literals: dsl_ctx.string_literals,
+        counters: dsl_ctx.counters,
     })
 }
 
