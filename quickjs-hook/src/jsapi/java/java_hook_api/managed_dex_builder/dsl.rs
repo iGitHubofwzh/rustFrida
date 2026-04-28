@@ -6,6 +6,7 @@ mod condition;
 mod control_flow;
 pub(super) use ast::*;
 mod cursor;
+mod declaration;
 mod lexer;
 mod member;
 use lexer::TokenKind as DslTokenKind;
