@@ -2,7 +2,7 @@
 
 `Java.managedHookDsl` compiles hook logic into a generated dex helper and routes the
 target method through the managed direct thunk. It is intended for high-frequency
-Java method hooks where JS/Lua callbacks are too expensive or unstable under app
+ Java method hooks where JS callbacks are too expensive or unstable under app
 natural traffic.
 
 ## Basic Usage
@@ -318,7 +318,7 @@ receiver type or when the code reads better with an explicit type:
 "return orig(arg0, arg1);"
 ```
 
-The cast compiles to dex `check-cast`; it does not cross the JS/Lua runtime
+The cast compiles to dex `check-cast`; it does not cross the JS runtime
 boundary.
 
 ### Returns
@@ -399,8 +399,8 @@ block:
 - Only one catch handler is currently emitted per generated method.
 - Monitor enter/exit and synchronized blocks are not part of the DSL.
 - Complex object lifetime rules should stay inside generated managed code.
-  Avoid JS/Lua callbacks on hot methods.
-- Reflection-style Java APIs from JS/Lua are not the high-frequency path. Use
+  Avoid JS callbacks on hot methods.
+- Reflection-style Java APIs from JS are not the high-frequency path. Use
   managed DSL operations that compile into dex bytecode.
 
 ## JD HashMap High-Frequency Template
