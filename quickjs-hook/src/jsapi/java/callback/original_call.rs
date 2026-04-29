@@ -129,7 +129,13 @@ unsafe fn marshal_js_to_jvalue_owned(
         }
         b'[' => {
             // 数组类型: JS array → Java primitive array (via NewXxxArray + SetXxxArrayRegion)
+            // byte[] 额外接受 ArrayBuffer / TypedArray，按原始字节拷贝。
             // Fallback: JS object with __jptr (已存在的 Java 数组) → 透传
+            if sig == "[B" {
+                if let Some(jarr) = js_byte_buffer_to_java_byte_array(ctx, env, val) {
+                    return MarshaledJValue::local(jarr);
+                }
+            }
             if ffi::JS_IsArray(ctx, val.raw()) != 0 {
                 return MarshaledJValue::local(
                     js_array_to_java_primitive_array(ctx, env, val, sig).unwrap_or(0),
@@ -209,6 +215,64 @@ unsafe fn js_array_len(ctx: *mut ffi::JSContext, arr: JSValue) -> i32 {
     let len = len_val.to_i64(ctx).unwrap_or(0);
     len_val.free(ctx);
     if len < 0 || len > i32::MAX as i64 { 0 } else { len as i32 }
+}
+
+/// ArrayBuffer / TypedArray → Java byte[].
+unsafe fn js_byte_buffer_to_java_byte_array(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    val: JSValue,
+) -> Option<u64> {
+    let mut size: usize = 0;
+    let buf_ptr = ffi::JS_GetArrayBuffer(ctx, &mut size, val.raw());
+    if !buf_ptr.is_null() {
+        return new_java_byte_array_from_bytes(env, std::slice::from_raw_parts(buf_ptr, size));
+    }
+
+    let mut byte_offset: usize = 0;
+    let mut byte_length: usize = 0;
+    let mut bpe: usize = 0;
+    let typed_ab = ffi::JS_GetTypedArrayBuffer(ctx, val.raw(), &mut byte_offset, &mut byte_length, &mut bpe);
+    if ffi::qjs_is_exception(typed_ab) != 0 {
+        let exc = ffi::JS_GetException(ctx);
+        ffi::qjs_free_value(ctx, exc);
+        return None;
+    }
+
+    let typed_ab_val = JSValue(typed_ab);
+    let mut result = None;
+    if byte_length == 0 {
+        result = new_java_byte_array_from_bytes(env, &[]);
+    } else {
+        let mut ab_size: usize = 0;
+        let ab_ptr = ffi::JS_GetArrayBuffer(ctx, &mut ab_size, typed_ab);
+        if !ab_ptr.is_null() && byte_offset + byte_length <= ab_size {
+            let bytes = std::slice::from_raw_parts(ab_ptr.add(byte_offset), byte_length);
+            result = new_java_byte_array_from_bytes(env, bytes);
+        }
+    }
+    typed_ab_val.free(ctx);
+    result
+}
+
+unsafe fn new_java_byte_array_from_bytes(env: JniEnv, bytes: &[u8]) -> Option<u64> {
+    let len = i32::try_from(bytes.len()).ok()?;
+    let new_fn: NewPrimitiveArrayFn = jni_fn!(env, NewPrimitiveArrayFn, JNI_NEW_BYTE_ARRAY);
+    let jarr = new_fn(env, len);
+    if jarr.is_null() || jni_check_exc(env) {
+        return None;
+    }
+    if len > 0 {
+        let set_fn: SetByteArrayRegionFn =
+            jni_fn!(env, SetByteArrayRegionFn, JNI_SET_BYTE_ARRAY_REGION);
+        set_fn(env, jarr, 0, len, bytes.as_ptr() as *const i8);
+        if jni_check_exc(env) {
+            let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+            delete(env, jarr);
+            return None;
+        }
+    }
+    Some(jarr as u64)
 }
 
 /// JS array → Java 原始类型数组 (`[B`/`[Z`/`[C`/`[S`/`[I`/`[J`/`[F`/`[D`)。

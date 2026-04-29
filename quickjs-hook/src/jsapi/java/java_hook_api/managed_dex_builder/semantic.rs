@@ -53,8 +53,27 @@ fn value_descriptor_assignable_to(src: &str, dst: &str) -> bool {
     src == dst || (return_is_object(src) && return_is_object(dst))
 }
 
+fn int_literal_assignable_to_descriptor(value: i16, dst: &str) -> bool {
+    match dst {
+        "B" => i8::try_from(value).is_ok(),
+        "S" | "I" => true,
+        "C" => value >= 0,
+        _ => false,
+    }
+}
+
+fn value_assignable_to_descriptor(value: &DslValue, src: &str, dst: &str) -> bool {
+    value_descriptor_assignable_to(src, dst)
+        || matches!(value, DslValue::Int(n) if int_literal_assignable_to_descriptor(*n, dst))
+}
+
 fn value_descriptor_assignable_to_strict(env: JniEnv, src: &str, dst: &str) -> bool {
     src == dst || object_assignability_score(env, src, dst).is_some()
+}
+
+fn value_assignable_to_descriptor_strict(env: JniEnv, value: &DslValue, src: &str, dst: &str) -> bool {
+    value_descriptor_assignable_to_strict(env, src, dst)
+        || matches!(value, DslValue::Int(n) if int_literal_assignable_to_descriptor(*n, dst))
 }
 
 fn descriptor_is_string(desc: Option<&str>) -> bool {
@@ -358,7 +377,7 @@ impl DslSemanticContext {
         }
         self.validate_value_inner(value, require_nonnull_receiver)?;
         if let Some(value_desc) = self.infer_value_descriptor(value)? {
-            if !value_descriptor_assignable_to(&value_desc, expected_desc) {
+            if !value_assignable_to_descriptor(value, &value_desc, expected_desc) {
                 return Err(format!(
                     "value type mismatch: cannot assign {} to {}",
                     value_desc, expected_desc
@@ -503,7 +522,7 @@ impl DslSemanticContext {
                 let component = array_component_descriptor(&array_desc)?;
                 for element in elements {
                     if let Some(element_desc) = self.infer_value_descriptor(element)? {
-                        if !value_descriptor_assignable_to(&element_desc, &component) {
+                        if !value_assignable_to_descriptor(element, &element_desc, &component) {
                             return Err(format!(
                                 "array literal element type mismatch: cannot store {} in {}",
                                 element_desc, component
@@ -687,7 +706,7 @@ impl DslSemanticContext {
         if let Some(value) = &stmt.value {
             self.validate_value_for_expected(value, &descriptor, false)?;
             if let Some(value_desc) = self.infer_value_descriptor(value)? {
-                if !value_descriptor_assignable_to(&value_desc, &descriptor) {
+                if !value_assignable_to_descriptor(value, &value_desc, &descriptor) {
                     return Err(format!(
                         "field '{}' type mismatch: cannot assign {} to {}",
                         stmt.field_name, value_desc, descriptor
@@ -718,7 +737,7 @@ impl DslSemanticContext {
         for (index, (value, expected_desc)) in values.iter().zip(&expected_descriptors).enumerate() {
             self.validate_value_for_expected(value, expected_desc, false)?;
             if let Some(value_desc) = self.infer_value_descriptor(value)? {
-                if !value_descriptor_assignable_to_strict(self.env, &value_desc, expected_desc) {
+                if !value_assignable_to_descriptor_strict(self.env, value, &value_desc, expected_desc) {
                     return Err(format!(
                         "orig(arg{}) type mismatch: cannot pass {} as {}",
                         index, value_desc, expected_desc
@@ -778,7 +797,7 @@ impl DslSemanticContext {
                     let descriptor = java_class_to_descriptor_or_primitive(type_name)?;
                     self.validate_value_for_expected(value, &descriptor, false)?;
                     if let Some(value_desc) = self.infer_value_descriptor(value)? {
-                        if !value_descriptor_assignable_to(&value_desc, &descriptor) {
+                        if !value_assignable_to_descriptor(value, &value_desc, &descriptor) {
                             return Err(format!(
                                 "local '{}' type mismatch: cannot assign {} to {}",
                                 name, value_desc, descriptor
@@ -804,7 +823,7 @@ impl DslSemanticContext {
                 };
                 self.validate_value_for_expected(value, &descriptor, false)?;
                 if let Some(value_desc) = self.infer_value_descriptor(value)? {
-                    if !value_descriptor_assignable_to(&value_desc, &descriptor) {
+                    if !value_assignable_to_descriptor(value, &value_desc, &descriptor) {
                         return Err(format!(
                             "local '{}' type mismatch: cannot assign {} to {}",
                             name, value_desc, descriptor
@@ -1114,7 +1133,12 @@ impl DslSemanticContext {
                     let expected_desc = self.target_return_type.clone();
                     self.validate_value_for_expected(value, &expected_desc, false)?;
                     if let Some(value_desc) = self.infer_value_descriptor(value)? {
-                        if !value_descriptor_assignable_to_strict(self.env, &value_desc, &self.target_return_type) {
+                        if !value_assignable_to_descriptor_strict(
+                            self.env,
+                            value,
+                            &value_desc,
+                            &self.target_return_type,
+                        ) {
                             return Err(format!(
                                 "return type mismatch: cannot return {} from {} method",
                                 value_desc, self.target_return_type

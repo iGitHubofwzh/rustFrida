@@ -1773,8 +1773,17 @@ fn emit_array_literal_element(
             Ok(REG_TMP1)
         }
         DslValue::Int(value) => {
-            if component_type != "I" {
-                return Err(format!("int literal cannot be stored in {}", component_type));
+            match component_type {
+                "B" if i8::try_from(*value).is_err() => {
+                    return Err(format!("int literal {} cannot be stored in byte", value));
+                }
+                "C" if *value < 0 => {
+                    return Err(format!("int literal {} cannot be stored in char", value));
+                }
+                "B" | "C" | "S" | "I" => {}
+                _ => {
+                    return Err(format!("int literal cannot be stored in {}", component_type));
+                }
             }
             ir.const16(REG_TMP1, *value);
             Ok(REG_TMP1)
