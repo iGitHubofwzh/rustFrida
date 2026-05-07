@@ -35,6 +35,13 @@ struct SpawnHello {
     package_name: String,
 }
 
+#[derive(Debug, Clone)]
+struct SpawnTarget {
+    package: String,
+    process_name: String,
+    request_keys: Vec<String>,
+}
+
 /// Zygote patch 信息（用于退出时还原）
 struct ZygotePatch {
     pid: u32,
@@ -107,12 +114,11 @@ impl SpawnNotifier {
     }
 }
 
-fn unregister_spawn_request(process_name: &str, package: &str, dual_key: bool) {
+fn unregister_spawn_keys(keys: &[String]) {
     if let Some(requests) = SPAWN_REQUESTS.get() {
         if let Ok(mut map) = requests.lock() {
-            map.remove(process_name);
-            if dual_key {
-                map.remove(package);
+            for key in keys {
+                map.remove(key);
             }
         }
     }
@@ -220,37 +226,36 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
     // 1. 确保 zymbiote 已加载到所有 zygote 进程
     ensure_zymbiote_loaded()?;
 
-    // 2. 解析进程名并注册 spawn 请求
-    //    同时注册 process_name 和原始 package name，因为 zymbiote hello 发送的是
-    //    setcontext 的 name 参数（= 包名），而 processName 可能不同（android:process 属性）
-    let process_name = resolve_process_name(package);
-    let dual_key = process_name != package;
-    if dual_key {
-        log_info!("进程名解析: {} -> {}（两者均注册）", package, process_name);
+    // 2. 解析启动目标并注册 spawn 请求。
+    //    --spawn com.foo 按 launcher Activity 的 android:process 精确匹配；
+    //    --spawn com.foo:remote 表示显式指定子进程，仍启动 com.foo 包。
+    let target = resolve_spawn_target(package);
+    if target.process_name != target.package {
+        log_info!("主进程解析: {} -> {}", target.package, target.process_name);
+    } else {
+        log_verbose!("主进程解析: {} 使用默认包进程", target.package);
     }
     let notifier = Arc::new(SpawnNotifier::new());
     {
         let requests = SPAWN_REQUESTS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut map = requests.lock().unwrap();
         // 检查重复 spawn 请求（与 Frida 一致：拒绝重复，防止前一个 spawn 永远收不到 hello）
-        if map.contains_key(&process_name) {
-            return Err(format!("已有一个针对 {} 的 spawn 请求正在进行中", process_name));
+        for key in &target.request_keys {
+            if map.contains_key(key) {
+                return Err(format!("已有一个针对 {} 的 spawn 请求正在进行中", key));
+            }
         }
-        if dual_key && map.contains_key(package) {
-            return Err(format!("已有一个针对 {} 的 spawn 请求正在进行中", package));
-        }
-        map.insert(process_name.clone(), notifier.clone());
-        if dual_key {
-            map.insert(package.to_string(), notifier.clone());
+        for key in &target.request_keys {
+            map.insert(key.clone(), notifier.clone());
         }
     }
 
     // 3. 强制停止并启动目标应用
-    log_info!("正在启动应用 {}...", package);
-    launch_app(package)?;
+    log_info!("正在启动应用 {}...", target.package);
+    launch_app(&target.package)?;
 
     // 4. 等待 SpawnHello（20s 超时）
-    log_info!("等待应用 {} 启动... (最长 20s)", package);
+    log_info!("等待进程 {} 启动... (最长 20s)", target.process_name);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let poll_interval = std::time::Duration::from_millis(100);
     let hello = loop {
@@ -259,8 +264,8 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
         }
 
         if signal_received() {
-            unregister_spawn_request(&process_name, package, dual_key);
-            return Err(format!("等待应用 {} 启动时收到终止信号", package));
+            unregister_spawn_keys(&target.request_keys);
+            return Err(format!("等待进程 {} 启动时收到终止信号", target.process_name));
         }
 
         let now = std::time::Instant::now();
@@ -271,11 +276,17 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
                 break late_hello;
             }
 
-            unregister_spawn_request(&process_name, package, dual_key);
+            unregister_spawn_keys(&target.request_keys);
             cleanup_orphan_spawn_connections();
+            let live_processes = list_package_processes(&target.package);
+            let live_hint = if live_processes.is_empty() {
+                "  4. 未发现目标包相关进程".to_string()
+            } else {
+                format!("  4. 当前目标包相关进程:\n{}", live_processes.join("\n"))
+            };
             return Err(format!(
-                "等待应用 {} 启动超时 (20s)，请检查:\n  1. 包名是否正确\n  2. 应用是否已安装\n  3. Zygote 是否已被正确 patch",
-                package
+                "等待进程 {} 启动超时 (20s)，请检查:\n  1. 包名是否正确\n  2. 应用是否已安装\n  3. Zygote 是否已被正确 patch\n{}",
+                target.process_name, live_hint
             ));
         };
 
@@ -285,8 +296,8 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
         }
     };
 
-    // 清理剩余的 key（handle_zymbiote_connection 已 remove 一个，清理另一个）
-    unregister_spawn_request(&process_name, package, dual_key);
+    // 清理剩余的 key（handle_zymbiote_connection 已 remove 一个，清理其它 key）
+    unregister_spawn_keys(&target.request_keys);
 
     log_success!(
         "收到 spawn hello: pid={}, ppid={}, package={}",
@@ -645,22 +656,10 @@ fn handle_zymbiote_connection(mut stream: std::os::unix::net::UnixStream) -> Res
     };
 
     // 查找匹配的 spawn 请求（匹配时立即移除，与 Frida unset 一致，防止重复消费）
-    // 先精确匹配，再前缀匹配（处理 android:process 自定义进程名，如 "pkg:suffix"）
+    // spawn 只做精确进程名匹配，避免误消费 service/isolated 等非目标进程。
     let notifier = if let Some(requests) = SPAWN_REQUESTS.get() {
         let mut map = requests.lock().unwrap();
-        if let Some(n) = map.remove(&package_name) {
-            Some(n)
-        } else {
-            // Prefix matching is only for explicit process-name requests, not for
-            // consuming a base package request with a secondary process like
-            // "com.foo.bar:service". The base package must keep waiting for the
-            // main process exact hello.
-            let prefix_key = map
-                .keys()
-                .find(|k| k.contains(':') && package_name.starts_with(k.as_str()))
-                .cloned();
-            prefix_key.and_then(|k| map.remove(&k))
-        }
+        map.remove(&package_name)
     } else {
         None
     };
@@ -831,28 +830,38 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// 读取进程的 ppid
-/// 解析应用的进程名（通过 dumpsys package）
-/// 大多数应用进程名等于包名，但使用 android:process 属性的应用除外
-fn resolve_process_name(package: &str) -> String {
-    let output = std::process::Command::new("dumpsys")
-        .args(["package", package])
-        .output();
-
-    if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if let Some(name) = trimmed.strip_prefix("processName=") {
-                let name = name.trim();
-                if !name.is_empty() {
-                    return name.to_string();
-                }
-            }
+fn resolve_spawn_target(target: &str) -> SpawnTarget {
+    if let Some((package, _suffix)) = target.split_once(':') {
+        if !package.is_empty() {
+            return SpawnTarget {
+                package: package.to_string(),
+                process_name: target.to_string(),
+                request_keys: vec![target.to_string()],
+            };
         }
     }
 
-    package.to_string()
+    let package = target.to_string();
+    let process_name = resolve_launch_process_name(&package).unwrap_or_else(|| package.clone());
+    let request_keys = vec![process_name.clone()];
+
+    SpawnTarget {
+        package,
+        process_name,
+        request_keys,
+    }
+}
+
+fn resolve_launch_process_name(package: &str) -> Option<String> {
+    let component = resolve_launch_activity(package);
+    if let Some(ref comp) = component {
+        if let Some(process) = resolve_activity_process_from_manifest(package, comp) {
+            return Some(process);
+        }
+        log_verbose!("无法从 manifest 解析 {} 的进程名，回退到包进程", comp);
+    }
+
+    resolve_application_process_from_manifest(package)
 }
 
 /// 启动应用：先 force-stop，再启动（与 Frida 分离 stop/start 一致）
@@ -956,6 +965,416 @@ fn resolve_launch_activity(package: &str) -> Option<String> {
     }
 
     None
+}
+
+fn resolve_activity_process_from_manifest(package: &str, component: &str) -> Option<String> {
+    let manifest = read_manifest_from_base_apk(package)?;
+    let manifest = BinaryManifest::parse(&manifest)?;
+    let activity_name = component_to_activity_name(package, component)?;
+    manifest.launch_activity_process(package, &activity_name)
+}
+
+fn resolve_application_process_from_manifest(package: &str) -> Option<String> {
+    let manifest = read_manifest_from_base_apk(package)?;
+    let manifest = BinaryManifest::parse(&manifest)?;
+    manifest
+        .application_process
+        .map(|p| normalize_process_name(package, &p))
+}
+
+fn read_manifest_from_base_apk(package: &str) -> Option<Vec<u8>> {
+    let output = std::process::Command::new("pm").args(["path", package]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let apk_path = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("package:"))
+        .map(str::trim)?;
+
+    let output = std::process::Command::new("unzip")
+        .args(["-p", apk_path, "AndroidManifest.xml"])
+        .output()
+        .ok()?;
+    if output.status.success() && !output.stdout.is_empty() {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
+fn component_to_activity_name(package: &str, component: &str) -> Option<String> {
+    let (_, class_name) = component.split_once('/')?;
+    Some(normalize_component_name(package, class_name))
+}
+
+fn normalize_component_name(package: &str, name: &str) -> String {
+    if name.starts_with('.') {
+        format!("{}{}", package, name)
+    } else if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{}.{}", package, name)
+    }
+}
+
+fn normalize_process_name(package: &str, process: &str) -> String {
+    if process.starts_with(':') {
+        format!("{}{}", package, process)
+    } else if process.starts_with('.') {
+        format!("{}{}", package, process)
+    } else {
+        process.to_string()
+    }
+}
+
+fn list_package_processes(package: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+
+    for entry in proc_dir.flatten() {
+        let fname = entry.file_name();
+        let fname_str = fname.to_string_lossy();
+        if !fname_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: i32 = match fname_str.parse() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        let Ok(data) = std::fs::read(cmdline_path) else {
+            continue;
+        };
+        let proc_name = data
+            .split(|&b| b == 0)
+            .next()
+            .and_then(|s| std::str::from_utf8(s).ok())
+            .unwrap_or("");
+        if proc_name == package || proc_name.starts_with(&format!("{}:", package)) {
+            out.push(format!("     PID {:6}: {}", pid, proc_name));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[derive(Debug, Clone)]
+struct BinaryManifest {
+    package_name: Option<String>,
+    application_process: Option<String>,
+    activities: HashMap<String, ManifestActivity>,
+    aliases: Vec<ManifestAlias>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ManifestActivity {
+    process: Option<String>,
+    has_main: bool,
+    has_launcher: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ManifestAlias {
+    name: String,
+    target: Option<String>,
+    has_main: bool,
+    has_launcher: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ManifestTag {
+    Activity(String),
+    Alias(usize),
+    IntentFilter,
+}
+
+impl BinaryManifest {
+    fn parse(data: &[u8]) -> Option<Self> {
+        let strings = parse_axml_strings(data)?;
+        let mut cursor = 8usize; // XML chunk header
+        let mut manifest = BinaryManifest {
+            package_name: None,
+            application_process: None,
+            activities: HashMap::new(),
+            aliases: Vec::new(),
+        };
+        let mut stack: Vec<ManifestTag> = Vec::new();
+
+        while cursor + 8 <= data.len() {
+            let chunk_type = read_u16(data, cursor)?;
+            let header_size = read_u16(data, cursor + 2)? as usize;
+            let chunk_size = read_u32(data, cursor + 4)? as usize;
+            if chunk_size < 8 || cursor + chunk_size > data.len() {
+                break;
+            }
+
+            match chunk_type {
+                0x0102 => {
+                    let name_idx = read_u32(data, cursor + 20)? as usize;
+                    let tag_name = strings.get(name_idx).cloned().unwrap_or_default();
+                    let attrs = parse_start_tag_attrs(data, cursor, &strings)?;
+
+                    match tag_name.as_str() {
+                        "manifest" => {
+                            manifest.package_name = attrs.get("package").cloned();
+                        }
+                        "application" => {
+                            manifest.application_process = attrs.get("process").cloned();
+                        }
+                        "activity" => {
+                            if let Some(name) = attrs.get("name") {
+                                let pkg = manifest.package_name.as_deref().unwrap_or("");
+                                let full_name = normalize_component_name(pkg, name);
+                                let entry = manifest.activities.entry(full_name.clone()).or_default();
+                                entry.process = attrs.get("process").cloned();
+                                stack.push(ManifestTag::Activity(full_name));
+                            }
+                        }
+                        "activity-alias" => {
+                            if let Some(name) = attrs.get("name") {
+                                let pkg = manifest.package_name.as_deref().unwrap_or("");
+                                let alias = ManifestAlias {
+                                    name: normalize_component_name(pkg, name),
+                                    target: attrs.get("targetActivity").map(|v| normalize_component_name(pkg, v)),
+                                    has_main: false,
+                                    has_launcher: false,
+                                };
+                                let idx = manifest.aliases.len();
+                                manifest.aliases.push(alias);
+                                stack.push(ManifestTag::Alias(idx));
+                            }
+                        }
+                        "intent-filter" => stack.push(ManifestTag::IntentFilter),
+                        "action" => {
+                            if attrs.get("name").map(String::as_str) == Some("android.intent.action.MAIN") {
+                                mark_current_intent(&mut manifest, &stack, true, false);
+                            }
+                        }
+                        "category" => {
+                            if attrs.get("name").map(String::as_str) == Some("android.intent.category.LAUNCHER") {
+                                mark_current_intent(&mut manifest, &stack, false, true);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                0x0103 => {
+                    let name_idx = read_u32(data, cursor + 20)? as usize;
+                    let tag_name = strings.get(name_idx).map(String::as_str).unwrap_or("");
+                    match tag_name {
+                        "activity" => pop_tag(&mut stack, |t| matches!(t, ManifestTag::Activity(_))),
+                        "activity-alias" => pop_tag(&mut stack, |t| matches!(t, ManifestTag::Alias(_))),
+                        "intent-filter" => pop_tag(&mut stack, |t| matches!(t, ManifestTag::IntentFilter)),
+                        _ => {}
+                    }
+                }
+                _ => {
+                    let _ = header_size;
+                }
+            }
+
+            cursor += chunk_size;
+        }
+
+        Some(manifest)
+    }
+
+    fn launch_activity_process(&self, package: &str, activity_name: &str) -> Option<String> {
+        if let Some(activity) = self.activities.get(activity_name) {
+            let process = activity
+                .process
+                .as_deref()
+                .or(self.application_process.as_deref())
+                .unwrap_or(package);
+            return Some(normalize_process_name(package, process));
+        }
+
+        if let Some(alias) = self.aliases.iter().find(|a| a.name == activity_name) {
+            if let Some(target) = alias.target.as_deref() {
+                if let Some(activity) = self.activities.get(target) {
+                    let process = activity
+                        .process
+                        .as_deref()
+                        .or(self.application_process.as_deref())
+                        .unwrap_or(package);
+                    return Some(normalize_process_name(package, process));
+                }
+            }
+            let process = self.application_process.as_deref().unwrap_or(package);
+            return Some(normalize_process_name(package, process));
+        }
+
+        self.activities
+            .iter()
+            .find(|(_, a)| a.has_main && a.has_launcher)
+            .map(|(_, a)| {
+                normalize_process_name(
+                    package,
+                    a.process
+                        .as_deref()
+                        .or(self.application_process.as_deref())
+                        .unwrap_or(package),
+                )
+            })
+    }
+}
+
+fn mark_current_intent(manifest: &mut BinaryManifest, stack: &[ManifestTag], main: bool, launcher: bool) {
+    if !stack.iter().any(|t| matches!(t, ManifestTag::IntentFilter)) {
+        return;
+    }
+
+    for tag in stack.iter().rev() {
+        match tag {
+            ManifestTag::Activity(name) => {
+                if let Some(activity) = manifest.activities.get_mut(name) {
+                    activity.has_main |= main;
+                    activity.has_launcher |= launcher;
+                }
+                return;
+            }
+            ManifestTag::Alias(idx) => {
+                if let Some(alias) = manifest.aliases.get_mut(*idx) {
+                    alias.has_main |= main;
+                    alias.has_launcher |= launcher;
+                }
+                return;
+            }
+            ManifestTag::IntentFilter => {}
+        }
+    }
+}
+
+fn pop_tag<F>(stack: &mut Vec<ManifestTag>, pred: F)
+where
+    F: Fn(&ManifestTag) -> bool,
+{
+    while let Some(tag) = stack.pop() {
+        if pred(&tag) {
+            break;
+        }
+    }
+}
+
+fn parse_start_tag_attrs(data: &[u8], chunk_start: usize, strings: &[String]) -> Option<HashMap<String, String>> {
+    let attr_start = read_u16(data, chunk_start + 24)? as usize;
+    let attr_size = read_u16(data, chunk_start + 26)? as usize;
+    let attr_count = read_u16(data, chunk_start + 28)? as usize;
+    let attr_base = chunk_start + 16 + attr_start;
+    let mut attrs = HashMap::new();
+
+    for i in 0..attr_count {
+        let off = attr_base + i * attr_size;
+        if off + 20 > data.len() {
+            return None;
+        }
+        let name_idx = read_u32(data, off + 4)? as usize;
+        let raw_idx = read_u32(data, off + 8)?;
+        let data_type = *data.get(off + 15)?;
+        let typed_data = read_u32(data, off + 16)?;
+
+        let name = strings.get(name_idx)?.clone();
+        let value = if raw_idx != u32::MAX {
+            strings.get(raw_idx as usize).cloned().unwrap_or_default()
+        } else if data_type == 0x03 {
+            strings.get(typed_data as usize).cloned().unwrap_or_default()
+        } else {
+            typed_data.to_string()
+        };
+        attrs.insert(name, value);
+    }
+
+    Some(attrs)
+}
+
+fn parse_axml_strings(data: &[u8]) -> Option<Vec<String>> {
+    let mut cursor = 8usize;
+    while cursor + 8 <= data.len() {
+        let chunk_type = read_u16(data, cursor)?;
+        let header_size = read_u16(data, cursor + 2)? as usize;
+        let chunk_size = read_u32(data, cursor + 4)? as usize;
+        if chunk_size < 8 || cursor + chunk_size > data.len() {
+            return None;
+        }
+        if chunk_type == 0x0001 {
+            if header_size < 28 || cursor + header_size > data.len() {
+                return None;
+            }
+            let string_count = read_u32(data, cursor + 8)? as usize;
+            let flags = read_u32(data, cursor + 16)?;
+            let strings_start = cursor + read_u32(data, cursor + 20)? as usize;
+            let utf8 = (flags & 0x0000_0100) != 0;
+            let offsets_base = cursor + header_size;
+            let mut strings = Vec::with_capacity(string_count);
+            for i in 0..string_count {
+                let off = read_u32(data, offsets_base + i * 4)? as usize;
+                strings.push(read_string_pool_entry(data, strings_start + off, utf8)?);
+            }
+            return Some(strings);
+        }
+        cursor += chunk_size;
+    }
+    None
+}
+
+fn read_string_pool_entry(data: &[u8], offset: usize, utf8: bool) -> Option<String> {
+    if utf8 {
+        let (_, pos) = read_length8(data, offset)?;
+        let (byte_len, pos) = read_length8(data, pos)?;
+        let end = pos + byte_len;
+        if end > data.len() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&data[pos..end]).to_string())
+    } else {
+        let (unit_len, pos) = read_length16(data, offset)?;
+        let byte_len = unit_len.checked_mul(2)?;
+        let end = pos + byte_len;
+        if end > data.len() {
+            return None;
+        }
+        let mut units = Vec::with_capacity(unit_len);
+        for i in 0..unit_len {
+            let b = pos + i * 2;
+            units.push(u16::from_le_bytes([data[b], data[b + 1]]));
+        }
+        String::from_utf16(&units).ok()
+    }
+}
+
+fn read_length8(data: &[u8], offset: usize) -> Option<(usize, usize)> {
+    let first = *data.get(offset)? as usize;
+    if (first & 0x80) != 0 {
+        let second = *data.get(offset + 1)? as usize;
+        Some((((first & 0x7f) << 8) | second, offset + 2))
+    } else {
+        Some((first, offset + 1))
+    }
+}
+
+fn read_length16(data: &[u8], offset: usize) -> Option<(usize, usize)> {
+    let first = read_u16(data, offset)? as usize;
+    if (first & 0x8000) != 0 {
+        let second = read_u16(data, offset + 2)? as usize;
+        Some((((first & 0x7fff) << 16) | second, offset + 4))
+    } else {
+        Some((first, offset + 2))
+    }
+}
+
+fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes: [u8; 2] = data.get(offset..offset + 2)?.try_into().ok()?;
+    Some(u16::from_le_bytes(bytes))
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
 }
 
 /// 向单个 zygote 进程注入 zymbiote

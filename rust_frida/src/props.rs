@@ -22,6 +22,7 @@ const PROP_AREA_MAGIC: u32 = 0x504f5250;
 const PROP_AREA_HEADER_SIZE: usize = 128;
 /// prop_info value 字段大小 (PROP_VALUE_MAX)
 const PROP_VALUE_MAX: usize = 92;
+const PROP_LONG_FLAG: u32 = 1u32 << 16;
 
 /// 设置文件的 SELinux context（通过 lsetxattr）
 fn set_selinux_context(path: &str, context: &str) {
@@ -512,12 +513,12 @@ fn lookup_property_context(profile_dir: &str, key: &str) -> Option<String> {
                 }
                 let prefix = parts[0];
                 let context = parts[1];
-                // 精确匹配或前缀匹配
-                let matches = if prefix.ends_with('*') {
-                    let p = &prefix[..prefix.len() - 1];
-                    key.starts_with(p) && p.len() > best_prefix.len()
+                let is_exact = parts.get(2).is_some_and(|kind| *kind == "exact");
+                let p = prefix.strip_suffix('*').unwrap_or(prefix);
+                let matches = if is_exact {
+                    key == p && p.len() > best_prefix.len()
                 } else {
-                    key == prefix && prefix.len() > best_prefix.len()
+                    key.starts_with(p) && p.len() > best_prefix.len()
                 };
                 if matches {
                     best_prefix = prefix.to_string();
@@ -618,7 +619,6 @@ fn add_prop_to_profile(profile_dir: &str, key: &str, value: &str) -> Result<(), 
     let mut data = std::fs::read(&target_path).map_err(|e| format!("读取 {} 失败: {}", target_path, e))?;
 
     insert_prop_inplace(&mut data, key, value)?;
-
     std::fs::write(&target_path, &data).map_err(|e| format!("写回 {} 失败: {}", target_path, e))?;
 
     let filename = std::path::Path::new(&target_path)
@@ -668,8 +668,8 @@ fn alloc_prop_info(
             return Err("prop_area 空间不足（long value）".to_string());
         }
 
-        // serial: kLongFlag
-        let serial = 2u32 | (1u32 << 16);
+        // serial: value length + kLongFlag + even update counter
+        let serial = prop_info_serial(0, vb.len(), true);
         data[data_start + pi_off..data_start + pi_off + 4].copy_from_slice(&serial.to_le_bytes());
 
         // value 区域: 占位符 + offset
@@ -691,7 +691,7 @@ fn alloc_prop_info(
     } else {
         // short: serial 高 8 位 = 值长度 (SERIAL_VALUE_LEN)
         let vlen = vb.len().min(PROP_VALUE_MAX - 1);
-        let serial = ((vlen as u32) << 24) | 2u32;
+        let serial = prop_info_serial(0, vlen, false);
         data[data_start + pi_off..data_start + pi_off + 4].copy_from_slice(&serial.to_le_bytes());
         data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen].copy_from_slice(&vb[..vlen]);
         let noff = pi_off + 4 + PROP_VALUE_MAX;
@@ -927,8 +927,8 @@ fn patch_prop_files(profile_dir: &str, overrides: &HashMap<String, String>) -> R
                         // offset = long_value 绝对地址 - prop_info serial 绝对地址
                         let offset = (long_abs - serial_offset) as u32;
                         data[value_offset + 56..value_offset + 60].copy_from_slice(&offset.to_le_bytes());
-                        // serial: 设置 kLongFlag
-                        let new_serial = original_serial | (1u32 << 16);
+                        // serial: 更新长度、kLongFlag 和低 24 位更新计数
+                        let new_serial = prop_info_serial(original_serial, new_bytes.len(), true);
                         data[serial_offset..serial_offset + 4].copy_from_slice(&new_serial.to_le_bytes());
                     } else {
                         log_warn!("属性 {} 的 long value 分配空间不足", key);
@@ -939,12 +939,7 @@ fn patch_prop_files(profile_dir: &str, overrides: &HashMap<String, String>) -> R
                     data[value_offset..value_offset + new_bytes.len()].copy_from_slice(new_bytes);
                     // serial: 更新高 8 位值长度 + 清除 kLongFlag
                     // bionic 用 SERIAL_VALUE_LEN(serial) = serial >> 24 获取值长度
-                    let base_serial = if is_long {
-                        original_serial & !(1u32 << 16)
-                    } else {
-                        original_serial
-                    };
-                    let new_serial = (base_serial & 0x00FF_FFFF) | ((new_bytes.len() as u32) << 24);
+                    let new_serial = prop_info_serial(original_serial, new_bytes.len(), false);
                     data[serial_offset..serial_offset + 4].copy_from_slice(&new_serial.to_le_bytes());
                 }
 
@@ -975,6 +970,16 @@ fn patch_prop_files(profile_dir: &str, overrides: &HashMap<String, String>) -> R
     }
 
     Ok((patch_count, modified_files))
+}
+
+fn prop_info_serial(original_serial: u32, value_len: usize, is_long: bool) -> u32 {
+    let mut low = original_serial & 0x00FF_FFFE;
+    if is_long {
+        low |= PROP_LONG_FLAG;
+    } else {
+        low &= !PROP_LONG_FLAG;
+    }
+    ((value_len as u32) << 24) | low
 }
 
 /// 在 haystack 中搜索 needle，返回首次匹配的起始偏移
@@ -1171,9 +1176,10 @@ fn build_prop_area(props: &[(String, String)]) -> Vec<u8> {
                         // 分配 prop_info
                         let nbytes = name.as_bytes();
                         if let Some(pi_off) = bump(4 + PROP_VALUE_MAX + nbytes.len() + 1) {
-                            data[data_start + pi_off..data_start + pi_off + 4].copy_from_slice(&2u32.to_le_bytes()); // serial=2
                             let vb = value.as_bytes();
                             let vlen = vb.len().min(PROP_VALUE_MAX - 1);
+                            let serial = prop_info_serial(0, vlen, false);
+                            data[data_start + pi_off..data_start + pi_off + 4].copy_from_slice(&serial.to_le_bytes());
                             data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen].copy_from_slice(&vb[..vlen]);
                             let noff = pi_off + 4 + PROP_VALUE_MAX;
                             data[data_start + noff..data_start + noff + nbytes.len()].copy_from_slice(nbytes);
@@ -1206,10 +1212,11 @@ fn build_prop_area(props: &[(String, String)]) -> Vec<u8> {
                                 // 更新已有节点的 prop_info
                                 let nbytes = name.as_bytes();
                                 if let Some(pi_off) = bump(4 + PROP_VALUE_MAX + nbytes.len() + 1) {
-                                    data[data_start + pi_off..data_start + pi_off + 4]
-                                        .copy_from_slice(&2u32.to_le_bytes());
                                     let vb = value.as_bytes();
                                     let vlen = vb.len().min(PROP_VALUE_MAX - 1);
+                                    let serial = prop_info_serial(0, vlen, false);
+                                    data[data_start + pi_off..data_start + pi_off + 4]
+                                        .copy_from_slice(&serial.to_le_bytes());
                                     data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
                                         .copy_from_slice(&vb[..vlen]);
                                     let noff = pi_off + 4 + PROP_VALUE_MAX;
