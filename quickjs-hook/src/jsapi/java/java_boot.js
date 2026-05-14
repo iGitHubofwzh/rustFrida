@@ -1358,6 +1358,14 @@
     var _readyGateSig = "(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Context;)Landroid/app/Application;";
     var _gateInstalled = false;
 
+    function _callReadyCallback(fn, index) {
+        try {
+            fn();
+        } catch(e) {
+            console.log("[Java.ready] callback #" + index + " error: " + e);
+        }
+    }
+
     Java._installGateHook = function() {
         if (_gateInstalled) return;
         try {
@@ -1376,17 +1384,26 @@
                 var cbs = _readyCallbacks;
                 _readyCallbacks = [];
                 for (var i = 0; i < cbs.length; i++) {
-                    try {
-                        cbs[i]();
-                    } catch(e) {
-                        console.log("[Java.ready] callback #" + i + " error: " + e);
-                    }
+                    _callReadyCallback(cbs[i], i);
                 }
 
                 return app;
             });
             _gateInstalled = true;
         } catch(e) {}
+    };
+
+    Java._flushReadyCallbacks = function() {
+        if (!_readyFired && !Java._isClassLoaderReady()) {
+            return;
+        }
+
+        _readyFired = true;
+        var cbs = _readyCallbacks;
+        _readyCallbacks = [];
+        for (var i = 0; i < cbs.length; i++) {
+            _callReadyCallback(cbs[i], i);
+        }
     };
 
     Java.ready = function(fn) {
@@ -1396,7 +1413,7 @@
 
         if (_readyFired || Java._isClassLoaderReady()) {
             _readyFired = true;
-            fn();
+            _readyCallbacks.push(fn);
             return;
         }
 

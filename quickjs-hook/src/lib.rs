@@ -226,6 +226,18 @@ impl JSEngine {
     pub fn run_pending_jobs(&self) {
         while self.context.execute_pending_job() {}
     }
+
+    /// Run callbacks queued by Java.ready() after the current top-level script
+    /// has finished, so callbacks can reference helpers declared later in the
+    /// same loadjs payload.
+    pub fn flush_java_ready_callbacks(&self) -> Result<(), String> {
+        let value = self.context.eval(
+            "if (globalThis.Java && typeof Java._flushReadyCallbacks === 'function') Java._flushReadyCallbacks();",
+            "<java_ready_flush>",
+        )?;
+        value.free(self.context.as_ptr());
+        Ok(())
+    }
 }
 
 impl Drop for JSEngine {
@@ -279,6 +291,7 @@ pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String,
     let engine = engine.as_ref().ok_or("JS engine not initialized")?;
     let _owner_guard = JsEngineOwnerGuard::acquire();
     let value = engine.eval_file(script, filename)?;
+    engine.flush_java_ready_callbacks()?;
     engine.run_pending_jobs();
     let result = if value.is_undefined() {
         "undefined".to_string()
