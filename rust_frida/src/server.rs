@@ -23,7 +23,7 @@ use crate::injection::inject_via_bootstrapper;
 use crate::process::find_pid_by_name;
 use crate::repl::{
     preconfigure_java_stealth_if_declared, print_eval_result, print_help, run_js_repl, script_uses_java_api,
-    try_loadjs_on_main_thread_if_java,
+    try_jseval_on_main_thread_if_java, try_loadjs_on_main_thread_if_java,
 };
 use crate::session::{Session, SessionManager};
 use crate::spawn;
@@ -410,13 +410,20 @@ fn run_session_repl(session: &Arc<Session>) -> bool {
                         break;
                     }
                 };
-                let handled_by_main_thread = match try_loadjs_on_main_thread_if_java(session, &line) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log_error!("{}", e);
-                        continue;
-                    }
-                };
+                let handled_by_main_thread =
+                    match try_loadjs_on_main_thread_if_java(session, &line).and_then(|handled| {
+                        if handled {
+                            Ok(true)
+                        } else {
+                            try_jseval_on_main_thread_if_java(session, &line)
+                        }
+                    }) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log_error!("{}", e);
+                            continue;
+                        }
+                    };
                 if !handled_by_main_thread {
                     match send_command(sender, &line) {
                         Ok(_) => {}

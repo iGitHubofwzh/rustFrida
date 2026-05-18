@@ -63,6 +63,25 @@ pub(crate) fn try_loadjs_on_main_thread_if_java(session: &Session, line: &str) -
     Ok(true)
 }
 
+pub(crate) fn try_jseval_on_main_thread_if_java(session: &Session, line: &str) -> Result<bool, String> {
+    let Some(expr) = line
+        .strip_prefix("jseval ")
+        .or_else(|| line.strip_prefix("jseval\n"))
+        .or_else(|| line.strip_prefix("jseval"))
+    else {
+        return Ok(false);
+    };
+
+    if !script_uses_java_api(expr) {
+        return Ok(false);
+    }
+
+    log_info!("检测到 Java jseval，切到目标主线程执行");
+    crate::remote_agent::eval_js_on_main_thread(session, expr, "", false)
+        .map_err(|e| format!("主线程执行 jseval 失败: {}", e))?;
+    Ok(true)
+}
+
 pub(crate) enum PreResumeLoad {
     Loaded,
 }
