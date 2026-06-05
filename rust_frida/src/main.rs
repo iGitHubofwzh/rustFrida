@@ -52,6 +52,36 @@ use types::get_string_table_names;
 
 const AGENT_SHUTDOWN_WAIT_SECS: u64 = 1;
 
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn wait_process_alive(pid: i32, seconds: u64, label: &str) -> bool {
+    for elapsed in 0..seconds {
+        if !std::path::Path::new(&format!("/proc/{}/status", pid)).exists() {
+            log_warn!("{}: 进程 {} 在 {}s 后退出", label, pid, elapsed);
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let alive = std::path::Path::new(&format!("/proc/{}/status", pid)).exists();
+    if alive {
+        log_success!("{}: 进程 {} 存活 {}s", label, pid, seconds);
+    } else {
+        log_warn!("{}: 进程 {} 在检查结束时已退出", label, pid);
+    }
+    alive
+}
+
 fn set_current_thread_name(name: &'static [u8]) {
     unsafe {
         let _ = libc::prctl(libc::PR_SET_NAME, name.as_ptr(), 0, 0, 0);
@@ -231,6 +261,42 @@ fn main() {
         }
     }
 
+    if let Some(ref package) = args.spawn {
+        if env_flag("RF_DIAG_ZYM_PASSIVE_SETARGV0") {
+            spawn::register_cleanup_handler();
+            match spawn::spawn_passive_setargv0_launch(package) {
+                Ok(pid) => {
+                    let hold_secs = env_u64("RF_DIAG_HOLD_SECS", 20);
+                    wait_process_alive(pid as i32, hold_secs, "RF_DIAG_ZYM_PASSIVE_SETARGV0");
+                    spawn::cleanup_zygote_patches();
+                    return;
+                }
+                Err(e) => {
+                    log_error!("Passive setArgV0 诊断失败: {}", e);
+                    spawn::cleanup_zygote_patches();
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        if env_flag("RF_DIAG_SPAWN_ONLY") {
+            spawn::register_cleanup_handler();
+            match spawn::spawn_only_and_resume(package) {
+                Ok(pid) => {
+                    let hold_secs = env_u64("RF_DIAG_HOLD_SECS", 20);
+                    wait_process_alive(pid as i32, hold_secs, "RF_DIAG_SPAWN_ONLY");
+                    spawn::cleanup_zygote_patches();
+                    return;
+                }
+                Err(e) => {
+                    log_error!("Spawn-only 诊断失败: {}", e);
+                    spawn::cleanup_zygote_patches();
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     // 根据参数选择注入方式，返回 (target_pid, host_fd)
     let (target_pid, injection): (Option<i32>, InjectionResult) = if let Some(ref package) = args.spawn {
         // Spawn 模式：注册信号处理函数，确保 Ctrl+C 时还原 Zygote patch
@@ -288,11 +354,7 @@ fn main() {
     if let Some(pid) = target_pid {
         session.pid.store(pid, Ordering::Relaxed);
     }
-    session.set_remote_agent_info(
-        injection.loader_ctx_addr,
-        injection.agent_current_thread_eval_impl,
-        injection.agent_start_java_worker_impl,
-    );
+    session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
 
     // 启动 socketpair handler（在 host_fd 上读写）
     let _handle = start_socketpair_handler(injection.host_fd, session.clone());

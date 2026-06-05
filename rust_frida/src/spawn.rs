@@ -67,6 +67,12 @@ static SPAWN_REQUESTS: OnceLock<Mutex<HashMap<String, Arc<SpawnNotifier>>>> = On
 /// 属性 profile 目录（由 --profile 设置，None = 禁用）
 static PROP_PROFILE_DIR: OnceLock<Option<String>> = OnceLock::new();
 
+fn diag_env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
+
 /// 设置属性 profile 目录（在 spawn_and_inject 之前调用）
 pub(crate) fn set_prop_profile(profile_dir: Option<String>) {
     let _ = PROP_PROFILE_DIR.set(profile_dir);
@@ -175,6 +181,7 @@ const CTX_CLOSE: usize = 192;
 const CTX_RAISE: usize = 200;
 const CTX_PROP_REMAP: usize = 208;
 const CTX_BLOCK_IN_SETCONTEXT: usize = 216;
+const CTX_PASSIVE_SETARGV0: usize = 224;
 /// 读取 stream 直到 EOF 或错误（用于等待子进程关闭 socket）
 fn drain_until_eof(stream: &mut std::os::unix::net::UnixStream, timeout: std::time::Duration) {
     stream.set_read_timeout(Some(timeout)).ok();
@@ -335,6 +342,40 @@ pub(crate) fn spawn_and_inject(
     //    子进程主线程仍阻塞在 zymbiote recv(ACK)，agent 线程可独立工作
 
     Ok((pid, injection))
+}
+
+/// Diagnostic path: run only the zygote spawn handshake and resume the child.
+/// No loader, agent, memfd, or agent threads are installed.
+pub(crate) fn spawn_only_and_resume(package: &str) -> Result<u32, String> {
+    log_info!("Spawn-only 诊断: 只启动并恢复 {}", package);
+    let hello = spawn_and_wait_hello(package)?;
+    resume_child(hello.pid)?;
+    Ok(hello.pid)
+}
+
+/// Diagnostic path: patch zygote and launch the app, but use a passive setArgV0
+/// replacement that only calls the original function. No zymbiote hello is expected.
+pub(crate) fn spawn_passive_setargv0_launch(package: &str) -> Result<u32, String> {
+    log_info!("Passive setArgV0 诊断: 只保留 setArgV0 指针改写并启动 {}", package);
+    ensure_zymbiote_loaded()?;
+
+    let target = resolve_spawn_target(package);
+    if target.process_name != target.package {
+        log_info!("主进程解析: {} -> {}", target.package, target.process_name);
+    } else {
+        log_verbose!("主进程解析: {} 使用默认包进程", target.package);
+    }
+
+    launch_app(&target.package)?;
+    wait_for_process_name(&target.process_name, std::time::Duration::from_secs(10)).ok_or_else(|| {
+        let live_processes = list_package_processes(&target.package);
+        let live_hint = if live_processes.is_empty() {
+            "未发现目标包相关进程".to_string()
+        } else {
+            format!("当前目标包相关进程:\n{}", live_processes.join("\n"))
+        };
+        format!("等待进程 {} 启动超时: {}", target.process_name, live_hint)
+    })
 }
 
 /// 确保 zymbiote 已加载到所有 zygote 进程
@@ -1068,6 +1109,47 @@ fn list_package_processes(package: &str) -> Vec<String> {
     out
 }
 
+fn wait_for_process_name(process_name: &str, timeout: std::time::Duration) -> Option<u32> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(pid) = find_process_by_exact_name(process_name) {
+            return Some(pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn find_process_by_exact_name(process_name: &str) -> Option<u32> {
+    let proc_dir = std::fs::read_dir("/proc").ok()?;
+    for entry in proc_dir.flatten() {
+        let fname = entry.file_name();
+        let fname_str = fname.to_string_lossy();
+        if !fname_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: u32 = match fname_str.parse() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        let Ok(data) = std::fs::read(cmdline_path) else {
+            continue;
+        };
+        let proc_name = data
+            .split(|&b| b == 0)
+            .next()
+            .and_then(|s| std::str::from_utf8(s).ok())
+            .unwrap_or("");
+        if proc_name == process_name {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 struct BinaryManifest {
     package_name: Option<String>,
@@ -1385,6 +1467,25 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
 /// 向单个 zygote 进程注入 zymbiote
 fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     let maps = parse_proc_maps(pid)?;
+    let diag_passive_setargv0 = diag_env_flag("RF_DIAG_ZYM_PASSIVE_SETARGV0");
+    let diag_no_setcontext = diag_env_flag("RF_DIAG_ZYM_NO_SETCONTEXT") || diag_passive_setargv0;
+    let diag_no_setargv0 = diag_env_flag("RF_DIAG_ZYM_NO_SETARGV0");
+
+    if diag_no_setcontext && diag_no_setargv0 {
+        return Err("RF_DIAG_ZYM_NO_SETCONTEXT 和 RF_DIAG_ZYM_NO_SETARGV0 不能同时启用".to_string());
+    }
+    if diag_passive_setargv0 && diag_no_setargv0 {
+        return Err("RF_DIAG_ZYM_PASSIVE_SETARGV0 和 RF_DIAG_ZYM_NO_SETARGV0 不能同时启用".to_string());
+    }
+    if diag_no_setcontext {
+        log_warn!("诊断模式: 跳过 zymbiote setcontext GOT hook");
+    }
+    if diag_no_setargv0 {
+        log_warn!("诊断模式: 跳过 zymbiote setArgV0 指针 hook，强制 setcontext-only 阻塞");
+    }
+    if diag_passive_setargv0 {
+        log_warn!("诊断模式: setArgV0 replacement 只调用原函数并返回，不发 hello/ACK/SIGSTOP");
+    }
 
     // 1. 找到 payload 写入位置（libstagefright.so 的 R+X 段末尾页）
     let loc = find_payload_location(&maps)?;
@@ -1418,6 +1519,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     if let Some((addr, _)) = &setcontext_info {
         log_verbose!("selinux_android_setcontext 地址: 0x{:x}", addr);
     }
+    let setcontext_info = if diag_no_setcontext { None } else { setcontext_info };
 
     // 6. 先构建 payload 获取替换函数地址（用于 already-patched 检测）
     let (
@@ -1449,7 +1551,11 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     // 7. 找到 setArgV0 指针（三层兜底扫描：boot heap → RW private → 全读）
     //    None: 三层全 miss，启用 setcontext-only 降级阻塞（要求 setcontext GOT 可用）
     let mut payload_data = payload_data;
-    let setargv0_search = find_setargv0_pointer_in_heap(pid, &maps, setargv0_addr, Some(replacement_setargv0_addr))?;
+    let setargv0_search = if diag_no_setargv0 {
+        None
+    } else {
+        find_setargv0_pointer_in_heap(pid, &maps, setargv0_addr, Some(replacement_setargv0_addr))?
+    };
     let already_patched = setargv0_search.as_ref().map(|(_, _, p)| *p).unwrap_or(false);
 
     if let Some((addr, backup, patched)) = &setargv0_search {
@@ -1460,13 +1566,17 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
             if *patched { " [already patched]" } else { "" }
         );
     } else {
-        // 降级模式：要求 setcontext GOT 必须可用
+        // 降级模式或诊断模式：要求 setcontext GOT 必须可用
         if !matches!(&setcontext_info, Some((_, Some(_)))) {
             return Err("boot heap / RW private / 全读映射均未命中 setArgV0 指针，\
                  且 setcontext GOT 不可用 — 无法建立阻塞点，目标 Android 版本可能不兼容。"
                 .to_string());
         }
-        log_warn!("降级为 setcontext-only 阻塞（Android 版本兼容路径）");
+        if diag_no_setargv0 {
+            log_warn!("诊断模式: setcontext-only 阻塞已启用");
+        } else {
+            log_warn!("降级为 setcontext-only 阻塞（Android 版本兼容路径）");
+        }
         let flag_offset = ctx_base_in_payload + CTX_BLOCK_IN_SETCONTEXT - CTX_SOCKET_PATH;
         if flag_offset + 8 > payload_data.len() {
             return Err(format!(
@@ -2193,6 +2303,12 @@ fn build_payload(
     write_u64(ctx, CTX_PROP_REMAP - CTX_SOCKET_PATH, prop_remap);
     // block_in_setcontext 默认 0，由调用者在三层 slot 全部 miss 时 flip 为 1
     write_u64(ctx, CTX_BLOCK_IN_SETCONTEXT - CTX_SOCKET_PATH, 0);
+    let passive_setargv0 = if diag_env_flag("RF_DIAG_ZYM_PASSIVE_SETARGV0") {
+        1u64
+    } else {
+        0u64
+    };
+    write_u64(ctx, CTX_PASSIVE_SETARGV0 - CTX_SOCKET_PATH, passive_setargv0);
     // 无需 GOT 重定位：zymbiote 用 -shared -nostdlib 构建，
     // ARM64 ADRP+ADD 为 PC-relative 寻址，代码和数据在同一段内，
     // 移动到新地址后相对偏移不变。实测 .got 为空且无动态重定位。

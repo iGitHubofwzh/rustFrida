@@ -22,6 +22,7 @@ pub(crate) const LOAD_DEFAULT_TIMEOUT_SECS: u64 = 5;
 pub(crate) const LOAD_JAVA_TIMEOUT_SECS: u64 = 60;
 pub(crate) const LOAD_STOP_WORKER_TIMEOUT_SECS: u64 = 2;
 pub(crate) const LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS: u64 = 30;
+pub(crate) const JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS: u64 = 35;
 pub(crate) const JAVA_STEALTH_TIMEOUT_SECS: u64 = 1;
 pub(crate) const JSCLEAN_SOFT_TIMEOUT_SECS: u64 = 1;
 
@@ -87,21 +88,26 @@ pub(crate) fn ensure_java_worker_ready(session: &Session) -> Result<(), String> 
     if session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
-    let _sender = session.get_sender().ok_or("agent 未连接")?;
+    let sender = session.get_sender().ok_or("agent 未连接")?;
     session.eval_state.clear();
     crate::process::thaw_cgroup_freezer(session.pid.load(std::sync::atomic::Ordering::Acquire));
-    crate::remote_agent::start_java_worker_on_current_thread(session)
-        .map_err(|e| format!("Java worker 当前线程初始化失败: {}", e))?;
-
-    match session.eval_state.recv_timeout(std::time::Duration::from_secs(2)) {
-        Some(Ok(_)) => {}
-        Some(Err(e)) => return Err(format!("Java worker 初始化失败: {}", e)),
-        None => log_warn!("Java worker 当前线程入口已返回 ready，但未收到 agent ready 回包"),
+    send_command(sender, "javaworker_init").map_err(|e| format!("发送 Java worker 初始化失败: {}", e))?;
+    match session
+        .eval_state
+        .recv_timeout(std::time::Duration::from_secs(JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS))
+    {
+        Some(Ok(_)) => {
+            session
+                .java_worker_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+        Some(Err(e)) => Err(format!("Java worker 初始化失败: {}", e)),
+        None => Err(format!(
+            "等待 Java worker 初始化超时({}s)",
+            JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS
+        )),
     }
-    session
-        .java_worker_ready
-        .store(true, std::sync::atomic::Ordering::Release);
-    Ok(())
 }
 
 pub(crate) fn cut_pre_resume_java_executor_hook(session: &Session) -> Result<(), String> {

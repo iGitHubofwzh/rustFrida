@@ -304,11 +304,7 @@ fn do_spawn(
             match spawn::spawn_and_inject(&package, &string_overrides) {
                 Ok((pid, injection)) => {
                     session.pid.store(pid, Ordering::Relaxed);
-                    session.set_remote_agent_info(
-                        injection.loader_ctx_addr,
-                        injection.agent_current_thread_eval_impl,
-                        injection.agent_start_java_worker_impl,
-                    );
+                    session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
                     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
                     if !session.wait_connected(SESSION_CONNECT_TIMEOUT_SECS) {
@@ -373,11 +369,7 @@ fn do_attach(
             match inject_via_bootstrapper(pid, &string_overrides) {
                 Ok(injection) => {
                     session.pid.store(pid, Ordering::Relaxed);
-                    session.set_remote_agent_info(
-                        injection.loader_ctx_addr,
-                        injection.agent_current_thread_eval_impl,
-                        injection.agent_start_java_worker_impl,
-                    );
+                    session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
                     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
                     if !session.wait_connected(SESSION_CONNECT_TIMEOUT_SECS) {
